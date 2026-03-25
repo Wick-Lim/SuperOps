@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sync"
+
+	"github.com/nats-io/nats.go"
 )
 
 type Hub struct {
@@ -11,6 +13,7 @@ type Hub struct {
 	mu         sync.RWMutex
 	register   chan *Client
 	unregister chan *Client
+	natsConn   *nats.Conn // nil = single-instance mode
 	logger     *slog.Logger
 }
 
@@ -28,7 +31,6 @@ func (h *Hub) Run() {
 		select {
 		case client := <-h.register:
 			h.mu.Lock()
-			// Close existing connection for this user (single session per user)
 			if existing, ok := h.clients[client.userID]; ok {
 				close(existing.send)
 				delete(h.clients, client.userID)
@@ -49,27 +51,19 @@ func (h *Hub) Run() {
 	}
 }
 
+// BroadcastToChannel sends a message to all local subscribers AND publishes
+// to NATS for cross-instance delivery in multi-replica deployments.
 func (h *Hub) BroadcastToChannel(channelID, msgType string, data interface{}, excludeUserID string) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
 	msg, err := json.Marshal(OutboundMessage{Type: msgType, Data: data})
 	if err != nil {
 		return
 	}
 
-	for userID, client := range h.clients {
-		if userID == excludeUserID {
-			continue
-		}
-		if client.IsSubscribed(channelID) {
-			select {
-			case client.send <- msg:
-			default:
-				h.logger.Warn("dropping message for slow client", "user_id", userID)
-			}
-		}
-	}
+	// 1. Deliver to local clients
+	h.localBroadcastRaw(channelID, msg, excludeUserID)
+
+	// 2. Publish to NATS for other instances
+	h.publishToNATS(channelID, msg, excludeUserID)
 }
 
 func (h *Hub) BroadcastToUser(userID, msgType string, data interface{}) {
@@ -98,4 +92,16 @@ func (h *Hub) IsOnline(userID string) bool {
 	defer h.mu.RUnlock()
 	_, ok := h.clients[userID]
 	return ok
+}
+
+// Shutdown gracefully closes all client connections.
+func (h *Hub) Shutdown() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for userID, client := range h.clients {
+		close(client.send)
+		delete(h.clients, userID)
+	}
+	h.logger.Info("hub shutdown, all clients disconnected")
 }

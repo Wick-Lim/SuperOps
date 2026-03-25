@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/app"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
@@ -45,6 +46,20 @@ func main() {
 		log.Fatal("nats: ", err)
 	}
 	defer natsClient.Close()
+
+	// Create JetStream durable stream for reliable message processing
+	_, err = natsClient.JetStream.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      "SUPEROPS",
+		Subjects:  []string{"superops.>"},
+		Retention: jetstream.InterestPolicy,
+		Storage:   jetstream.FileStorage,
+		MaxAge:    24 * time.Hour,
+	})
+	if err != nil {
+		l.Warn("JetStream stream creation failed (non-fatal)", "error", err)
+	} else {
+		l.Info("JetStream stream SUPEROPS ready")
+	}
 
 	// Search indexer
 	if cfg.Meili.Host != "" {

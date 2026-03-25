@@ -103,8 +103,9 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		fileStorage = nil
 	}
 
-	// WebSocket Hub
+	// WebSocket Hub with NATS bridge for multi-replica support
 	hub := ws.NewHub(logger)
+	hub.StartNATSBridge(natsClient.Conn, logger)
 	go hub.Run()
 
 	// Handlers

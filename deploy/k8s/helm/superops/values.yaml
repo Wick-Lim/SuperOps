@@ -63,6 +63,7 @@ jwt:
 
 postgresql:
   enabled: true
+  architecture: replication  # HA: primary + read replicas
   auth:
     database: superops
     username: superops
@@ -70,13 +71,25 @@ postgresql:
   primary:
     persistence:
       size: 10Gi
+  readReplicas:
+    replicaCount: 1
+    persistence:
+      size: 10Gi
 
 redis:
   enabled: true
+  architecture: replication  # HA: master + replicas + sentinel
   auth:
     enabled: true
     password: ""  # Must be set
+  sentinel:
+    enabled: true
+    masterSet: superops-master
   master:
+    persistence:
+      size: 2Gi
+  replica:
+    replicaCount: 2
     persistence:
       size: 2Gi
 
@@ -84,6 +97,9 @@ nats:
   enabled: true
   jetstream:
     enabled: true
+  cluster:
+    enabled: true
+    replicas: 3
 
 minio:
   enabled: true
