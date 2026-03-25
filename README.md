@@ -2,22 +2,22 @@
 
 Free, self-hosted team messenger for organizations of any size. Slack/Mattermost alternative you own completely.
 
-Deploy with a single `docker compose up` or scale to thousands of users with Kubernetes.
+Native apps for **iOS, Android, macOS, and Windows** from a single React Native codebase. Backend deploys with Docker Compose or scales to thousands with Kubernetes.
 
 ## Features
 
 **Messaging**
 - Real-time channels (public/private) with WebSocket
-- Threaded replies with slide-out panel
+- Threaded replies
 - Direct messages (1:1)
 - Emoji reactions
 - Message editing and deletion (soft delete)
 - Cursor-based pagination for message history
-- File sharing with inline preview (images, documents)
+- File sharing with inline preview
 
 **Collaboration**
 - Multi-workspace support
-- Full-text search powered by Meilisearch (Cmd+K)
+- Full-text search powered by Meilisearch
 - User presence (online/away/DND/offline)
 - Typing indicators
 - Unread counts and read tracking
@@ -40,8 +40,8 @@ Deploy with a single `docker compose up` or scale to thousands of users with Kub
 
 | Layer | Technology |
 |-------|-----------|
+| Mobile/Desktop App | React Native (Expo) + TypeScript |
 | Backend | Go 1.25 (net/http, no framework) |
-| Frontend | React 19 + TypeScript + TailwindCSS v4 + Zustand |
 | Database | PostgreSQL 16 (HA replication) |
 | Cache | Redis 7 (Sentinel) |
 | Search | Meilisearch |
@@ -49,9 +49,18 @@ Deploy with a single `docker compose up` or scale to thousands of users with Kub
 | Messaging | NATS + JetStream (clustered) |
 | WebSocket | coder/websocket + NATS bridge |
 
+## Supported Platforms
+
+| Platform | Method |
+|----------|--------|
+| iOS | Expo / `npx expo run:ios` |
+| Android | Expo / `npx expo run:android` |
+| macOS | `react-native-macos` |
+| Windows | `react-native-windows` |
+
 ## Quick Start
 
-### Docker Compose
+### 1. Start the backend
 
 ```bash
 git clone https://github.com/Wick-Lim/SuperOps.git
@@ -62,38 +71,36 @@ cp deploy/docker/.env.example deploy/docker/.env
 
 cd deploy/docker
 docker compose up -d
-
-# Open http://localhost
+# Backend API available at http://localhost:8081
 ```
 
-### Development
+### 2. Run the app
 
 ```bash
-# Prerequisites: Go 1.25+, Node.js 22+, Docker
+cd app
+npm install
+npx expo start
+# Press 'i' for iOS simulator, 'a' for Android emulator
+```
 
-# Start infrastructure
+### Development (local backend)
+
+```bash
+# Start infrastructure only
 cd deploy/docker
 cp .env.example .env
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
-# Run migrations
+# Run migrations + start backend
 cd ../../backend
 JWT_SECRET=dev_secret_change_me_32chars_long \
 DB_HOST=localhost DB_PASSWORD=changeme_db_password \
-go run ./cmd/migrate -direction up
-
-# Start backend
-JWT_SECRET=dev_secret_change_me_32chars_long \
-DB_HOST=localhost DB_PASSWORD=changeme_db_password \
 REDIS_PASSWORD=changeme_redis_password \
-go run ./cmd/superops
+go run ./cmd/migrate -direction up && go run ./cmd/superops
 
-# Start frontend (new terminal)
-cd frontend && npm ci && npm run dev
-# Open http://localhost:3000
+# Run app (new terminal)
+cd app && npx expo start
 ```
-
-Or simply: `./scripts/setup.sh`
 
 ### Kubernetes
 
@@ -107,49 +114,62 @@ helm install superops deploy/k8s/helm/superops \
   --set global.domain="chat.example.com"
 ```
 
-Includes: backend HPA (2-10 replicas), frontend, worker, pre-install migration job, ingress with WebSocket, PodDisruptionBudget, PostgreSQL HA, Redis Sentinel, NATS cluster.
+Includes: backend HPA (2-10 replicas), worker, pre-install migration job, ingress with WebSocket, PodDisruptionBudget, PostgreSQL HA, Redis Sentinel, NATS cluster.
 
 ## Architecture
 
 ```
-                        ┌─────────────────────────────────────────────┐
-                        │              Kubernetes / Docker             │
-  Browser ──────────►   │  ┌─────────┐                                │
-  (React SPA)    WS/    │  │  Nginx  │──► Frontend (static)           │
-                 REST   │  │ Ingress │                                │
-                        │  └────┬────┘                                │
-                        │       │                                     │
-                        │  ┌────▼────┐   ┌──────────┐   ┌─────────┐  │
-                        │  │Backend-1│◄─►│          │◄─►│         │  │
-                        │  │  (Hub)  │   │   NATS   │   │  Redis  │  │
-                        │  ├─────────┤   │ JetStream│   │Sentinel │  │
-                        │  │Backend-N│◄─►│ (cluster)│   │  (HA)   │  │
-                        │  │  (Hub)  │   │          │   │         │  │
-                        │  └────┬────┘   └────┬─────┘   └─────────┘  │
-                        │       │             │                       │
-                        │  ┌────▼────┐   ┌────▼─────┐   ┌─────────┐  │
-                        │  │PostgreSQL│   │  Worker  │   │  MinIO  │  │
-                        │  │  (HA)   │   │(indexer, │   │  (S3)   │  │
-                        │  │ primary │   │ notifier)│   │         │  │
-                        │  │+replica │   └──────────┘   └─────────┘  │
-                        │  └─────────┘                                │
-                        │                    ┌──────────┐             │
-                        │                    │Meilisearch│            │
-                        │                    └──────────┘             │
-                        └─────────────────────────────────────────────┘
+  ┌──────────────┐
+  │  Native App  │  React Native (iOS / Android / macOS / Windows)
+  │  (Expo)      │
+  └──────┬───────┘
+         │ REST + WebSocket
+         ▼
+┌─────────────────────────────────────────────────┐
+│                Kubernetes / Docker                │
+│                                                   │
+│  ┌──────────┐    ┌──────────┐    ┌─────────┐    │
+│  │Backend-1 │◄──►│   NATS   │◄──►│  Redis  │    │
+│  │  (Hub)   │    │ JetStream│    │Sentinel │    │
+│  ├──────────┤    │ (cluster)│    │  (HA)   │    │
+│  │Backend-N │◄──►│          │    │         │    │
+│  │  (Hub)   │    └────┬─────┘    └─────────┘    │
+│  └──────┬───┘         │                          │
+│         │        ┌────▼─────┐    ┌─────────┐    │
+│  ┌──────▼───┐    │  Worker  │    │  MinIO  │    │
+│  │PostgreSQL│    │(indexer, │    │  (S3)   │    │
+│  │  (HA)    │    │ notifier)│    │         │    │
+│  │ primary  │    └──────────┘    └─────────┘    │
+│  │+replica  │                                    │
+│  └──────────┘    ┌──────────┐                    │
+│                  │Meilisearch│                    │
+│                  └──────────┘                    │
+└─────────────────────────────────────────────────┘
 ```
 
 **Multi-replica WebSocket delivery:**
-Each backend instance runs a local WebSocket Hub. When a message arrives, it's delivered to local clients AND published to NATS `ws.broadcast.{channelId}`. All other instances receive via NATS subscription and forward to their local clients. No sticky sessions required.
+Each backend instance runs a local WebSocket Hub. Messages are delivered to local clients AND published to NATS `ws.broadcast.{channelId}`. Other instances receive via NATS and forward to their local clients. No sticky sessions required.
 
 ## Project Structure
 
 ```
 SuperOps/
-├── backend/
+├── app/                        # React Native (Expo)
+│   ├── src/
+│   │   ├── api/                # REST client (auth, channels, messages, workspaces)
+│   │   ├── stores/             # Zustand + AsyncStorage (auth, channel, message, workspace)
+│   │   ├── lib/                # Types, WebSocket manager
+│   │   ├── screens/            # Login, Register, Setup, Workspace, Admin
+│   │   ├── components/
+│   │   │   ├── channel/        # ChannelView
+│   │   │   └── message/        # MessageList (FlatList), MessageItem, MessageInput
+│   │   ├── navigation/         # React Navigation (AuthStack / MainStack)
+│   │   └── config.ts           # API_BASE_URL, WS_BASE_URL
+│   └── App.tsx
+├── backend/                    # Go API server
 │   ├── cmd/
 │   │   ├── superops/           # API server
-│   │   ├── worker/             # Async worker (search index, notifications)
+│   │   ├── worker/             # Async worker (search index, notifications, cleanup)
 │   │   └── migrate/            # Database migrations
 │   ├── internal/
 │   │   ├── app/                # Bootstrap, config, wiring
@@ -168,34 +188,18 @@ SuperOps/
 │   │   ├── audit/              # Audit logging
 │   │   └── ratelimit/          # Redis rate limiting
 │   ├── pkg/                    # Shared: database, redis, nats, httputil, crypto
-│   └── migrations/             # 6 SQL migration files (12+ tables)
-├── frontend/
-│   └── src/
-│       ├── api/                # REST client (auth, channels, messages, search, admin, files)
-│       ├── stores/             # Zustand (auth, channel, message, presence, thread)
-│       ├── components/
-│       │   ├── layout/         # Sidebar (responsive, DM section)
-│       │   ├── channel/        # ChannelView
-│       │   ├── message/        # MessageList (virtualized), MessageItem, MessageInput
-│       │   ├── thread/         # ThreadPanel (slide-out)
-│       │   ├── search/         # SearchModal (Cmd+K)
-│       │   ├── dm/             # DMCreate
-│       │   ├── file/           # FileUpload
-│       │   ├── presence/       # PresenceIndicator, TypingIndicator
-│       │   └── shared/         # Modal, Button, Avatar, Spinner, Badge, Toast, EmojiPicker, NotificationBell, ErrorBoundary
-│       ├── pages/              # Login, Register, Setup, Workspace, Admin, 404
-│       └── lib/                # WebSocket manager, types
+│   └── migrations/             # SQL migrations (12+ tables)
 ├── deploy/
-│   ├── docker/                 # Compose (9 services), Dockerfiles, nginx
-│   ├── k8s/helm/superops/      # Helm chart (12 templates, HA values)
-│   └── nginx/                  # Reverse proxy (WS upgrade, API routing)
+│   ├── docker/                 # Compose (backend, worker, migrate, PG, Redis, NATS, MinIO, Meilisearch)
+│   ├── k8s/helm/superops/      # Helm chart (HA values, HPA, PDB, Sentinel)
+│   └── nginx/                  # Reverse proxy config
 ├── scripts/                    # setup.sh, backup.sh, restore.sh
 └── .github/workflows/          # CI (lint/test/build), Release (Docker images)
 ```
 
 ## API Reference
 
-All endpoints under `/api/v1`. Consistent response envelope:
+All endpoints under `/api/v1`. Response envelope:
 
 ```json
 {"data": {...}, "meta": {"cursor": "...", "has_more": true}, "error": null}
@@ -234,11 +238,11 @@ Frame: `{"type": "event_type", "seq": 1, "data": {...}}`
 ## Testing
 
 ```bash
-# Backend (9 tests)
+# Backend (Go)
 cd backend && go test ./... -v
 
-# Frontend (7 tests)
-cd frontend && npm test
+# App (TypeScript)
+cd app && npx tsc --noEmit
 ```
 
 ## Operations
@@ -251,9 +255,9 @@ cd frontend && npm test
 
 ## Configuration
 
-All configuration via environment variables. See [`deploy/docker/.env.example`](deploy/docker/.env.example) for the full list.
+All backend configuration via environment variables. See [`deploy/docker/.env.example`](deploy/docker/.env.example) for the full list.
 
-Key variables: `JWT_SECRET`, `DB_HOST`, `DB_PASSWORD`, `REDIS_PASSWORD`, `NATS_URL`, `MINIO_ENDPOINT`, `MEILI_HOST`.
+App server URL is configured in [`app/src/config.ts`](app/src/config.ts).
 
 ## License
 
