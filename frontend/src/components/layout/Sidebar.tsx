@@ -4,6 +4,7 @@ import { useAuthStore } from '@/stores/authStore'
 import { useWorkspaceStore } from '@/stores/workspaceStore'
 import { useChannelStore } from '@/stores/channelStore'
 import { channelApi } from '@/api/channels'
+import DMCreate from '@/components/dm/DMCreate'
 
 interface SidebarProps {
   onNavigate?: () => void
@@ -17,6 +18,7 @@ export default function Sidebar({ onNavigate }: SidebarProps) {
   const logout = useAuthStore((s) => s.logout)
   const workspace = useWorkspaceStore((s) => s.activeWorkspace)
   const { channels, setChannels, setActiveChannel } = useChannelStore()
+  const [showDMCreate, setShowDMCreate] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
   const [newName, setNewName] = useState('')
 
@@ -95,6 +97,27 @@ export default function Sidebar({ onNavigate }: SidebarProps) {
           ))}
         </div>
       </div>
+
+      {/* Direct Messages */}
+      <div className="px-3 mt-2 mb-1 flex items-center justify-between">
+        <span className="text-xs font-semibold text-surface-200 uppercase tracking-wider">Direct Messages</span>
+        <button onClick={() => setShowDMCreate(true)}
+          className="w-5 h-5 flex items-center justify-center text-surface-200 hover:text-white hover:bg-surface-700 rounded transition-colors text-lg leading-none">
+          +
+        </button>
+      </div>
+      <div className="space-y-0.5 px-1.5 mb-2">
+        {channels.filter((ch) => ch.type === 'dm' || ch.type === 'group_dm').map((ch) => (
+          <button key={ch.id} onClick={() => selectChannel(ch)}
+            className={`w-full text-left px-2.5 py-1.5 rounded-md text-sm flex items-center transition-colors ${
+              ch.id === channelId ? 'bg-brand-600/20 text-brand-300' : 'text-surface-200 hover:bg-surface-800 hover:text-white'
+            }`}>
+            <span className="w-2 h-2 bg-green-500 rounded-full mr-2 shrink-0" />
+            <span className="truncate">{ch.name || 'Direct Message'}</span>
+          </button>
+        ))}
+      </div>
+      <DMCreate open={showDMCreate} onClose={() => setShowDMCreate(false)} />
 
       {/* Admin link */}
       <div className="px-1.5 pb-2">

@@ -6,7 +6,7 @@ import type { Message } from '@/lib/types'
 import MessageList from '@/components/message/MessageList'
 import MessageInput from '@/components/message/MessageInput'
 import TypingIndicator from '@/components/presence/TypingIndicator'
-import { shallow } from 'zustand/shallow'
+import NotificationBell from '@/components/shared/NotificationBell'
 
 interface ChannelViewProps {
   channelId: string
@@ -66,6 +66,7 @@ export default function ChannelView({ channelId }: ChannelViewProps) {
         {activeChannel?.topic && (
           <span className="ml-3 text-sm text-surface-200/60 truncate">{activeChannel.topic}</span>
         )}
+        <div className="ml-auto"><NotificationBell /></div>
       </header>
 
       {/* Messages */}

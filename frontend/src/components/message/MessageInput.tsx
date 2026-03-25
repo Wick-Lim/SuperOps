@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { wsManager } from '@/lib/websocket'
+import FileUpload from '@/components/file/FileUpload'
 
 interface Props {
   onSend: (content: string) => void
@@ -57,10 +58,10 @@ export default function MessageInput({ onSend, channelName, channelId }: Props) 
           className="w-full px-4 py-3 bg-transparent text-white placeholder-surface-200/40 resize-none focus:outline-none text-sm leading-relaxed"
         />
         <div className="flex items-center justify-between px-3 py-2 border-t border-surface-700/30">
-          <div className="flex gap-1">
-            <button className="w-8 h-8 flex items-center justify-center text-surface-200/60 hover:text-white hover:bg-surface-800 rounded-lg transition-colors text-lg" title="Attach file">
-              +
-            </button>
+          <div className="flex gap-1 items-center">
+            <FileUpload onUploaded={(file) => {
+              onSend(`[file: ${file.name}](/api/v1/files/${file.id})`)
+            }} />
           </div>
           <button
             onClick={() => { if (content.trim()) { onSend(content.trim()); setContent('') } }}

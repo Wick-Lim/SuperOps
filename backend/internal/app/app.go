@@ -11,6 +11,7 @@ import (
 	"github.com/rs/cors"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/admin"
+	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
@@ -118,6 +119,8 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		fileHandler = file.NewHandler(fileStorage, pool)
 	}
 	notificationHandler := notification.NewHandler(notificationRepo)
+	auditService := audit.NewService(pool)
+	_ = auditService // available for handler-level audit logging
 	adminHandler := admin.NewHandler(pool)
 	var searchHandler *search.Handler
 	if searchService != nil {
