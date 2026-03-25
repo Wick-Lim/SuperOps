@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "superops.fullname" . }}-migrate
+  labels:
+    {{- include "superops.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          command: ["/app/migrate", "-direction", "up"]
+          env:
+            - name: MIGRATIONS_PATH
+              value: "file:///app/migrations"
+          envFrom:
+            - configMapRef:
+                name: {{ include "superops.fullname" . }}-config
+            - secretRef:
+                name: {{ include "superops.fullname" . }}-secret

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "superops.fullname" . }}-config
+  labels:
+    {{- include "superops.labels" . | nindent 4 }}
+data:
+  SERVER_HOST: "0.0.0.0"
+  SERVER_PORT: "8080"
+  DB_HOST: "{{ include "superops.fullname" . }}-postgresql"
+  DB_PORT: "5432"
+  DB_NAME: "superops"
+  DB_USER: "superops"
+  DB_SSLMODE: "disable"
+  REDIS_ADDR: "{{ include "superops.fullname" . }}-redis-master:6379"
+  NATS_URL: "nats://{{ include "superops.fullname" . }}-nats:4222"
+  MINIO_ENDPOINT: "{{ include "superops.fullname" . }}-minio:9000"
+  MINIO_BUCKET: "superops"
+  MINIO_USE_SSL: "false"
+  MEILI_HOST: "http://{{ include "superops.fullname" . }}-meilisearch:7700"
+  LOG_LEVEL: {{ .Values.backend.env.LOG_LEVEL | quote }}

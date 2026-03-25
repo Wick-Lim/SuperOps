@@ -1,0 +1,98 @@
+global:
+  domain: "superops.example.com"
+  storageClass: ""
+
+backend:
+  image:
+    repository: ghcr.io/wick-lim/superops-backend
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  replicas: 2
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilization: 70
+  env:
+    LOG_LEVEL: "info"
+
+worker:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+frontend:
+  image:
+    repository: ghcr.io/wick-lim/superops-frontend
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  replicas: 2
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/websocket-services: "superops-backend"
+  tls:
+    enabled: true
+    secretName: superops-tls
+
+jwt:
+  secret: ""  # Must be set
+
+postgresql:
+  enabled: true
+  auth:
+    database: superops
+    username: superops
+    password: ""  # Must be set
+  primary:
+    persistence:
+      size: 10Gi
+
+redis:
+  enabled: true
+  auth:
+    enabled: true
+    password: ""  # Must be set
+  master:
+    persistence:
+      size: 2Gi
+
+nats:
+  enabled: true
+  jetstream:
+    enabled: true
+
+minio:
+  enabled: true
+  auth:
+    rootUser: minioadmin
+    rootPassword: ""  # Must be set
+  persistence:
+    size: 20Gi
+
+meilisearch:
+  enabled: true
+  masterKey: ""  # Must be set

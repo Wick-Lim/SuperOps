@@ -10,11 +10,14 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/rs/cors"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/admin"
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
+	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
+	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/internal/workspace"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ws"
@@ -73,7 +76,18 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	jwtMgr := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenTTL)
 	authService := auth.NewService(authRepo, userRepo, jwtMgr, cfg.JWT.RefreshTokenTTL)
 	presenceService := presence.NewService(redisClient)
-	_ = presenceService // used by WS hub for presence tracking
+	_ = presenceService
+
+	notificationRepo := notification.NewRepository(pool)
+
+	// Search
+	var searchService *search.Service
+	if cfg.Meili.Host != "" {
+		searchService, err = search.NewService(cfg.Meili.Host, cfg.Meili.MasterKey, logger)
+		if err != nil {
+			logger.Warn("Meilisearch not available, search disabled", "error", err)
+		}
+	}
 
 	// File Storage
 	fileStorage, err := file.NewStorage(file.StorageConfig{
@@ -103,6 +117,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	if fileStorage != nil {
 		fileHandler = file.NewHandler(fileStorage, pool)
 	}
+	notificationHandler := notification.NewHandler(notificationRepo)
+	adminHandler := admin.NewHandler(pool)
+	var searchHandler *search.Handler
+	if searchService != nil {
+		searchHandler = search.NewHandler(searchService)
+	}
 
 	// Router
 	mux := http.NewServeMux()
@@ -123,6 +143,11 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	channelHandler.RegisterRoutes(mux, authMw)
 	if fileHandler != nil {
 		fileHandler.RegisterRoutes(mux, authMw)
+	}
+	notificationHandler.RegisterRoutes(mux, authMw)
+	adminHandler.RegisterRoutes(mux, authMw)
+	if searchHandler != nil {
+		searchHandler.RegisterRoutes(mux, authMw)
 	}
 	messageHandler.RegisterRoutes(mux, authMw)
 
