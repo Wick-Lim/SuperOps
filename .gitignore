@@ -11,10 +11,12 @@ dist/
 backend/vendor/
 backend/tmp/
 
-# Node
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
+# Node / React Native
+app/node_modules/
+app/.expo/
+app/ios/
+app/android/
+app/dist/
 
 # Environment
 .env

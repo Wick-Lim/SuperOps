@@ -44,14 +44,6 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  frontend:
-    build:
-      context: ../../
-      dockerfile: deploy/docker/Dockerfile.frontend
-    ports:
-      - "3000:80"
-    restart: unless-stopped
-
   migrate:
     build:
       context: ../../
@@ -127,18 +119,6 @@ services:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-changeme_meili_master_key}
     ports:
       - "7700:7700"
-    restart: unless-stopped
-
-  # --- Reverse Proxy ---
-  nginx:
-    image: nginx:alpine
-    volumes:
-      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    ports:
-      - "80:80"
-    depends_on:
-      - backend
-      - frontend
     restart: unless-stopped
 
   # --- Monitoring (optional) ---
