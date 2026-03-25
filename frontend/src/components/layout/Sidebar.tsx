@@ -5,7 +5,11 @@ import { useWorkspaceStore } from '@/stores/workspaceStore'
 import { useChannelStore } from '@/stores/channelStore'
 import { channelApi } from '@/api/channels'
 
-export default function Sidebar() {
+interface SidebarProps {
+  onNavigate?: () => void
+}
+
+export default function Sidebar({ onNavigate }: SidebarProps) {
   const { workspaceId, '*': splat } = useParams()
   const channelId = splat?.startsWith('c/') ? splat.slice(2) : undefined
   const navigate = useNavigate()
@@ -35,6 +39,7 @@ export default function Sidebar() {
   const selectChannel = (ch: typeof channels[0]) => {
     setActiveChannel(ch)
     navigate(`/w/${workspaceId}/c/${ch.id}`)
+    onNavigate?.()
   }
 
   return (
@@ -89,6 +94,17 @@ export default function Sidebar() {
             </button>
           ))}
         </div>
+      </div>
+
+      {/* Admin link */}
+      <div className="px-1.5 pb-2">
+        <button onClick={() => { navigate(`/w/${workspaceId}/admin`); onNavigate?.() }}
+          className={`w-full text-left px-2.5 py-1.5 rounded-md text-sm flex items-center transition-colors ${
+            splat === 'admin' ? 'bg-brand-600/20 text-brand-300' : 'text-surface-200 hover:bg-surface-800 hover:text-white'
+          }`}>
+          <span className="mr-2 text-surface-200/60">&#9881;</span>
+          <span>Admin</span>
+        </button>
       </div>
 
       {/* User footer */}

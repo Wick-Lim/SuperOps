@@ -1,4 +1,5 @@
 import type { Message } from '@/lib/types'
+import { useThreadStore } from '@/stores/threadStore'
 
 interface Props {
   message: Message
@@ -57,8 +58,15 @@ export default function MessageItem({ message, showHeader }: Props) {
           {message.content}
         </div>
         {message.reply_count > 0 && (
-          <button className="text-xs text-brand-400 hover:text-brand-300 mt-1">
+          <button onClick={() => useThreadStore.getState().openThread(message)}
+            className="text-xs text-brand-400 hover:text-brand-300 mt-1">
             {message.reply_count} {message.reply_count === 1 ? 'reply' : 'replies'}
+          </button>
+        )}
+        {!message.parent_id && message.reply_count === 0 && (
+          <button onClick={() => useThreadStore.getState().openThread(message)}
+            className="text-xs text-surface-200/0 group-hover:text-surface-200/40 hover:!text-brand-400 mt-1 transition-colors">
+            Reply
           </button>
         )}
       </div>
