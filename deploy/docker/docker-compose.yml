@@ -5,7 +5,7 @@ services:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.backend
     ports:
-      - "8080:8080"
+      - "8081:8080"
     env_file: .env
     depends_on:
       postgres:
@@ -30,7 +30,8 @@ services:
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.backend
-    command: ["/app/worker"]
+    entrypoint: ["/app/worker"]
+    command: []
     env_file: .env
     depends_on:
       postgres:
@@ -55,7 +56,8 @@ services:
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.backend
-    command: ["/app/migrate", "-direction", "up"]
+    entrypoint: ["/app/migrate"]
+    command: ["-direction", "up"]
     env_file: .env
     environment:
       MIGRATIONS_PATH: "file:///app/migrations"
