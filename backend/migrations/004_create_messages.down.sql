@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS reactions;
+DROP TABLE IF EXISTS messages;

@@ -1,0 +1,17 @@
+# Development overrides - use with:
+# docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Only starts infrastructure services (DB, Redis, NATS, MinIO, Meilisearch)
+# Run backend/frontend locally for hot reload.
+
+services:
+  backend:
+    profiles: ["disabled"]
+  worker:
+    profiles: ["disabled"]
+  frontend:
+    profiles: ["disabled"]
+  migrate:
+    profiles: ["disabled"]
+  nginx:
+    profiles: ["disabled"]

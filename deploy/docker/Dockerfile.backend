@@ -1,0 +1,29 @@
+# Stage 1: Build
+FROM golang:1.23-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /src
+COPY backend/go.mod backend/go.sum ./
+RUN go mod download
+
+COPY backend/ .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/superops ./cmd/superops && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/worker ./cmd/worker && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/migrate ./cmd/migrate
+
+# Stage 2: Runtime
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates wget tzdata && \
+    addgroup -S superops && adduser -S superops -G superops
+
+COPY --from=builder /bin/superops /app/superops
+COPY --from=builder /bin/worker /app/worker
+COPY --from=builder /bin/migrate /app/migrate
+COPY backend/migrations /app/migrations
+
+USER superops
+EXPOSE 8080
+
+ENTRYPOINT ["/app/superops"]
