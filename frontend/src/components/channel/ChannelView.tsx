@@ -1,20 +1,25 @@
-import { useEffect, useCallback } from 'react'
-import { useParams } from 'react-router-dom'
+import { useEffect, useCallback, useRef } from 'react'
 import { messageApi } from '@/api/messages'
 import { useChannelStore } from '@/stores/channelStore'
 import { useMessageStore } from '@/stores/messageStore'
+import type { Message } from '@/lib/types'
 import MessageList from '@/components/message/MessageList'
 import MessageInput from '@/components/message/MessageInput'
 import TypingIndicator from '@/components/presence/TypingIndicator'
+import { shallow } from 'zustand/shallow'
 
-export default function ChannelView() {
-  const { channelId } = useParams<{ channelId: string }>()
+interface ChannelViewProps {
+  channelId: string
+}
+
+const EMPTY_MESSAGES: Message[] = []
+
+export default function ChannelView({ channelId }: ChannelViewProps) {
   const activeChannel = useChannelStore((s) => s.channels.find((c) => c.id === channelId))
-  const { messages, setMessages, hasMore, cursors } = useMessageStore()
-
-  const currentMessages = channelId ? messages[channelId] || [] : []
-  const currentCursor = channelId ? cursors[channelId] : undefined
-  const currentHasMore = channelId ? hasMore[channelId] ?? true : false
+  const currentMessages = useMessageStore((s) => s.messages[channelId] ?? EMPTY_MESSAGES)
+  const currentCursor = useMessageStore((s) => s.cursors[channelId])
+  const currentHasMore = useMessageStore((s) => s.hasMore[channelId] ?? true)
+  const setMessages = useMessageStore((s) => s.setMessages)
 
   const loadMessages = useCallback(async () => {
     if (!channelId) return

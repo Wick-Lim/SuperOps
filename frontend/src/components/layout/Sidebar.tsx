@@ -6,7 +6,8 @@ import { useChannelStore } from '@/stores/channelStore'
 import { channelApi } from '@/api/channels'
 
 export default function Sidebar() {
-  const { workspaceId, channelId } = useParams()
+  const { workspaceId, '*': splat } = useParams()
+  const channelId = splat?.startsWith('c/') ? splat.slice(2) : undefined
   const navigate = useNavigate()
   const user = useAuthStore((s) => s.user)
   const logout = useAuthStore((s) => s.logout)
