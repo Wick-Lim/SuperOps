@@ -12,7 +12,9 @@ import (
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
+	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
+	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/internal/workspace"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ws"
@@ -70,6 +72,21 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// Services
 	jwtMgr := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenTTL)
 	authService := auth.NewService(authRepo, userRepo, jwtMgr, cfg.JWT.RefreshTokenTTL)
+	presenceService := presence.NewService(redisClient)
+	_ = presenceService // used by WS hub for presence tracking
+
+	// File Storage
+	fileStorage, err := file.NewStorage(file.StorageConfig{
+		Endpoint:  cfg.MinIO.Endpoint,
+		AccessKey: cfg.MinIO.AccessKey,
+		SecretKey: cfg.MinIO.SecretKey,
+		Bucket:    cfg.MinIO.Bucket,
+		UseSSL:    cfg.MinIO.UseSSL,
+	}, logger)
+	if err != nil {
+		logger.Warn("MinIO not available, file uploads disabled", "error", err)
+		fileStorage = nil
+	}
 
 	// WebSocket Hub
 	hub := ws.NewHub(logger)
@@ -82,6 +99,10 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	channelHandler := channel.NewHandler(channelRepo)
 	messageHandler := message.NewHandler(messageRepo, channelRepo, natsClient)
 	wsHandler := ws.NewWSHandler(hub, jwtMgr, logger)
+	var fileHandler *file.Handler
+	if fileStorage != nil {
+		fileHandler = file.NewHandler(fileStorage, pool)
+	}
 
 	// Router
 	mux := http.NewServeMux()
@@ -100,6 +121,9 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	userHandler.RegisterRoutes(mux, authMw)
 	workspaceHandler.RegisterRoutes(mux, authMw)
 	channelHandler.RegisterRoutes(mux, authMw)
+	if fileHandler != nil {
+		fileHandler.RegisterRoutes(mux, authMw)
+	}
 	messageHandler.RegisterRoutes(mux, authMw)
 
 	// WebSocket (handles its own auth)

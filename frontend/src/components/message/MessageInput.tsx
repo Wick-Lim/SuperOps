@@ -1,13 +1,16 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { wsManager } from '@/lib/websocket'
 
 interface Props {
   onSend: (content: string) => void
   channelName: string
+  channelId?: string
 }
 
-export default function MessageInput({ onSend, channelName }: Props) {
+export default function MessageInput({ onSend, channelName, channelId }: Props) {
   const [content, setContent] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     textareaRef.current?.focus()
@@ -38,7 +41,16 @@ export default function MessageInput({ onSend, channelName }: Props) {
         <textarea
           ref={textareaRef}
           value={content}
-          onChange={(e) => setContent(e.target.value)}
+          onChange={(e) => {
+            setContent(e.target.value)
+            if (channelId && e.target.value) {
+              if (!typingTimer.current) {
+                wsManager.sendTyping(channelId)
+              }
+              if (typingTimer.current) clearTimeout(typingTimer.current)
+              typingTimer.current = setTimeout(() => { typingTimer.current = null }, 2000)
+            }
+          }}
           onKeyDown={handleKeyDown}
           placeholder={`Message #${channelName}`}
           rows={1}

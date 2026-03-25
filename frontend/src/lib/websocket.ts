@@ -1,5 +1,6 @@
 import { useAuthStore } from '@/stores/authStore'
 import { useMessageStore } from '@/stores/messageStore'
+import { usePresenceStore } from '@/stores/presenceStore'
 
 type WSEventHandler = (data: unknown) => void
 
@@ -94,11 +95,29 @@ class WebSocketManager {
     this.handlers.set(type, handlers.filter((h) => h !== handler))
   }
 
+  sendTyping(channelId: string) {
+    this.send('typing.start', { channel_id: channelId })
+  }
+
   private dispatch(type: string, data: unknown) {
     // Built-in handlers
     if (type === 'message.new') {
-      const msg = data as { channel_id: string; id: string }
+      const msg = data as { channel_id: string }
       useMessageStore.getState().addMessage(msg.channel_id, data as import('@/lib/types').Message)
+    }
+
+    if (type === 'presence.changed') {
+      const d = data as { user_id: string; status: string }
+      usePresenceStore.getState().setPresence(d.user_id, d.status)
+    }
+
+    if (type === 'typing.indicator') {
+      const d = data as { channel_id: string; user_id: string }
+      usePresenceStore.getState().setTyping(d.channel_id, d.user_id)
+      // Auto-clear after 3 seconds
+      setTimeout(() => {
+        usePresenceStore.getState().clearTyping(d.channel_id, d.user_id)
+      }, 3000)
     }
 
     // Custom handlers

@@ -5,6 +5,7 @@ import { useChannelStore } from '@/stores/channelStore'
 import { useMessageStore } from '@/stores/messageStore'
 import MessageList from '@/components/message/MessageList'
 import MessageInput from '@/components/message/MessageInput'
+import TypingIndicator from '@/components/presence/TypingIndicator'
 
 export default function ChannelView() {
   const { channelId } = useParams<{ channelId: string }>()
@@ -26,10 +27,10 @@ export default function ChannelView() {
   }, [channelId, setMessages])
 
   useEffect(() => {
-    if (channelId && !messages[channelId]) {
+    if (channelId) {
       loadMessages()
     }
-  }, [channelId, messages, loadMessages])
+  }, [channelId, loadMessages])
 
   const handleLoadMore = async () => {
     if (!channelId || !currentHasMore || !currentCursor) return
@@ -44,8 +45,8 @@ export default function ChannelView() {
   const handleSend = async (content: string) => {
     if (!channelId || !content.trim()) return
     try {
-      await messageApi.send(channelId, content)
-      // Message will arrive via WebSocket or we add it directly
+      const res = await messageApi.send(channelId, content)
+      useMessageStore.getState().addMessage(channelId, res.data)
     } catch {
       // ignore
     }
@@ -69,8 +70,11 @@ export default function ChannelView() {
         onLoadMore={handleLoadMore}
       />
 
+      {/* Typing indicator */}
+      {channelId && <TypingIndicator channelId={channelId} />}
+
       {/* Input */}
-      <MessageInput onSend={handleSend} channelName={activeChannel?.name || 'channel'} />
+      <MessageInput onSend={handleSend} channelName={activeChannel?.name || 'channel'} channelId={channelId} />
     </>
   )
 }
