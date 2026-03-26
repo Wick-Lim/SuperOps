@@ -57,9 +57,9 @@ export default function LoginScreen({ navigation }: Props) {
           <Text style={{ color: '#fff', fontSize: 15, fontWeight: '600' }}>{loading ? 'Signing in...' : 'Sign In'}</Text>
         </Pressable>
 
-        <Pressable onPress={() => navigation.navigate('Register')} style={{ marginTop: 24, alignItems: 'center' }}>
+        <Pressable onPress={() => navigation.navigate('Invite', {})} style={{ marginTop: 24, alignItems: 'center' }}>
           <Text style={{ color: '#94a3b8', fontSize: 14 }}>
-            Don't have an account? <Text style={{ color: '#818cf8' }}>Sign up</Text>
+            Have an invite? <Text style={{ color: '#818cf8' }}>Join workspace</Text>
           </Text>
         </Pressable>
       </View>

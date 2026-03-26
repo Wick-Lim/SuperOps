@@ -30,13 +30,15 @@ export const useAuthStore = create<AuthState>()((set) => ({
   },
   logout: () => {
     set({ accessToken: null, refreshToken: null, user: null, isAuthenticated: false })
-    AsyncStorage.multiRemove(['superops-auth', 'superops-user'])
+    AsyncStorage.removeItem('superops-auth')
+    AsyncStorage.removeItem('superops-user')
   },
   hydrate: async () => {
     try {
-      const [authStr, userStr] = await AsyncStorage.multiGet(['superops-auth', 'superops-user'])
-      const auth = authStr[1] ? JSON.parse(authStr[1]) : null
-      const user = userStr[1] ? JSON.parse(userStr[1]) : null
+      const authStr = await AsyncStorage.getItem('superops-auth')
+      const userStr = await AsyncStorage.getItem('superops-user')
+      const auth = authStr ? JSON.parse(authStr) : null
+      const user = userStr ? JSON.parse(userStr) : null
       if (auth?.accessToken) {
         set({ accessToken: auth.accessToken, refreshToken: auth.refreshToken, user, isAuthenticated: true, hydrated: true })
       } else {

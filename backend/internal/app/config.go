@@ -15,7 +15,14 @@ type Config struct {
 	JWT      JWTConfig
 	MinIO    MinIOConfig
 	Meili    MeiliConfig
+	Admin    AdminConfig
 	LogLevel string
+}
+
+type AdminConfig struct {
+	Email    string
+	Password string
+	Username string
 }
 
 type ServerConfig struct {
@@ -114,11 +121,19 @@ func LoadConfig() (*Config, error) {
 			Host:      envStr("MEILI_HOST", "http://localhost:7700"),
 			MasterKey: envStr("MEILI_MASTER_KEY", ""),
 		},
+		Admin: AdminConfig{
+			Email:    envStr("ADMIN_EMAIL", ""),
+			Password: envStr("ADMIN_PASSWORD", ""),
+			Username: envStr("ADMIN_USERNAME", "admin"),
+		},
 		LogLevel: envStr("LOG_LEVEL", "info"),
 	}
 
 	if cfg.JWT.Secret == "" {
 		return nil, fmt.Errorf("JWT_SECRET environment variable is required")
+	}
+	if cfg.Admin.Email == "" || cfg.Admin.Password == "" {
+		return nil, fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD environment variables are required")
 	}
 
 	return cfg, nil

@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/bcrypt"
 	"github.com/rs/cors"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/admin"
@@ -75,7 +77,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 
 	// Services
 	jwtMgr := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenTTL)
-	authService := auth.NewService(authRepo, userRepo, jwtMgr, cfg.JWT.RefreshTokenTTL)
+	authService := auth.NewService(authRepo, userRepo, pool, jwtMgr, cfg.JWT.RefreshTokenTTL)
 	presenceService := presence.NewService(redisClient)
 	_ = presenceService
 
@@ -179,6 +181,11 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		IdleTimeout:  cfg.Server.IdleTimeout,
 	}
 
+	// Seed admin account + default workspace/channel on first boot
+	if err := seedAdmin(ctx, pool, cfg, logger); err != nil {
+		logger.Warn("admin seed failed", "error", err)
+	}
+
 	return &App{
 		Config: cfg,
 		Logger: logger,
@@ -188,6 +195,62 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		Hub:    hub,
 		Server: server,
 	}, nil
+}
+
+func seedAdmin(ctx context.Context, pool *pgxpool.Pool, cfg *Config, logger *slog.Logger) error {
+	// Check if admin already exists
+	var exists bool
+	pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)", cfg.Admin.Email).Scan(&exists)
+	if exists {
+		return nil
+	}
+
+	// Create admin user
+	hash, err := bcrypt.GenerateFromPassword([]byte(cfg.Admin.Password), 12)
+	if err != nil {
+		return fmt.Errorf("hash admin password: %w", err)
+	}
+
+	adminID := uuid.NewString()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO users (id, email, username, full_name, password_hash, is_active)
+		 VALUES ($1, $2, $3, 'Admin', $4, true)`,
+		adminID, cfg.Admin.Email, cfg.Admin.Username, string(hash),
+	)
+	if err != nil {
+		return fmt.Errorf("create admin user: %w", err)
+	}
+	logger.Info("admin account created", "email", cfg.Admin.Email)
+
+	// Create default workspace
+	wsID := uuid.NewString()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, 'SuperOps', 'superops', $2)`,
+		wsID, adminID,
+	)
+	if err != nil {
+		return fmt.Errorf("create default workspace: %w", err)
+	}
+
+	// Add admin as workspace owner
+	pool.Exec(ctx,
+		`INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')`,
+		wsID, adminID,
+	)
+
+	// Create #general channel
+	chID := uuid.NewString()
+	pool.Exec(ctx,
+		`INSERT INTO channels (id, workspace_id, name, slug, description, type, creator_id) VALUES ($1, $2, 'general', 'general', 'General discussion', 'public', $3)`,
+		chID, wsID, adminID,
+	)
+	pool.Exec(ctx,
+		`INSERT INTO channel_members (channel_id, user_id, role) VALUES ($1, $2, 'admin')`,
+		chID, adminID,
+	)
+
+	logger.Info("default workspace and #general channel created", "workspace_id", wsID)
+	return nil
 }
 
 func (a *App) Close() {

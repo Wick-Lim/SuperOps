@@ -7,4 +7,7 @@ export const workspaceApi = {
   create(data: { name: string; slug: string; description?: string }) {
     return api.post<Workspace>('/workspaces', data)
   },
+  update(id: string, data: Partial<Workspace>) {
+    return api.patch<Workspace>(`/workspaces/${id}`, data)
+  },
 }

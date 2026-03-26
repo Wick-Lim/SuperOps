@@ -15,40 +15,11 @@ func NewHandler(service *Service) *Handler {
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/v1/auth/register", h.Register)
 	mux.HandleFunc("POST /api/v1/auth/login", h.Login)
 	mux.HandleFunc("POST /api/v1/auth/refresh", h.Refresh)
 	mux.HandleFunc("POST /api/v1/auth/logout", h.Logout)
-}
-
-func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
-	var input RegisterInput
-	if err := httputil.DecodeJSON(r, &input); err != nil {
-		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
-		return
-	}
-
-	if input.Email == "" || input.Username == "" || input.Password == "" {
-		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "email, username, and password are required")
-		return
-	}
-
-	if len(input.Password) < 8 {
-		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "password must be at least 8 characters")
-		return
-	}
-
-	u, err := h.service.Register(r.Context(), input)
-	if err != nil {
-		httputil.JSONError(w, http.StatusConflict, "CONFLICT", err.Error())
-		return
-	}
-
-	httputil.JSON(w, http.StatusCreated, map[string]interface{}{
-		"id":       u.ID,
-		"email":    u.Email,
-		"username": u.Username,
-	})
+	mux.HandleFunc("POST /api/v1/auth/accept-invite", h.AcceptInvite)
+	mux.HandleFunc("GET /api/v1/auth/invite/{token}", h.GetInviteInfo)
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
@@ -110,4 +81,44 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "logged out"})
+}
+
+func (h *Handler) AcceptInvite(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Token    string `json:"token"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+		FullName string `json:"full_name"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
+		return
+	}
+
+	if input.Token == "" || input.Username == "" || input.Password == "" {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "token, username, and password are required")
+		return
+	}
+	if len(input.Password) < 8 {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "password must be at least 8 characters")
+		return
+	}
+
+	tokens, err := h.service.AcceptInvite(r.Context(), input.Token, input.Username, input.Password, input.FullName, r.UserAgent(), r.RemoteAddr)
+	if err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error())
+		return
+	}
+
+	httputil.JSON(w, http.StatusCreated, tokens)
+}
+
+func (h *Handler) GetInviteInfo(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	info, err := h.service.GetInviteInfo(r.Context(), token)
+	if err != nil {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", err.Error())
+		return
+	}
+	httputil.JSON(w, http.StatusOK, info)
 }
