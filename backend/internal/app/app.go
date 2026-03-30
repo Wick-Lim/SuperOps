@@ -22,6 +22,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
+	"github.com/Wick-Lim/SuperOps/backend/internal/webhook"
 	"github.com/Wick-Lim/SuperOps/backend/internal/workspace"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ws"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
@@ -156,6 +157,8 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		searchHandler.RegisterRoutes(mux, authMw)
 	}
 	messageHandler.RegisterRoutes(mux, authMw)
+	webhookHandler := webhook.NewHandler(pool)
+	webhookHandler.RegisterRoutes(mux, authMw)
 
 	// WebSocket (handles its own auth)
 	wsHandler.RegisterRoutes(mux)

@@ -33,6 +33,95 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("DELETE /api/v1/channels/{channel_id}/messages/{message_id}/reactions/{emoji}", authMw(http.HandlerFunc(h.RemoveReaction)))
 	mux.Handle("GET /api/v1/messages/{message_id}/thread", authMw(http.HandlerFunc(h.ListThread)))
 	mux.Handle("POST /api/v1/messages/{message_id}/thread", authMw(http.HandlerFunc(h.ReplyThread)))
+	mux.Handle("POST /api/v1/channels/{channel_id}/messages/{message_id}/pin", authMw(http.HandlerFunc(h.Pin)))
+	mux.Handle("DELETE /api/v1/channels/{channel_id}/messages/{message_id}/pin", authMw(http.HandlerFunc(h.Unpin)))
+	mux.Handle("POST /api/v1/messages/{message_id}/bookmark", authMw(http.HandlerFunc(h.Bookmark)))
+	mux.Handle("DELETE /api/v1/messages/{message_id}/bookmark", authMw(http.HandlerFunc(h.RemoveBookmark)))
+	mux.Handle("GET /api/v1/bookmarks", authMw(http.HandlerFunc(h.ListBookmarks)))
+	mux.Handle("POST /api/v1/channels/{channel_id}/messages/{message_id}/forward", authMw(http.HandlerFunc(h.Forward)))
+}
+
+func (h *Handler) Pin(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	msgID := r.PathValue("message_id")
+	h.repo.pool.Exec(r.Context(), `UPDATE messages SET is_pinned = TRUE, pinned_by = $2, pinned_at = NOW() WHERE id = $1`, msgID, userID)
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "pinned"})
+}
+
+func (h *Handler) Unpin(w http.ResponseWriter, r *http.Request) {
+	msgID := r.PathValue("message_id")
+	h.repo.pool.Exec(r.Context(), `UPDATE messages SET is_pinned = FALSE, pinned_by = NULL, pinned_at = NULL WHERE id = $1`, msgID)
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "unpinned"})
+}
+
+func (h *Handler) Bookmark(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	msgID := r.PathValue("message_id")
+	h.repo.pool.Exec(r.Context(), `INSERT INTO bookmarks (user_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, msgID)
+	httputil.JSON(w, http.StatusCreated, map[string]string{"message": "bookmarked"})
+}
+
+func (h *Handler) RemoveBookmark(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	msgID := r.PathValue("message_id")
+	h.repo.pool.Exec(r.Context(), `DELETE FROM bookmarks WHERE user_id = $1 AND message_id = $2`, userID, msgID)
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "removed"})
+}
+
+func (h *Handler) ListBookmarks(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	rows, err := h.repo.pool.Query(r.Context(),
+		`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at
+		 FROM bookmarks b JOIN messages m ON b.message_id = m.id
+		 WHERE b.user_id = $1 ORDER BY b.created_at DESC LIMIT 50`, userID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	defer rows.Close()
+
+	var items []map[string]interface{}
+	for rows.Next() {
+		var id, chID, uid, content string
+		var createdAt interface{}
+		rows.Scan(&id, &chID, &uid, &content, &createdAt)
+		items = append(items, map[string]interface{}{"id": id, "channel_id": chID, "user_id": uid, "content": content, "created_at": createdAt})
+	}
+	if items == nil { items = []map[string]interface{}{} }
+	httputil.JSON(w, http.StatusOK, items)
+}
+
+func (h *Handler) Forward(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	msgID := r.PathValue("message_id")
+
+	var input struct {
+		TargetChannelID string `json:"target_channel_id"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil || input.TargetChannelID == "" {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "target_channel_id is required")
+		return
+	}
+
+	// Get original message
+	msg, err := h.repo.GetByID(r.Context(), msgID)
+	if err != nil || msg == nil {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "message not found")
+		return
+	}
+
+	// Create forwarded message in target channel
+	fwd := &Message{
+		ID:          uuid.NewString(),
+		ChannelID:   input.TargetChannelID,
+		UserID:      userID,
+		Content:     "[Forwarded] " + msg.Content,
+		ContentType: "markdown",
+	}
+	h.repo.Create(r.Context(), fwd)
+	h.chanRepo.UpdateLastMessage(r.Context(), input.TargetChannelID, time.Now())
+
+	httputil.JSON(w, http.StatusCreated, fwd)
 }
 
 func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {

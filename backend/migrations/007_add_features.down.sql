@@ -1,0 +1,14 @@
+DROP TABLE IF EXISTS custom_emojis;
+ALTER TABLE workspaces DROP COLUMN IF EXISTS retention_days;
+ALTER TABLE users DROP COLUMN IF EXISTS totp_enabled;
+ALTER TABLE users DROP COLUMN IF EXISTS totp_secret;
+DROP TABLE IF EXISTS webhooks;
+DROP TABLE IF EXISTS user_blocks;
+ALTER TABLE messages DROP COLUMN IF EXISTS is_scheduled;
+ALTER TABLE messages DROP COLUMN IF EXISTS scheduled_at;
+ALTER TABLE messages DROP COLUMN IF EXISTS pinned_at;
+ALTER TABLE messages DROP COLUMN IF EXISTS pinned_by;
+ALTER TABLE messages DROP COLUMN IF EXISTS is_pinned;
+ALTER TABLE users DROP COLUMN IF EXISTS status_emoji;
+ALTER TABLE users DROP COLUMN IF EXISTS status_text;
+DROP TABLE IF EXISTS bookmarks;

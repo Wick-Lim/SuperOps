@@ -16,6 +16,10 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
+func (r *Repository) Pool() *pgxpool.Pool {
+	return r.pool
+}
+
 func (r *Repository) Create(ctx context.Context, u *User) error {
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO users (id, email, username, full_name, password_hash, avatar_url, timezone, locale, is_bot, is_active)

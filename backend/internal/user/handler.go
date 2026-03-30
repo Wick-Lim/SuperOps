@@ -18,8 +18,30 @@ func NewHandler(repo *Repository) *Handler {
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
 	mux.Handle("GET /api/v1/users/me", authMw(http.HandlerFunc(h.GetMe)))
 	mux.Handle("PATCH /api/v1/users/me", authMw(http.HandlerFunc(h.UpdateMe)))
+	mux.Handle("PUT /api/v1/users/me/status", authMw(http.HandlerFunc(h.UpdateStatus)))
 	mux.Handle("GET /api/v1/users/{user_id}", authMw(http.HandlerFunc(h.GetUser)))
 	mux.Handle("GET /api/v1/users/search", authMw(http.HandlerFunc(h.SearchUsers)))
+}
+
+func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	var input struct {
+		StatusText  string `json:"status_text"`
+		StatusEmoji string `json:"status_emoji"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
+		return
+	}
+	_, err := h.repo.Pool().Exec(r.Context(),
+		`UPDATE users SET status_text = $2, status_emoji = $3 WHERE id = $1`,
+		userID, input.StatusText, input.StatusEmoji,
+	)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	httputil.JSON(w, http.StatusOK, map[string]string{"status_text": input.StatusText, "status_emoji": input.StatusEmoji})
 }
 
 func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
