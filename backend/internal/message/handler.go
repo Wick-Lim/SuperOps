@@ -536,6 +536,9 @@ func (h *Handler) Unpin(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Bookmark(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 	msgID := r.PathValue("message_id")
+	if _, ok := h.requireMessageMember(w, r, msgID); !ok {
+		return
+	}
 	if _, err := h.repo.pool.Exec(r.Context(),
 		`INSERT INTO bookmarks (user_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, msgID); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
@@ -591,15 +594,14 @@ func (h *Handler) Forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Caller must be a member of the target channel.
-	if member, err := h.chanRepo.GetMember(r.Context(), input.TargetChannelID, userID); err != nil || member == nil {
-		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of the target channel")
+	// Caller must be a member of the SOURCE channel (to read the message)...
+	msg, ok := h.requireMessageMember(w, r, msgID)
+	if !ok {
 		return
 	}
-
-	msg, err := h.repo.GetByID(r.Context(), msgID)
-	if err != nil || msg == nil {
-		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "message not found")
+	// ...and of the TARGET channel (to post into it).
+	if member, err := h.chanRepo.GetMember(r.Context(), input.TargetChannelID, userID); err != nil || member == nil {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of the target channel")
 		return
 	}
 

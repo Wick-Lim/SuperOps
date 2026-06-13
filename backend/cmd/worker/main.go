@@ -155,6 +155,11 @@ func scheduledMessageJob(ctx context.Context, pool *pgxpool.Pool, nc *natspkg.Cl
 				var wsID string
 				_ = pool.QueryRow(ctx, `SELECT workspace_id FROM channels WHERE id = $1`, d.channelID).Scan(&wsID)
 				pool.Exec(ctx, `UPDATE channels SET last_message_at = NOW() WHERE id = $1`, d.channelID)
+				// Thread replies must bump the parent's reply_count (Create does
+				// this for live messages; the scheduled path bypassed it).
+				if d.parentID != nil && *d.parentID != "" {
+					pool.Exec(ctx, `UPDATE messages SET reply_count = reply_count + 1 WHERE id = $1`, *d.parentID)
+				}
 				if wsID == "" {
 					continue
 				}

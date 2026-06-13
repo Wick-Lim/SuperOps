@@ -28,10 +28,11 @@ type Client struct {
 	mu            sync.RWMutex
 	seq           atomic.Int64
 	presence      *presence.Service
+	isMember      MemberChecker
 	logger        *slog.Logger
 }
 
-func NewClient(hub *Hub, conn *websocket.Conn, userID string, presenceSvc *presence.Service, logger *slog.Logger) *Client {
+func NewClient(hub *Hub, conn *websocket.Conn, userID string, presenceSvc *presence.Service, isMember MemberChecker, logger *slog.Logger) *Client {
 	return &Client{
 		hub:           hub,
 		conn:          conn,
@@ -39,6 +40,7 @@ func NewClient(hub *Hub, conn *websocket.Conn, userID string, presenceSvc *prese
 		send:          make(chan []byte, 256),
 		subscriptions: make(map[string]bool),
 		presence:      presenceSvc,
+		isMember:      isMember,
 		logger:        logger,
 	}
 }
@@ -153,6 +155,11 @@ func (c *Client) handleMessage(ctx context.Context, msg InboundMessage) {
 	case TypeSubscribe:
 		var data SubscribeData
 		if err := json.Unmarshal(msg.Data, &data); err == nil && data.ChannelID != "" {
+			// Only members may subscribe to a channel's real-time events.
+			if c.isMember != nil && !c.isMember(ctx, data.ChannelID, c.userID) {
+				c.SendMessage(TypeError, map[string]string{"message": "not a member of this channel"})
+				return
+			}
 			c.Subscribe(data.ChannelID)
 		}
 

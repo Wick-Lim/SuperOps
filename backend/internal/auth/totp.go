@@ -14,7 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
 
 // ErrTOTPRequired signals that a correct password was supplied but the account
@@ -138,23 +141,25 @@ func (s *Service) EnableTOTP(ctx context.Context, userID, code string) ([]string
 		codes[i] = strings.ToLower(c[:8])
 	}
 
-	err := func() error {
-		if _, err := s.pool.Exec(ctx, `UPDATE users SET totp_enabled = TRUE WHERE id = $1`, userID); err != nil {
+	err := database.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE users SET totp_enabled = TRUE WHERE id = $1`, userID); err != nil {
 			return err
 		}
-		s.pool.Exec(ctx, `DELETE FROM totp_backup_codes WHERE user_id = $1`, userID)
+		if _, err := tx.Exec(ctx, `DELETE FROM totp_backup_codes WHERE user_id = $1`, userID); err != nil {
+			return err
+		}
 		for _, c := range codes {
 			h, err := crypto.HashPassword(c)
 			if err != nil {
 				return err
 			}
-			if _, err := s.pool.Exec(ctx,
+			if _, err := tx.Exec(ctx,
 				`INSERT INTO totp_backup_codes (user_id, code_hash) VALUES ($1, $2)`, userID, h); err != nil {
 				return err
 			}
 		}
 		return nil
-	}()
+	})
 	if err != nil {
 		return nil, fmt.Errorf("enable totp: %w", err)
 	}
@@ -175,12 +180,13 @@ func (s *Service) DisableTOTP(ctx context.Context, userID, code string) error {
 	if !s.verifyTOTPOrBackup(ctx, userID, secret, code) {
 		return errors.New("invalid code")
 	}
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE users SET totp_enabled = FALSE, totp_secret = NULL WHERE id = $1`, userID); err != nil {
+	return database.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE users SET totp_enabled = FALSE, totp_secret = NULL WHERE id = $1`, userID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM totp_backup_codes WHERE user_id = $1`, userID)
 		return err
-	}
-	s.pool.Exec(ctx, `DELETE FROM totp_backup_codes WHERE user_id = $1`, userID)
-	return nil
+	})
 }
 
 // TOTPEnabled reports whether the user has 2FA active.
@@ -212,8 +218,13 @@ func (s *Service) verifyTOTPOrBackup(ctx context.Context, userID, secret, code s
 	}
 	for _, b := range candidates {
 		if crypto.CheckPassword(code, b.hash) {
-			s.pool.Exec(ctx, `UPDATE totp_backup_codes SET used = TRUE WHERE id = $1`, b.id)
-			return true
+			// Atomically consume the code; if a concurrent request already used
+			// it (0 rows affected), this attempt does not authenticate.
+			tag, err := s.pool.Exec(ctx, `UPDATE totp_backup_codes SET used = TRUE WHERE id = $1 AND used = FALSE`, b.id)
+			if err == nil && tag.RowsAffected() > 0 {
+				return true
+			}
+			return false
 		}
 	}
 	return false

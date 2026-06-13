@@ -12,15 +12,19 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
+// MemberChecker reports whether a user may subscribe to a channel's events.
+type MemberChecker func(ctx context.Context, channelID, userID string) bool
+
 type WSHandler struct {
 	hub      *Hub
 	jwtMgr   *auth.JWTManager
 	presence *presence.Service
+	isMember MemberChecker
 	logger   *slog.Logger
 }
 
-func NewWSHandler(hub *Hub, jwtMgr *auth.JWTManager, presenceSvc *presence.Service, logger *slog.Logger) *WSHandler {
-	return &WSHandler{hub: hub, jwtMgr: jwtMgr, presence: presenceSvc, logger: logger}
+func NewWSHandler(hub *Hub, jwtMgr *auth.JWTManager, presenceSvc *presence.Service, isMember MemberChecker, logger *slog.Logger) *WSHandler {
+	return &WSHandler{hub: hub, jwtMgr: jwtMgr, presence: presenceSvc, isMember: isMember, logger: logger}
 }
 
 func (h *WSHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -49,7 +53,7 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := NewClient(h.hub, conn, claims.UserID, h.presence, h.logger)
+	client := NewClient(h.hub, conn, claims.UserID, h.presence, h.isMember, h.logger)
 	h.hub.register <- client
 
 	if h.presence != nil {

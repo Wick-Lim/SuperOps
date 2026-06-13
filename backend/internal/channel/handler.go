@@ -111,6 +111,12 @@ func (h *Handler) Browse(w http.ResponseWriter, r *http.Request) {
 	httputil.JSON(w, http.StatusOK, channels)
 }
 
+// isMember reports whether the caller belongs to the channel.
+func (h *Handler) isMember(r *http.Request, channelID string) bool {
+	m, err := h.repo.GetMember(r.Context(), channelID, authctx.UserID(r.Context()))
+	return err == nil && m != nil
+}
+
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	ch, err := h.repo.GetByID(r.Context(), r.PathValue("channel_id"))
 	if err != nil {
@@ -119,6 +125,11 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	if ch == nil {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "channel not found")
+		return
+	}
+	// Non-public channels (private/dm/group_dm) are only visible to members.
+	if ch.Type != TypePublic && !h.isMember(r, ch.ID) {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
 		return
 	}
 	httputil.JSON(w, http.StatusOK, ch)
@@ -208,7 +219,12 @@ func (h *Handler) Leave(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
-	members, err := h.repo.ListMembers(r.Context(), r.PathValue("channel_id"))
+	chID := r.PathValue("channel_id")
+	if !h.isMember(r, chID) {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
+		return
+	}
+	members, err := h.repo.ListMembers(r.Context(), chID)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -223,6 +239,10 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 	chID := r.PathValue("channel_id")
 
+	if !h.isMember(r, chID) {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
+		return
+	}
 	if err := h.repo.UpdateReadAt(r.Context(), chID, userID); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

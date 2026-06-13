@@ -124,7 +124,10 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	workspaceHandler := workspace.NewHandler(workspaceRepo)
 	channelHandler := channel.NewHandler(channelRepo)
 	messageHandler := message.NewHandler(messageRepo, channelRepo, natsClient)
-	wsHandler := ws.NewWSHandler(hub, jwtMgr, presenceService, logger)
+	wsHandler := ws.NewWSHandler(hub, jwtMgr, presenceService, func(ctx context.Context, channelID, userID string) bool {
+		m, err := channelRepo.GetMember(ctx, channelID, userID)
+		return err == nil && m != nil
+	}, logger)
 	presenceHandler := presence.NewHandler(presenceService, pool)
 	var fileHandler *file.Handler
 	if fileStorage != nil {
@@ -153,6 +156,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		loginLimiter = ratelimit.MiddlewareByIP(redisClient, ratelimit.Config{
 			RequestsPerMinute: cfg.RateLimit.AuthPerMinute,
 			Window:            time.Minute,
+			TrustProxy:        cfg.RateLimit.TrustProxy,
 		})
 	}
 
@@ -195,6 +199,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		handler = ratelimit.APIMiddleware(redisClient, ratelimit.Config{
 			RequestsPerMinute: cfg.RateLimit.APIPerMinute,
 			Window:            time.Minute,
+			TrustProxy:        cfg.RateLimit.TrustProxy,
 		})(handler)
 	}
 	handler = MetricsMiddleware(handler)

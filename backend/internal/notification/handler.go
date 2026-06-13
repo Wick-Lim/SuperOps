@@ -26,15 +26,25 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 	params := httputil.ParsePagination(r)
 
-	notifications, err := h.repo.ListByUser(r.Context(), userID, params.Cursor, params.Limit)
+	notifications, err := h.repo.ListByUser(r.Context(), userID, params.Cursor, params.Limit+1)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
+
+	hasMore := len(notifications) > params.Limit
+	if hasMore {
+		notifications = notifications[:params.Limit]
+	}
 	if notifications == nil {
 		notifications = []*Notification{}
 	}
-	httputil.JSON(w, http.StatusOK, notifications)
+
+	var cursor string
+	if len(notifications) > 0 {
+		cursor = httputil.EncodeCursor(notifications[len(notifications)-1].CreatedAt)
+	}
+	httputil.JSONList(w, http.StatusOK, notifications, cursor, hasMore)
 }
 
 func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {

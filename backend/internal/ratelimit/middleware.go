@@ -17,14 +17,21 @@ import (
 type Config struct {
 	RequestsPerMinute int
 	Window            time.Duration
+	// TrustProxy controls whether X-Forwarded-For is honored. Enable only when
+	// running behind a trusted reverse proxy (nginx/ingress); when directly
+	// exposed it must be false, otherwise clients can spoof their IP to evade
+	// per-IP limits.
+	TrustProxy bool
 }
 
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
+func clientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if i := strings.IndexByte(xff, ','); i >= 0 {
+				return strings.TrimSpace(xff[:i])
+			}
+			return strings.TrimSpace(xff)
 		}
-		return strings.TrimSpace(xff)
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -54,7 +61,7 @@ func Middleware(rdb *redis.Client, cfg Config) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			key := authctx.UserID(r.Context())
 			if key == "" {
-				key = clientIP(r)
+				key = clientIP(r, cfg.TrustProxy)
 			}
 			enforce(w, r, rdb, fmt.Sprintf("ratelimit:%s", key), cfg, next)
 		})
@@ -66,7 +73,7 @@ func Middleware(rdb *redis.Client, cfg Config) func(http.Handler) http.Handler {
 func MiddlewareByIP(rdb *redis.Client, cfg Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			enforce(w, r, rdb, fmt.Sprintf("ratelimit:ip:%s:%s", r.URL.Path, clientIP(r)), cfg, next)
+			enforce(w, r, rdb, fmt.Sprintf("ratelimit:ip:%s:%s", r.URL.Path, clientIP(r, cfg.TrustProxy)), cfg, next)
 		})
 	}
 }
@@ -82,7 +89,7 @@ func APIMiddleware(rdb *redis.Client, cfg Config) func(http.Handler) http.Handle
 			}
 			key := authctx.UserID(r.Context())
 			if key == "" {
-				key = clientIP(r)
+				key = clientIP(r, cfg.TrustProxy)
 			}
 			enforce(w, r, rdb, fmt.Sprintf("ratelimit:api:%s", key), cfg, next)
 		})

@@ -22,8 +22,9 @@ type Config struct {
 
 type RateLimitConfig struct {
 	Enabled       bool
-	APIPerMinute  int // general authenticated API ceiling
-	AuthPerMinute int // strict limit for login/refresh/accept-invite (per IP)
+	APIPerMinute  int  // general authenticated API ceiling
+	AuthPerMinute int  // strict limit for login/refresh/accept-invite (per IP)
+	TrustProxy    bool // honor X-Forwarded-For (true only behind a trusted proxy)
 }
 
 type AdminConfig struct {
@@ -137,6 +138,7 @@ func LoadConfig() (*Config, error) {
 			Enabled:       envBool("RATE_LIMIT_ENABLED", true),
 			APIPerMinute:  envInt("RATE_LIMIT_API_PER_MIN", 600),
 			AuthPerMinute: envInt("RATE_LIMIT_AUTH_PER_MIN", 10),
+			TrustProxy:    envBool("RATE_LIMIT_TRUST_PROXY", true),
 		},
 		LogLevel: envStr("LOG_LEVEL", "info"),
 	}

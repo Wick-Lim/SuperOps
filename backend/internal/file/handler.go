@@ -24,6 +24,17 @@ func NewHandler(storage *Storage, pool *pgxpool.Pool) *Handler {
 	return &Handler{storage: storage, pool: pool}
 }
 
+func (h *Handler) isWorkspaceMember(r *http.Request, workspaceID, userID string) bool {
+	if workspaceID == "" {
+		return false
+	}
+	var ok bool
+	_ = h.pool.QueryRow(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)`,
+		workspaceID, userID).Scan(&ok)
+	return ok
+}
+
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
 	mux.Handle("POST /api/v1/files/upload", authMw(http.HandlerFunc(h.Upload)))
 	mux.Handle("GET /api/v1/files/{file_id}", authMw(http.HandlerFunc(h.Download)))
@@ -49,6 +60,10 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	workspaceID := r.FormValue("workspace_id")
 	if workspaceID == "" {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "workspace_id is required")
+		return
+	}
+	if !h.isWorkspaceMember(r, workspaceID, userID) {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this workspace")
 		return
 	}
 
@@ -87,13 +102,18 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 	fileID := r.PathValue("file_id")
+	userID := authctx.UserID(r.Context())
 
-	var name, contentType, storageKey string
+	var name, contentType, storageKey, workspaceID string
 	err := h.pool.QueryRow(r.Context(),
-		`SELECT name, content_type, storage_key FROM files WHERE id = $1`, fileID,
-	).Scan(&name, &contentType, &storageKey)
+		`SELECT name, content_type, storage_key, workspace_id FROM files WHERE id = $1`, fileID,
+	).Scan(&name, &contentType, &storageKey, &workspaceID)
 	if err != nil {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "file not found")
+		return
+	}
+	if !h.isWorkspaceMember(r, workspaceID, userID) {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this workspace")
 		return
 	}
 

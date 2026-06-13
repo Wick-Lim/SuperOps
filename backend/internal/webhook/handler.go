@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -131,11 +132,11 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) IncomingWebhook(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
 
-	var chID string
+	var chID, createdBy string
 	var isActive bool
 	err := h.pool.QueryRow(r.Context(),
-		`SELECT channel_id, is_active FROM webhooks WHERE token = $1 AND type = 'incoming'`, token,
-	).Scan(&chID, &isActive)
+		`SELECT channel_id, created_by, is_active FROM webhooks WHERE token = $1 AND type = 'incoming'`, token,
+	).Scan(&chID, &createdBy, &isActive)
 	if err != nil || !isActive {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "webhook not found or inactive")
 		return
@@ -149,18 +150,39 @@ func (h *Handler) IncomingWebhook(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "text is required")
 		return
 	}
-	if input.Username == "" {
-		input.Username = "webhook"
-	}
 
-	// Insert message as system/bot message
+	// Post as a system message authored by the webhook's creator (respects
+	// workspace isolation instead of assuming a global 'admin' user). The
+	// display username is sanitized to a single safe line.
 	msgID := uuid.NewString()
-	h.pool.Exec(r.Context(),
-		`INSERT INTO messages (id, channel_id, user_id, content, content_type)
-		 VALUES ($1, $2, (SELECT id FROM users WHERE username = 'admin' LIMIT 1), $3, 'system')`,
-		msgID, chID, "["+input.Username+"] "+input.Text,
-	)
+	content := "[" + sanitizeName(input.Username) + "] " + input.Text
+	if _, err := h.pool.Exec(r.Context(),
+		`INSERT INTO messages (id, channel_id, user_id, content, content_type) VALUES ($1, $2, $3, $4, 'system')`,
+		msgID, chID, createdBy, content,
+	); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
 	h.pool.Exec(r.Context(), `UPDATE channels SET last_message_at = $2 WHERE id = $1`, chID, time.Now())
 
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "posted"})
+}
+
+// sanitizeName strips line breaks and bracket characters from a webhook display
+// name and caps its length.
+func sanitizeName(name string) string {
+	name = strings.Map(func(rr rune) rune {
+		if rr == '\n' || rr == '\r' || rr == '[' || rr == ']' || rr < 0x20 {
+			return -1
+		}
+		return rr
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "webhook"
+	}
+	if len(name) > 40 {
+		name = name[:40]
+	}
+	return name
 }
