@@ -103,7 +103,20 @@ func (c *Client) SendMessage(msgType string, data interface{}) {
 	if err != nil {
 		return
 	}
+	c.trySend(b)
+}
 
+// trySend delivers bytes to the client's buffered send channel without blocking.
+// It recovers from a send on a closed channel, which can race when the hub
+// evicts this client (re-login / unregister) concurrently with a broadcast or
+// a relay-driven BroadcastToUser — that panic would otherwise crash the
+// non-HTTP goroutine it runs in.
+func (c *Client) trySend(b []byte) {
+	defer func() {
+		if recover() != nil {
+			c.logger.Debug("send to closed client dropped", "user_id", c.userID)
+		}
+	}()
 	select {
 	case c.send <- b:
 	default:

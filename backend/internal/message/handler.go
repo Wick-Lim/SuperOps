@@ -98,6 +98,27 @@ func (h *Handler) requireMember(w http.ResponseWriter, r *http.Request, channelI
 	return true
 }
 
+// requireMessageMember loads a message and verifies the caller is a member of
+// its channel (the authoritative channel, not whatever is in the URL path).
+func (h *Handler) requireMessageMember(w http.ResponseWriter, r *http.Request, messageID string) (*Message, bool) {
+	msg, err := h.repo.GetByID(r.Context(), messageID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return nil, false
+	}
+	if msg == nil {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "message not found")
+		return nil, false
+	}
+	userID := authctx.UserID(r.Context())
+	member, err := h.chanRepo.GetMember(r.Context(), msg.ChannelID, userID)
+	if err != nil || member == nil {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
+		return nil, false
+	}
+	return msg, true
+}
+
 // --- handlers ---
 
 func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
@@ -186,13 +207,8 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
-	msg, err := h.repo.GetByID(r.Context(), r.PathValue("message_id"))
-	if err != nil {
-		httputil.HandleError(w, httputil.NewInternal(err))
-		return
-	}
-	if msg == nil {
-		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "message not found")
+	msg, ok := h.requireMessageMember(w, r, r.PathValue("message_id"))
+	if !ok {
 		return
 	}
 	_ = h.repo.HydrateReactions(r.Context(), []*Message{msg})
@@ -331,6 +347,9 @@ func (h *Handler) RemoveReaction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetReactions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireMessageMember(w, r, r.PathValue("message_id")); !ok {
+		return
+	}
 	reactions, err := h.repo.ListReactions(r.Context(), r.PathValue("message_id"))
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
@@ -344,6 +363,9 @@ func (h *Handler) GetReactions(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) ListThread(w http.ResponseWriter, r *http.Request) {
 	parentID := r.PathValue("message_id")
+	if _, ok := h.requireMessageMember(w, r, parentID); !ok {
+		return
+	}
 	messages, err := h.repo.ListThread(r.Context(), parentID, 100)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))

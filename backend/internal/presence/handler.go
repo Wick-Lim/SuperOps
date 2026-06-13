@@ -5,6 +5,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
@@ -25,6 +26,16 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 // WorkspacePresence returns the presence status of every member of a workspace.
 func (h *Handler) WorkspacePresence(w http.ResponseWriter, r *http.Request) {
 	wsID := r.PathValue("workspace_id")
+	userID := authctx.UserID(r.Context())
+
+	var member bool
+	_ = h.pool.QueryRow(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)`,
+		wsID, userID).Scan(&member)
+	if !member {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this workspace")
+		return
+	}
 
 	rows, err := h.pool.Query(r.Context(),
 		`SELECT user_id FROM workspace_members WHERE workspace_id = $1`, wsID)
@@ -54,6 +65,17 @@ func (h *Handler) WorkspacePresence(w http.ResponseWriter, r *http.Request) {
 // ChannelTyping returns the list of user IDs currently typing in a channel.
 func (h *Handler) ChannelTyping(w http.ResponseWriter, r *http.Request) {
 	chID := r.PathValue("channel_id")
+	userID := authctx.UserID(r.Context())
+
+	var member bool
+	_ = h.pool.QueryRow(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2)`,
+		chID, userID).Scan(&member)
+	if !member {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
+		return
+	}
+
 	users := h.service.GetTypingUsers(r.Context(), chID)
 	if users == nil {
 		users = []string{}
