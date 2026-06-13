@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -108,14 +109,17 @@ func (s *Service) Search(ctx context.Context, workspaceID, query string, channel
 		return nil, fmt.Errorf("search: %w", err)
 	}
 
-	var hits []MessageDoc
+	// Meilisearch hit values come back as json.RawMessage; decode each hit into
+	// the typed doc rather than fmt.Sprint-ing raw bytes.
+	hits := []MessageDoc{}
 	for _, hit := range res.Hits {
-		doc := MessageDoc{
-			ID:          fmt.Sprint(hit["id"]),
-			ChannelID:   fmt.Sprint(hit["channel_id"]),
-			WorkspaceID: fmt.Sprint(hit["workspace_id"]),
-			UserID:      fmt.Sprint(hit["user_id"]),
-			Content:     fmt.Sprint(hit["content"]),
+		b, err := json.Marshal(hit)
+		if err != nil {
+			continue
+		}
+		var doc MessageDoc
+		if err := json.Unmarshal(b, &doc); err != nil {
+			continue
 		}
 		hits = append(hits, doc)
 	}
