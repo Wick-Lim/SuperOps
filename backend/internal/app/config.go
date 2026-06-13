@@ -8,15 +8,22 @@ import (
 )
 
 type Config struct {
-	Server   ServerConfig
-	DB       DBConfig
-	Redis    RedisConfig
-	NATS     NATSConfig
-	JWT      JWTConfig
-	MinIO    MinIOConfig
-	Meili    MeiliConfig
-	Admin    AdminConfig
-	LogLevel string
+	Server    ServerConfig
+	DB        DBConfig
+	Redis     RedisConfig
+	NATS      NATSConfig
+	JWT       JWTConfig
+	MinIO     MinIOConfig
+	Meili     MeiliConfig
+	Admin     AdminConfig
+	RateLimit RateLimitConfig
+	LogLevel  string
+}
+
+type RateLimitConfig struct {
+	Enabled       bool
+	APIPerMinute  int // general authenticated API ceiling
+	AuthPerMinute int // strict limit for login/refresh/accept-invite (per IP)
 }
 
 type AdminConfig struct {
@@ -125,6 +132,11 @@ func LoadConfig() (*Config, error) {
 			Email:    envStr("ADMIN_EMAIL", ""),
 			Password: envStr("ADMIN_PASSWORD", ""),
 			Username: envStr("ADMIN_USERNAME", "admin"),
+		},
+		RateLimit: RateLimitConfig{
+			Enabled:       envBool("RATE_LIMIT_ENABLED", true),
+			APIPerMinute:  envInt("RATE_LIMIT_API_PER_MIN", 600),
+			AuthPerMinute: envInt("RATE_LIMIT_AUTH_PER_MIN", 10),
 		},
 		LogLevel: envStr("LOG_LEVEL", "info"),
 	}

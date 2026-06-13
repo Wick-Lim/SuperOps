@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -61,34 +62,35 @@ func main() {
 		l.Info("JetStream stream SUPEROPS ready")
 	}
 
-	// Search indexer
+	// Search indexer — queue group ensures each event is indexed once across
+	// multiple worker replicas. Subscribes to all message lifecycle events.
 	if cfg.Meili.Host != "" {
 		searchSvc, err := search.NewService(cfg.Meili.Host, cfg.Meili.MasterKey, l)
 		if err != nil {
 			l.Warn("meilisearch not available, search indexing disabled", "error", err)
 		} else {
 			indexer := search.NewIndexer(searchSvc, l)
-			_, err := natsClient.Conn.Subscribe("superops.*.message.created", indexer.HandleMessage)
-			if err != nil {
+			if _, err := natsClient.Conn.QueueSubscribe("superops.*.message.*", "indexer", indexer.HandleMessage); err != nil {
 				l.Error("subscribe search indexer", "error", err)
 			} else {
-				l.Info("search indexer subscribed to message.created")
+				l.Info("search indexer subscribed to message.*")
 			}
 		}
 	}
 
-	// Notification service
+	// Notification service — queue group ensures each event notifies once.
 	notifRepo := notification.NewRepository(pool)
-	notifSvc := notification.NewService(notifRepo, l)
-	_, err = natsClient.Conn.Subscribe("superops.*.message.created", notifSvc.HandleMessage)
-	if err != nil {
+	notifSvc := notification.NewService(notifRepo, pool, natsClient, l)
+	if _, err := natsClient.Conn.QueueSubscribe("superops.*.message.created", "notifier", notifSvc.HandleMessage); err != nil {
 		l.Error("subscribe notification service", "error", err)
 	} else {
 		l.Info("notification service subscribed to message.created")
 	}
 
-	// Session cleanup (every 10 minutes)
-	go sessionCleanup(ctx, pool, nil)
+	// Background jobs
+	go sessionCleanup(ctx, pool, l)
+	go scheduledMessageJob(ctx, pool, natsClient, l)
+	go retentionJob(ctx, pool, l)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -100,20 +102,108 @@ func main() {
 	l.Info("worker shutting down")
 }
 
-func sessionCleanup(ctx context.Context, pool *pgxpool.Pool, _ interface{}) {
+func sessionCleanup(ctx context.Context, pool *pgxpool.Pool, l *slog.Logger) {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			tag, err := pool.Exec(ctx, "DELETE FROM sessions WHERE expires_at < NOW()")
-			if err == nil {
-				if tag.RowsAffected() > 0 {
-					// log cleaned sessions
-					_ = tag
+			if tag, err := pool.Exec(ctx, "DELETE FROM sessions WHERE expires_at < NOW()"); err == nil && tag.RowsAffected() > 0 {
+				l.Info("cleaned expired sessions", "count", tag.RowsAffected())
+			}
+			// Also clean up long-expired invitations.
+			pool.Exec(ctx, "UPDATE invitations SET status = 'expired' WHERE status = 'pending' AND expires_at < NOW()")
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// scheduledMessageJob promotes due scheduled messages to live messages and
+// broadcasts them so they appear in real time.
+func scheduledMessageJob(ctx context.Context, pool *pgxpool.Pool, nc *natspkg.Client, l *slog.Logger) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			rows, err := pool.Query(ctx,
+				`UPDATE messages SET is_scheduled = FALSE, created_at = NOW(), updated_at = NOW()
+				 WHERE is_scheduled = TRUE AND scheduled_at IS NOT NULL AND scheduled_at <= NOW()
+				 RETURNING id, channel_id, user_id, parent_id, content, content_type, created_at`)
+			if err != nil {
+				l.Warn("scheduled job: query", "error", err)
+				continue
+			}
+			type due struct {
+				id, channelID, userID, content, contentType string
+				parentID                                     *string
+				createdAt                                    time.Time
+			}
+			var dues []due
+			for rows.Next() {
+				var d due
+				if err := rows.Scan(&d.id, &d.channelID, &d.userID, &d.parentID, &d.content, &d.contentType, &d.createdAt); err == nil {
+					dues = append(dues, d)
 				}
 			}
+			rows.Close()
+
+			for _, d := range dues {
+				var wsID string
+				_ = pool.QueryRow(ctx, `SELECT workspace_id FROM channels WHERE id = $1`, d.channelID).Scan(&wsID)
+				pool.Exec(ctx, `UPDATE channels SET last_message_at = NOW() WHERE id = $1`, d.channelID)
+				if wsID == "" {
+					continue
+				}
+				_ = nc.Publish("superops."+wsID+".message.created", natspkg.Event{
+					Type: "message.new",
+					Data: map[string]interface{}{
+						"id": d.id, "channel_id": d.channelID, "user_id": d.userID,
+						"parent_id": d.parentID, "content": d.content, "content_type": d.contentType,
+						"created_at": d.createdAt.Format(time.RFC3339Nano),
+					},
+				})
+			}
+			if len(dues) > 0 {
+				l.Info("sent scheduled messages", "count", len(dues))
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// retentionJob enforces per-workspace message retention policies by hard-deleting
+// messages older than the configured number of days.
+func retentionJob(ctx context.Context, pool *pgxpool.Pool, l *slog.Logger) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	run := func() {
+		tag, err := pool.Exec(ctx,
+			`DELETE FROM messages m
+			 USING channels c, workspaces w
+			 WHERE m.channel_id = c.id AND c.workspace_id = w.id
+			   AND w.retention_days > 0
+			   AND m.created_at < NOW() - (w.retention_days || ' days')::interval`)
+		if err != nil {
+			l.Warn("retention job", "error", err)
+			return
+		}
+		if tag.RowsAffected() > 0 {
+			l.Info("retention: purged messages", "count", tag.RowsAffected())
+		}
+	}
+
+	// Run once at startup, then hourly.
+	run()
+	for {
+		select {
+		case <-ticker.C:
+			run()
 		case <-ctx.Done():
 			return
 		}

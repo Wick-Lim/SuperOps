@@ -1,8 +1,8 @@
 package message
 
 import (
+	"context"
 	"net/http"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -13,10 +13,20 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
+// Wire/outbound event types (mirror internal/ws.Type* constants — these are the
+// public wire protocol, decoupled to avoid an import cycle).
+const (
+	evtMessageNew      = "message.new"
+	evtMessageUpdated  = "message.updated"
+	evtMessageDeleted  = "message.deleted"
+	evtReactionAdded   = "reaction.added"
+	evtReactionRemoved = "reaction.removed"
+)
+
 type Handler struct {
-	repo    *Repository
+	repo     *Repository
 	chanRepo *channel.Repository
-	nats    *natspkg.Client
+	nats     *natspkg.Client
 }
 
 func NewHandler(repo *Repository, chanRepo *channel.Repository, nats *natspkg.Client) *Handler {
@@ -31,8 +41,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("DELETE /api/v1/channels/{channel_id}/messages/{message_id}", authMw(http.HandlerFunc(h.Delete)))
 	mux.Handle("POST /api/v1/channels/{channel_id}/messages/{message_id}/reactions", authMw(http.HandlerFunc(h.AddReaction)))
 	mux.Handle("DELETE /api/v1/channels/{channel_id}/messages/{message_id}/reactions/{emoji}", authMw(http.HandlerFunc(h.RemoveReaction)))
+	mux.Handle("GET /api/v1/messages/{message_id}/reactions", authMw(http.HandlerFunc(h.GetReactions)))
 	mux.Handle("GET /api/v1/messages/{message_id}/thread", authMw(http.HandlerFunc(h.ListThread)))
 	mux.Handle("POST /api/v1/messages/{message_id}/thread", authMw(http.HandlerFunc(h.ReplyThread)))
+	mux.Handle("GET /api/v1/channels/{channel_id}/pins", authMw(http.HandlerFunc(h.ListPins)))
 	mux.Handle("POST /api/v1/channels/{channel_id}/messages/{message_id}/pin", authMw(http.HandlerFunc(h.Pin)))
 	mux.Handle("DELETE /api/v1/channels/{channel_id}/messages/{message_id}/pin", authMw(http.HandlerFunc(h.Unpin)))
 	mux.Handle("POST /api/v1/messages/{message_id}/bookmark", authMw(http.HandlerFunc(h.Bookmark)))
@@ -41,94 +53,57 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("POST /api/v1/channels/{channel_id}/messages/{message_id}/forward", authMw(http.HandlerFunc(h.Forward)))
 }
 
-func (h *Handler) Pin(w http.ResponseWriter, r *http.Request) {
-	userID := authctx.UserID(r.Context())
-	msgID := r.PathValue("message_id")
-	h.repo.pool.Exec(r.Context(), `UPDATE messages SET is_pinned = TRUE, pinned_by = $2, pinned_at = NOW() WHERE id = $1`, msgID, userID)
-	httputil.JSON(w, http.StatusOK, map[string]string{"message": "pinned"})
+// --- event publishing helpers ---
+
+func subjectSuffix(eventType string) string {
+	switch eventType {
+	case evtMessageNew:
+		return "message.created"
+	case evtMessageUpdated:
+		return "message.updated"
+	case evtMessageDeleted:
+		return "message.deleted"
+	default:
+		return eventType
+	}
 }
 
-func (h *Handler) Unpin(w http.ResponseWriter, r *http.Request) {
-	msgID := r.PathValue("message_id")
-	h.repo.pool.Exec(r.Context(), `UPDATE messages SET is_pinned = FALSE, pinned_by = NULL, pinned_at = NULL WHERE id = $1`, msgID)
-	httputil.JSON(w, http.StatusOK, map[string]string{"message": "unpinned"})
-}
-
-func (h *Handler) Bookmark(w http.ResponseWriter, r *http.Request) {
-	userID := authctx.UserID(r.Context())
-	msgID := r.PathValue("message_id")
-	h.repo.pool.Exec(r.Context(), `INSERT INTO bookmarks (user_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, msgID)
-	httputil.JSON(w, http.StatusCreated, map[string]string{"message": "bookmarked"})
-}
-
-func (h *Handler) RemoveBookmark(w http.ResponseWriter, r *http.Request) {
-	userID := authctx.UserID(r.Context())
-	msgID := r.PathValue("message_id")
-	h.repo.pool.Exec(r.Context(), `DELETE FROM bookmarks WHERE user_id = $1 AND message_id = $2`, userID, msgID)
-	httputil.JSON(w, http.StatusOK, map[string]string{"message": "removed"})
-}
-
-func (h *Handler) ListBookmarks(w http.ResponseWriter, r *http.Request) {
-	userID := authctx.UserID(r.Context())
-	rows, err := h.repo.pool.Query(r.Context(),
-		`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at
-		 FROM bookmarks b JOIN messages m ON b.message_id = m.id
-		 WHERE b.user_id = $1 ORDER BY b.created_at DESC LIMIT 50`, userID)
-	if err != nil {
-		httputil.HandleError(w, httputil.NewInternal(err))
+func (h *Handler) publishWS(workspaceID, eventType string, data interface{}) {
+	if h.nats == nil || workspaceID == "" {
 		return
 	}
-	defer rows.Close()
-
-	var items []map[string]interface{}
-	for rows.Next() {
-		var id, chID, uid, content string
-		var createdAt interface{}
-		rows.Scan(&id, &chID, &uid, &content, &createdAt)
-		items = append(items, map[string]interface{}{"id": id, "channel_id": chID, "user_id": uid, "content": content, "created_at": createdAt})
-	}
-	if items == nil { items = []map[string]interface{}{} }
-	httputil.JSON(w, http.StatusOK, items)
+	_ = h.nats.Publish("superops."+workspaceID+"."+subjectSuffix(eventType), natspkg.Event{Type: eventType, Data: data})
 }
 
-func (h *Handler) Forward(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) publishCh(ctx context.Context, channelID, eventType string, data interface{}) {
+	if h.nats == nil {
+		return
+	}
+	ch, err := h.chanRepo.GetByID(ctx, channelID)
+	if err != nil || ch == nil {
+		return
+	}
+	h.publishWS(ch.WorkspaceID, eventType, data)
+}
+
+// requireMember returns the caller's channel membership or writes a 403 and
+// returns false.
+func (h *Handler) requireMember(w http.ResponseWriter, r *http.Request, channelID string) bool {
 	userID := authctx.UserID(r.Context())
-	msgID := r.PathValue("message_id")
-
-	var input struct {
-		TargetChannelID string `json:"target_channel_id"`
+	member, err := h.chanRepo.GetMember(r.Context(), channelID, userID)
+	if err != nil || member == nil {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
+		return false
 	}
-	if err := httputil.DecodeJSON(r, &input); err != nil || input.TargetChannelID == "" {
-		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "target_channel_id is required")
-		return
-	}
-
-	// Get original message
-	msg, err := h.repo.GetByID(r.Context(), msgID)
-	if err != nil || msg == nil {
-		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "message not found")
-		return
-	}
-
-	// Create forwarded message in target channel
-	fwd := &Message{
-		ID:          uuid.NewString(),
-		ChannelID:   input.TargetChannelID,
-		UserID:      userID,
-		Content:     "[Forwarded] " + msg.Content,
-		ContentType: "markdown",
-	}
-	h.repo.Create(r.Context(), fwd)
-	h.chanRepo.UpdateLastMessage(r.Context(), input.TargetChannelID, time.Now())
-
-	httputil.JSON(w, http.StatusCreated, fwd)
+	return true
 }
+
+// --- handlers ---
 
 func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 	chID := r.PathValue("channel_id")
 
-	// Check membership
 	member, err := h.chanRepo.GetMember(r.Context(), chID, userID)
 	if err != nil || member == nil {
 		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
@@ -149,7 +124,6 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "content is required")
 		return
 	}
-
 	if input.ContentType == "" {
 		input.ContentType = "markdown"
 	}
@@ -168,30 +142,20 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update channel last_message_at
-	now := time.Now()
-	h.chanRepo.UpdateLastMessage(r.Context(), chID, now)
-
-	// Fetch the full message to return with timestamps
-	created, _ := h.repo.GetByID(r.Context(), msg.ID)
-	if created != nil {
+	if created, _ := h.repo.GetByID(r.Context(), msg.ID); created != nil {
 		msg = created
 	}
 
-	// Publish event via NATS
-	ch, _ := h.chanRepo.GetByID(r.Context(), chID)
-	if ch != nil && h.nats != nil {
-		h.nats.Publish(
-			"superops."+ch.WorkspaceID+".message.created",
-			natspkg.Event{Type: "message.new", Data: msg},
-		)
-	}
+	h.publishCh(r.Context(), chID, evtMessageNew, msg)
 
 	httputil.JSON(w, http.StatusCreated, msg)
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	chID := r.PathValue("channel_id")
+	if !h.requireMember(w, r, chID) {
+		return
+	}
 	params := httputil.ParsePagination(r)
 
 	messages, err := h.repo.ListByChannel(r.Context(), chID, params.Cursor, params.Limit+1)
@@ -204,9 +168,13 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		messages = messages[:params.Limit]
 	}
-
 	if messages == nil {
 		messages = []*Message{}
+	}
+
+	if err := h.repo.HydrateReactions(r.Context(), messages); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
 	}
 
 	var cursor string
@@ -227,6 +195,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "message not found")
 		return
 	}
+	_ = h.repo.HydrateReactions(r.Context(), []*Message{msg})
 	httputil.JSON(w, http.StatusOK, msg)
 }
 
@@ -247,8 +216,8 @@ func (h *Handler) Edit(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Content string `json:"content"`
 	}
-	if err := httputil.DecodeJSON(r, &input); err != nil {
-		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
+	if err := httputil.DecodeJSON(r, &input); err != nil || input.Content == "" {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "content is required")
 		return
 	}
 
@@ -257,7 +226,15 @@ func (h *Handler) Edit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, _ := h.repo.GetByID(r.Context(), msgID)
+	updated, err := h.repo.GetByID(r.Context(), msgID)
+	if err != nil || updated == nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	_ = h.repo.HydrateReactions(r.Context(), []*Message{updated})
+
+	h.publishCh(r.Context(), updated.ChannelID, evtMessageUpdated, updated)
+
 	httputil.JSON(w, http.StatusOK, updated)
 }
 
@@ -280,12 +257,21 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publishCh(r.Context(), msg.ChannelID, evtMessageDeleted, map[string]string{
+		"id":         msgID,
+		"channel_id": msg.ChannelID,
+	})
+
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "deleted"})
 }
 
 func (h *Handler) AddReaction(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
+	chID := r.PathValue("channel_id")
 	msgID := r.PathValue("message_id")
+	if !h.requireMember(w, r, chID) {
+		return
+	}
 
 	var input struct {
 		Emoji string `json:"emoji"`
@@ -302,9 +288,19 @@ func (h *Handler) AddReaction(w http.ResponseWriter, r *http.Request) {
 		Emoji:     input.Emoji,
 	}
 
-	if err := h.repo.AddReaction(r.Context(), reaction); err != nil {
+	inserted, err := h.repo.AddReaction(r.Context(), reaction)
+	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
+	}
+
+	if inserted {
+		h.publishCh(r.Context(), chID, evtReactionAdded, map[string]string{
+			"channel_id": chID,
+			"message_id": msgID,
+			"user_id":    userID,
+			"emoji":      input.Emoji,
+		})
 	}
 
 	httputil.JSON(w, http.StatusCreated, reaction)
@@ -312,15 +308,38 @@ func (h *Handler) AddReaction(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) RemoveReaction(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
+	chID := r.PathValue("channel_id")
 	msgID := r.PathValue("message_id")
 	emoji := r.PathValue("emoji")
+	if !h.requireMember(w, r, chID) {
+		return
+	}
 
 	if err := h.repo.RemoveReaction(r.Context(), msgID, userID, emoji); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
 
+	h.publishCh(r.Context(), chID, evtReactionRemoved, map[string]string{
+		"channel_id": chID,
+		"message_id": msgID,
+		"user_id":    userID,
+		"emoji":      emoji,
+	})
+
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "reaction removed"})
+}
+
+func (h *Handler) GetReactions(w http.ResponseWriter, r *http.Request) {
+	reactions, err := h.repo.ListReactions(r.Context(), r.PathValue("message_id"))
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if reactions == nil {
+		reactions = []*Reaction{}
+	}
+	httputil.JSON(w, http.StatusOK, reactions)
 }
 
 func (h *Handler) ListThread(w http.ResponseWriter, r *http.Request) {
@@ -333,6 +352,7 @@ func (h *Handler) ListThread(w http.ResponseWriter, r *http.Request) {
 	if messages == nil {
 		messages = []*Message{}
 	}
+	_ = h.repo.HydrateReactions(r.Context(), messages)
 	httputil.JSON(w, http.StatusOK, messages)
 }
 
@@ -343,6 +363,11 @@ func (h *Handler) ReplyThread(w http.ResponseWriter, r *http.Request) {
 	parent, err := h.repo.GetByID(r.Context(), parentID)
 	if err != nil || parent == nil {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "parent message not found")
+		return
+	}
+
+	if member, err := h.chanRepo.GetMember(r.Context(), parent.ChannelID, userID); err != nil || member == nil {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
 		return
 	}
 
@@ -368,10 +393,155 @@ func (h *Handler) ReplyThread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	created, _ := h.repo.GetByID(r.Context(), msg.ID)
-	if created != nil {
+	if created, _ := h.repo.GetByID(r.Context(), msg.ID); created != nil {
 		msg = created
 	}
 
+	// Broadcast the new reply, then the parent (its reply_count changed).
+	h.publishCh(r.Context(), msg.ChannelID, evtMessageNew, msg)
+	if updatedParent, _ := h.repo.GetByID(r.Context(), parentID); updatedParent != nil {
+		h.publishCh(r.Context(), msg.ChannelID, evtMessageUpdated, updatedParent)
+	}
+
 	httputil.JSON(w, http.StatusCreated, msg)
+}
+
+func (h *Handler) ListPins(w http.ResponseWriter, r *http.Request) {
+	chID := r.PathValue("channel_id")
+	if !h.requireMember(w, r, chID) {
+		return
+	}
+	messages, err := h.repo.ListPinned(r.Context(), chID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if messages == nil {
+		messages = []*Message{}
+	}
+	_ = h.repo.HydrateReactions(r.Context(), messages)
+	httputil.JSON(w, http.StatusOK, messages)
+}
+
+func (h *Handler) Pin(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	chID := r.PathValue("channel_id")
+	msgID := r.PathValue("message_id")
+	if !h.requireMember(w, r, chID) {
+		return
+	}
+	if err := h.repo.SetPinned(r.Context(), msgID, userID, true); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if updated, _ := h.repo.GetByID(r.Context(), msgID); updated != nil {
+		h.publishCh(r.Context(), chID, evtMessageUpdated, updated)
+	}
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "pinned"})
+}
+
+func (h *Handler) Unpin(w http.ResponseWriter, r *http.Request) {
+	chID := r.PathValue("channel_id")
+	msgID := r.PathValue("message_id")
+	if !h.requireMember(w, r, chID) {
+		return
+	}
+	if err := h.repo.SetPinned(r.Context(), msgID, "", false); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if updated, _ := h.repo.GetByID(r.Context(), msgID); updated != nil {
+		h.publishCh(r.Context(), chID, evtMessageUpdated, updated)
+	}
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "unpinned"})
+}
+
+func (h *Handler) Bookmark(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	msgID := r.PathValue("message_id")
+	if _, err := h.repo.pool.Exec(r.Context(),
+		`INSERT INTO bookmarks (user_id, message_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, msgID); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	httputil.JSON(w, http.StatusCreated, map[string]string{"message": "bookmarked"})
+}
+
+func (h *Handler) RemoveBookmark(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	msgID := r.PathValue("message_id")
+	if _, err := h.repo.pool.Exec(r.Context(),
+		`DELETE FROM bookmarks WHERE user_id = $1 AND message_id = $2`, userID, msgID); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "removed"})
+}
+
+func (h *Handler) ListBookmarks(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	rows, err := h.repo.pool.Query(r.Context(),
+		`SELECT m.id, m.channel_id, m.user_id, m.content, m.created_at
+		 FROM bookmarks b JOIN messages m ON b.message_id = m.id
+		 WHERE b.user_id = $1 ORDER BY b.created_at DESC LIMIT 50`, userID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	defer rows.Close()
+
+	items := []map[string]interface{}{}
+	for rows.Next() {
+		var id, chID, uid, content string
+		var createdAt interface{}
+		if err := rows.Scan(&id, &chID, &uid, &content, &createdAt); err != nil {
+			continue
+		}
+		items = append(items, map[string]interface{}{"id": id, "channel_id": chID, "user_id": uid, "content": content, "created_at": createdAt})
+	}
+	httputil.JSON(w, http.StatusOK, items)
+}
+
+func (h *Handler) Forward(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	msgID := r.PathValue("message_id")
+
+	var input struct {
+		TargetChannelID string `json:"target_channel_id"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil || input.TargetChannelID == "" {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "target_channel_id is required")
+		return
+	}
+
+	// Caller must be a member of the target channel.
+	if member, err := h.chanRepo.GetMember(r.Context(), input.TargetChannelID, userID); err != nil || member == nil {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of the target channel")
+		return
+	}
+
+	msg, err := h.repo.GetByID(r.Context(), msgID)
+	if err != nil || msg == nil {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "message not found")
+		return
+	}
+
+	fwd := &Message{
+		ID:          uuid.NewString(),
+		ChannelID:   input.TargetChannelID,
+		UserID:      userID,
+		Content:     "[Forwarded] " + msg.Content,
+		ContentType: "markdown",
+	}
+	if err := h.repo.Create(r.Context(), fwd); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if created, _ := h.repo.GetByID(r.Context(), fwd.ID); created != nil {
+		fwd = created
+	}
+
+	h.publishCh(r.Context(), input.TargetChannelID, evtMessageNew, fwd)
+
+	httputil.JSON(w, http.StatusCreated, fwd)
 }

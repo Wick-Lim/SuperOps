@@ -42,3 +42,30 @@ func RequireWorkspaceRole(pool *pgxpool.Pool, roles ...string) func(http.Handler
 		})
 	}
 }
+
+// RequireSystemAdmin gates endpoints that are not workspace-scoped in their
+// path (the /api/v1/admin/* surface). It allows callers who are an owner or
+// admin of at least one workspace.
+func RequireSystemAdmin(pool *pgxpool.Pool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			userID := authctx.UserID(r.Context())
+			if userID == "" {
+				httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "access denied")
+				return
+			}
+
+			var ok bool
+			err := pool.QueryRow(r.Context(),
+				`SELECT EXISTS(SELECT 1 FROM workspace_members WHERE user_id = $1 AND role IN ('owner','admin'))`,
+				userID,
+			).Scan(&ok)
+			if err != nil || !ok {
+				httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "admin privileges required")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}

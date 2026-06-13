@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -20,6 +21,8 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
+	"github.com/Wick-Lim/SuperOps/backend/internal/ratelimit"
+	"github.com/Wick-Lim/SuperOps/backend/internal/rbac"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/internal/webhook"
@@ -80,7 +83,6 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	jwtMgr := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenTTL)
 	authService := auth.NewService(authRepo, userRepo, pool, jwtMgr, cfg.JWT.RefreshTokenTTL)
 	presenceService := presence.NewService(redisClient)
-	_ = presenceService
 
 	notificationRepo := notification.NewRepository(pool)
 
@@ -106,9 +108,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		fileStorage = nil
 	}
 
-	// WebSocket Hub with NATS bridge for multi-replica support
+	// WebSocket Hub with NATS bridge for multi-replica support.
+	// - NATS bridge: relays client-originated ephemeral events (typing) between replicas.
+	// - Event relay: fans application domain events (message/reaction/notification) to local clients.
 	hub := ws.NewHub(logger)
 	hub.StartNATSBridge(natsClient.Conn, logger)
+	hub.StartEventRelay(natsClient.Conn, logger)
 	go hub.Run()
 
 	// Handlers
@@ -117,15 +122,15 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	workspaceHandler := workspace.NewHandler(workspaceRepo)
 	channelHandler := channel.NewHandler(channelRepo)
 	messageHandler := message.NewHandler(messageRepo, channelRepo, natsClient)
-	wsHandler := ws.NewWSHandler(hub, jwtMgr, logger)
+	wsHandler := ws.NewWSHandler(hub, jwtMgr, presenceService, logger)
+	presenceHandler := presence.NewHandler(presenceService, pool)
 	var fileHandler *file.Handler
 	if fileStorage != nil {
 		fileHandler = file.NewHandler(fileStorage, pool)
 	}
 	notificationHandler := notification.NewHandler(notificationRepo)
 	auditService := audit.NewService(pool)
-	_ = auditService // available for handler-level audit logging
-	adminHandler := admin.NewHandler(pool)
+	adminHandler := admin.NewHandler(pool, auditService)
 	var searchHandler *search.Handler
 	if searchService != nil {
 		searchHandler = search.NewHandler(searchService)
@@ -138,21 +143,37 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	mux.HandleFunc("GET /health", healthHandler(pool, redisClient))
 	mux.HandleFunc("GET /ready", healthHandler(pool, redisClient))
 
-	// Auth routes (no auth middleware)
-	authHandler.RegisterRoutes(mux)
+	// Rate limiters (Redis-backed). A strict per-IP limit guards the
+	// brute-forceable auth endpoints; a generous per-user limit guards the API.
+	var loginLimiter func(http.Handler) http.Handler
+	if cfg.RateLimit.Enabled {
+		loginLimiter = ratelimit.MiddlewareByIP(redisClient, ratelimit.Config{
+			RequestsPerMinute: cfg.RateLimit.AuthPerMinute,
+			Window:            time.Minute,
+		})
+	}
+
+	// Auth routes (no auth middleware; login/refresh/accept-invite are rate-limited)
+	authHandler.RegisterRoutes(mux, loginLimiter)
 
 	// Auth middleware
 	authMw := auth.Middleware(jwtMgr)
 
 	// Protected routes
+	authHandler.RegisterProtectedRoutes(mux, authMw)
 	userHandler.RegisterRoutes(mux, authMw)
 	workspaceHandler.RegisterRoutes(mux, authMw)
 	channelHandler.RegisterRoutes(mux, authMw)
+	presenceHandler.RegisterRoutes(mux, authMw)
 	if fileHandler != nil {
 		fileHandler.RegisterRoutes(mux, authMw)
 	}
 	notificationHandler.RegisterRoutes(mux, authMw)
-	adminHandler.RegisterRoutes(mux, authMw)
+	// Admin endpoints require an authenticated caller who administers a workspace.
+	adminMw := func(next http.Handler) http.Handler {
+		return authMw(rbac.RequireSystemAdmin(pool)(next))
+	}
+	adminHandler.RegisterRoutes(mux, adminMw)
 	if searchHandler != nil {
 		searchHandler.RegisterRoutes(mux, authMw)
 	}
@@ -165,6 +186,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 
 	// Middleware chain
 	var handler http.Handler = mux
+	if cfg.RateLimit.Enabled {
+		handler = ratelimit.APIMiddleware(redisClient, ratelimit.Config{
+			RequestsPerMinute: cfg.RateLimit.APIPerMinute,
+			Window:            time.Minute,
+		})(handler)
+	}
 	handler = httputil.RequestIDMiddleware(handler)
 	handler = httputil.LoggingMiddleware(logger)(handler)
 	handler = httputil.RecoveryMiddleware(logger)(handler)

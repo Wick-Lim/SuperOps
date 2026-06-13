@@ -3,7 +3,6 @@ package ws
 import (
 	"encoding/json"
 	"log/slog"
-	"strings"
 
 	"github.com/nats-io/nats.go"
 )
@@ -12,6 +11,7 @@ const natsSubjectPrefix = "ws.broadcast."
 
 // BroadcastEnvelope is published to NATS for cross-instance delivery.
 type BroadcastEnvelope struct {
+	OriginID      string `json:"origin_id"`
 	ChannelID     string `json:"channel_id"`
 	ExcludeUserID string `json:"exclude_user_id"`
 	Payload       []byte `json:"payload"`
@@ -26,6 +26,13 @@ func (h *Hub) StartNATSBridge(nc *nats.Conn, logger *slog.Logger) {
 		var env BroadcastEnvelope
 		if err := json.Unmarshal(msg.Data, &env); err != nil {
 			logger.Warn("nats bridge: unmarshal", "error", err)
+			return
+		}
+
+		// Skip envelopes we published ourselves — the origin replica already
+		// delivered them locally in BroadcastToChannel, and core NATS echoes a
+		// connection's own publishes back to it.
+		if env.OriginID == h.id {
 			return
 		}
 
@@ -45,6 +52,7 @@ func (h *Hub) publishToNATS(channelID string, payload []byte, excludeUserID stri
 		return
 	}
 	env := BroadcastEnvelope{
+		OriginID:      h.id,
 		ChannelID:     channelID,
 		ExcludeUserID: excludeUserID,
 		Payload:       payload,
@@ -72,12 +80,4 @@ func (h *Hub) localBroadcastRaw(channelID string, payload []byte, excludeUserID 
 			}
 		}
 	}
-}
-
-func extractChannelFromSubject(subject string) string {
-	// ws.broadcast.{channelId}
-	if idx := strings.LastIndex(subject, "."); idx >= 0 {
-		return subject[idx+1:]
-	}
-	return ""
 }

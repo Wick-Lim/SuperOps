@@ -7,7 +7,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
+
+// messageColumns is the canonical column list (and scan order) for a message row.
+const messageColumns = `id, channel_id, user_id, parent_id, content, content_type,
+	is_edited, is_deleted, reply_count, is_pinned, pinned_by, pinned_at, created_at, updated_at`
 
 type Repository struct {
 	pool *pgxpool.Pool
@@ -17,35 +23,40 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
+// Create inserts a message and, atomically in the same transaction, bumps the
+// parent reply_count (for thread replies) and the channel's last_message_at.
 func (r *Repository) Create(ctx context.Context, m *Message) error {
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO messages (id, channel_id, user_id, parent_id, content, content_type)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		m.ID, m.ChannelID, m.UserID, m.ParentID, m.Content, m.ContentType,
-	)
-	if err != nil {
-		return fmt.Errorf("create message: %w", err)
-	}
-
-	// Increment parent reply count if this is a thread reply
-	if m.ParentID != nil {
-		_, err = r.pool.Exec(ctx,
-			`UPDATE messages SET reply_count = reply_count + 1 WHERE id = $1`, *m.ParentID,
-		)
-		if err != nil {
-			return fmt.Errorf("increment reply count: %w", err)
+	return database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO messages (id, channel_id, user_id, parent_id, content, content_type)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			m.ID, m.ChannelID, m.UserID, m.ParentID, m.Content, m.ContentType,
+		); err != nil {
+			return fmt.Errorf("create message: %w", err)
 		}
-	}
 
-	return nil
+		if m.ParentID != nil {
+			if _, err := tx.Exec(ctx,
+				`UPDATE messages SET reply_count = reply_count + 1 WHERE id = $1`, *m.ParentID,
+			); err != nil {
+				return fmt.Errorf("increment reply count: %w", err)
+			}
+		}
+
+		if _, err := tx.Exec(ctx,
+			`UPDATE channels SET last_message_at = NOW() WHERE id = $1`, m.ChannelID,
+		); err != nil {
+			return fmt.Errorf("update last message: %w", err)
+		}
+		return nil
+	})
 }
 
 func (r *Repository) GetByID(ctx context.Context, id string) (*Message, error) {
 	m := &Message{}
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, channel_id, user_id, parent_id, content, content_type, is_edited, is_deleted, reply_count, created_at, updated_at
-		 FROM messages WHERE id = $1`, id,
-	).Scan(&m.ID, &m.ChannelID, &m.UserID, &m.ParentID, &m.Content, &m.ContentType, &m.IsEdited, &m.IsDeleted, &m.ReplyCount, &m.CreatedAt, &m.UpdatedAt)
+		`SELECT `+messageColumns+` FROM messages WHERE id = $1`, id,
+	).Scan(scanArgs(m)...)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -56,9 +67,9 @@ func (r *Repository) GetByID(ctx context.Context, id string) (*Message, error) {
 }
 
 func (r *Repository) ListByChannel(ctx context.Context, channelID string, before time.Time, limit int) ([]*Message, error) {
-	query := `SELECT id, channel_id, user_id, parent_id, content, content_type, is_edited, is_deleted, reply_count, created_at, updated_at
+	query := `SELECT ` + messageColumns + `
 		 FROM messages
-		 WHERE channel_id = $1 AND parent_id IS NULL AND is_deleted = FALSE`
+		 WHERE channel_id = $1 AND parent_id IS NULL AND is_deleted = FALSE AND is_scheduled = FALSE`
 
 	var rows pgx.Rows
 	var err error
@@ -81,7 +92,7 @@ func (r *Repository) ListByChannel(ctx context.Context, channelID string, before
 
 func (r *Repository) ListThread(ctx context.Context, parentID string, limit int) ([]*Message, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, channel_id, user_id, parent_id, content, content_type, is_edited, is_deleted, reply_count, created_at, updated_at
+		`SELECT `+messageColumns+`
 		 FROM messages
 		 WHERE parent_id = $1 AND is_deleted = FALSE
 		 ORDER BY created_at ASC
@@ -89,6 +100,22 @@ func (r *Repository) ListThread(ctx context.Context, parentID string, limit int)
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list thread: %w", err)
+	}
+	defer rows.Close()
+
+	return r.scanMessages(rows)
+}
+
+// ListPinned returns the non-deleted pinned messages of a channel.
+func (r *Repository) ListPinned(ctx context.Context, channelID string) ([]*Message, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+messageColumns+`
+		 FROM messages
+		 WHERE channel_id = $1 AND is_pinned = TRUE AND is_deleted = FALSE
+		 ORDER BY pinned_at DESC`, channelID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list pinned: %w", err)
 	}
 	defer rows.Close()
 
@@ -116,18 +143,31 @@ func (r *Repository) SoftDelete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (r *Repository) SetPinned(ctx context.Context, id, pinnedBy string, pinned bool) error {
+	if pinned {
+		_, err := r.pool.Exec(ctx,
+			`UPDATE messages SET is_pinned = TRUE, pinned_by = $2, pinned_at = NOW() WHERE id = $1`, id, pinnedBy)
+		return err
+	}
+	_, err := r.pool.Exec(ctx,
+		`UPDATE messages SET is_pinned = FALSE, pinned_by = NULL, pinned_at = NULL WHERE id = $1`, id)
+	return err
+}
+
 // Reactions
 
-func (r *Repository) AddReaction(ctx context.Context, reaction *Reaction) error {
-	_, err := r.pool.Exec(ctx,
+// AddReaction inserts a reaction, returning true if a new row was created
+// (false if the user had already reacted with the same emoji).
+func (r *Repository) AddReaction(ctx context.Context, reaction *Reaction) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
 		`INSERT INTO reactions (id, message_id, user_id, emoji) VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (message_id, user_id, emoji) DO NOTHING`,
 		reaction.ID, reaction.MessageID, reaction.UserID, reaction.Emoji,
 	)
 	if err != nil {
-		return fmt.Errorf("add reaction: %w", err)
+		return false, fmt.Errorf("add reaction: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 func (r *Repository) RemoveReaction(ctx context.Context, messageID, userID, emoji string) error {
@@ -161,14 +201,59 @@ func (r *Repository) ListReactions(ctx context.Context, messageID string) ([]*Re
 	return reactions, nil
 }
 
+// hydrateReactions attaches reactions to the given messages with a single query
+// (avoids N+1). Messages with no reactions get an empty slice.
+func (r *Repository) hydrateReactions(ctx context.Context, messages []*Message) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	ids := make([]string, len(messages))
+	byID := make(map[string]*Message, len(messages))
+	for i, m := range messages {
+		ids[i] = m.ID
+		byID[m.ID] = m
+	}
+
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, message_id, user_id, emoji, created_at FROM reactions WHERE message_id = ANY($1) ORDER BY created_at`, ids)
+	if err != nil {
+		return fmt.Errorf("hydrate reactions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		re := &Reaction{}
+		if err := rows.Scan(&re.ID, &re.MessageID, &re.UserID, &re.Emoji, &re.CreatedAt); err != nil {
+			return fmt.Errorf("scan reaction: %w", err)
+		}
+		if m, ok := byID[re.MessageID]; ok {
+			m.Reactions = append(m.Reactions, re)
+		}
+	}
+	return rows.Err()
+}
+
+// HydrateReactions is the exported wrapper used by handlers.
+func (r *Repository) HydrateReactions(ctx context.Context, messages []*Message) error {
+	return r.hydrateReactions(ctx, messages)
+}
+
+func scanArgs(m *Message) []any {
+	return []any{
+		&m.ID, &m.ChannelID, &m.UserID, &m.ParentID, &m.Content, &m.ContentType,
+		&m.IsEdited, &m.IsDeleted, &m.ReplyCount, &m.IsPinned, &m.PinnedBy, &m.PinnedAt,
+		&m.CreatedAt, &m.UpdatedAt,
+	}
+}
+
 func (r *Repository) scanMessages(rows pgx.Rows) ([]*Message, error) {
 	var messages []*Message
 	for rows.Next() {
 		m := &Message{}
-		if err := rows.Scan(&m.ID, &m.ChannelID, &m.UserID, &m.ParentID, &m.Content, &m.ContentType, &m.IsEdited, &m.IsDeleted, &m.ReplyCount, &m.CreatedAt, &m.UpdatedAt); err != nil {
+		if err := rows.Scan(scanArgs(m)...); err != nil {
 			return nil, fmt.Errorf("scan message: %w", err)
 		}
 		messages = append(messages, m)
 	}
-	return messages, nil
+	return messages, rows.Err()
 }

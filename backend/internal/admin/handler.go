@@ -6,17 +6,26 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
 type Handler struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	audit *audit.Service
 }
 
-func NewHandler(pool *pgxpool.Pool) *Handler {
-	return &Handler{pool: pool}
+func NewHandler(pool *pgxpool.Pool, auditSvc *audit.Service) *Handler {
+	return &Handler{pool: pool, audit: auditSvc}
+}
+
+// workspaceOf returns the caller's first workspace id (best-effort, for audit scoping).
+func (h *Handler) workspaceOf(r *http.Request, userID string) string {
+	var wsID string
+	_ = h.pool.QueryRow(r.Context(), `SELECT workspace_id FROM workspace_members WHERE user_id = $1 LIMIT 1`, userID).Scan(&wsID)
+	return wsID
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -67,6 +76,11 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
+	}
+
+	if h.audit != nil {
+		_ = h.audit.Log(r.Context(), wsID, userID, "invitation.created", "invitation", "",
+			map[string]interface{}{"email": input.Email, "role": input.Role})
 	}
 
 	httputil.JSON(w, http.StatusCreated, map[string]string{
@@ -147,7 +161,15 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if input.IsActive != nil {
-		h.pool.Exec(r.Context(), `UPDATE users SET is_active = $2 WHERE id = $1`, uid, *input.IsActive)
+		if _, err := h.pool.Exec(r.Context(), `UPDATE users SET is_active = $2 WHERE id = $1`, uid, *input.IsActive); err != nil {
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return
+		}
+		if h.audit != nil {
+			actor := authctx.UserID(r.Context())
+			_ = h.audit.Log(r.Context(), h.workspaceOf(r, actor), actor, "user.updated", "user", uid,
+				map[string]interface{}{"is_active": *input.IsActive})
+		}
 	}
 
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "user updated"})
@@ -169,10 +191,14 @@ func (h *Handler) Stats(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) AuditLogs(w http.ResponseWriter, r *http.Request) {
 	params := httputil.ParsePagination(r)
+	actor := authctx.UserID(r.Context())
 
+	// Only expose audit logs for workspaces the caller administers.
 	rows, err := h.pool.Query(r.Context(),
 		`SELECT id, workspace_id, actor_id, action, resource_type, resource_id, metadata::text, COALESCE(host(ip_address),''), created_at
-		 FROM audit_logs ORDER BY created_at DESC LIMIT $1`, params.Limit)
+		 FROM audit_logs
+		 WHERE workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = $1 AND role IN ('owner','admin'))
+		 ORDER BY created_at DESC LIMIT $2`, actor, params.Limit)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

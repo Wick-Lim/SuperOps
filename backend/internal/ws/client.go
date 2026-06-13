@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
 )
 
 const (
@@ -25,16 +27,18 @@ type Client struct {
 	subscriptions map[string]bool
 	mu            sync.RWMutex
 	seq           atomic.Int64
+	presence      *presence.Service
 	logger        *slog.Logger
 }
 
-func NewClient(hub *Hub, conn *websocket.Conn, userID string, logger *slog.Logger) *Client {
+func NewClient(hub *Hub, conn *websocket.Conn, userID string, presenceSvc *presence.Service, logger *slog.Logger) *Client {
 	return &Client{
 		hub:           hub,
 		conn:          conn,
 		userID:        userID,
 		send:          make(chan []byte, 256),
 		subscriptions: make(map[string]bool),
+		presence:      presenceSvc,
 		logger:        logger,
 	}
 }
@@ -128,6 +132,9 @@ func (c *Client) IsSubscribed(channelID string) bool {
 func (c *Client) handleMessage(ctx context.Context, msg InboundMessage) {
 	switch msg.Type {
 	case TypePing:
+		if c.presence != nil {
+			_ = c.presence.Heartbeat(ctx, c.userID)
+		}
 		c.SendMessage(TypePong, nil)
 
 	case TypeSubscribe:
@@ -144,11 +151,20 @@ func (c *Client) handleMessage(ctx context.Context, msg InboundMessage) {
 
 	case TypeTypingStart:
 		var data TypingData
-		if err := json.Unmarshal(msg.Data, &data); err == nil {
+		if err := json.Unmarshal(msg.Data, &data); err == nil && data.ChannelID != "" {
+			if c.presence != nil {
+				_ = c.presence.SetTyping(ctx, data.ChannelID, c.userID)
+			}
 			c.hub.BroadcastToChannel(data.ChannelID, TypeTypingIndicator, map[string]string{
 				"channel_id": data.ChannelID,
 				"user_id":    c.userID,
 			}, c.userID)
+		}
+
+	case TypePresence:
+		var data PresenceData
+		if err := json.Unmarshal(msg.Data, &data); err == nil && data.Status != "" && c.presence != nil {
+			_ = c.presence.SetStatus(ctx, c.userID, presence.Status(data.Status))
 		}
 
 	default:

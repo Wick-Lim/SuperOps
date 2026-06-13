@@ -8,17 +8,19 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
+	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
 type WSHandler struct {
-	hub    *Hub
-	jwtMgr *auth.JWTManager
-	logger *slog.Logger
+	hub      *Hub
+	jwtMgr   *auth.JWTManager
+	presence *presence.Service
+	logger   *slog.Logger
 }
 
-func NewWSHandler(hub *Hub, jwtMgr *auth.JWTManager, logger *slog.Logger) *WSHandler {
-	return &WSHandler{hub: hub, jwtMgr: jwtMgr, logger: logger}
+func NewWSHandler(hub *Hub, jwtMgr *auth.JWTManager, presenceSvc *presence.Service, logger *slog.Logger) *WSHandler {
+	return &WSHandler{hub: hub, jwtMgr: jwtMgr, presence: presenceSvc, logger: logger}
 }
 
 func (h *WSHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -47,8 +49,15 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := NewClient(h.hub, conn, claims.UserID, h.logger)
+	client := NewClient(h.hub, conn, claims.UserID, h.presence, h.logger)
 	h.hub.register <- client
+
+	if h.presence != nil {
+		// context.Background: presence writes must outlive the request context,
+		// which may already be near cancellation after the hijacked upgrade.
+		_ = h.presence.SetOnline(context.Background(), claims.UserID)
+		defer h.presence.SetStatus(context.Background(), claims.UserID, presence.StatusOffline)
+	}
 
 	// Send hello
 	client.SendMessage(TypeHello, map[string]string{

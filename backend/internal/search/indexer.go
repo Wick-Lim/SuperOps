@@ -35,20 +35,31 @@ func (idx *Indexer) HandleMessage(msg *nats.Msg) {
 		return
 	}
 
-	if envelope.Type != "message.new" {
-		return
-	}
-
 	var event MessageEvent
 	if err := json.Unmarshal(envelope.Data, &event); err != nil {
 		idx.logger.Warn("indexer: unmarshal message", "error", err)
 		return
 	}
+	if event.ID == "" {
+		return
+	}
 
-	// Extract workspace ID from NATS subject: superops.{workspace_id}.message.created
-	parts := splitSubject(msg.Subject)
+	switch envelope.Type {
+	case "message.deleted":
+		if err := idx.service.DeleteMessage(event.ID); err != nil {
+			idx.logger.Warn("indexer: delete message", "error", err, "id", event.ID)
+		}
+		return
+
+	case "message.new", "message.updated":
+		// index/re-index below
+	default:
+		return
+	}
+
+	// Extract workspace ID from NATS subject: superops.{workspace_id}.message.{action}
 	workspaceID := ""
-	if len(parts) >= 2 {
+	if parts := splitSubject(msg.Subject); len(parts) >= 2 {
 		workspaceID = parts[1]
 	}
 

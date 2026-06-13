@@ -27,6 +27,18 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.HandleFunc("POST /api/v1/webhooks/incoming/{token}", h.IncomingWebhook)
 }
 
+// isWorkspaceAdmin reports whether the user is an owner/admin of the workspace.
+func (h *Handler) isWorkspaceAdmin(r *http.Request, workspaceID, userID string) bool {
+	if workspaceID == "" {
+		return false
+	}
+	var ok bool
+	_ = h.pool.QueryRow(r.Context(),
+		`SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 AND role IN ('owner','admin'))`,
+		workspaceID, userID).Scan(&ok)
+	return ok
+}
+
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 
@@ -43,12 +55,15 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		input.Type = "incoming"
 	}
 
-	token, _ := crypto.GenerateRandomToken(24)
-
 	// Get workspace from channel
 	var wsID string
 	h.pool.QueryRow(r.Context(), `SELECT workspace_id FROM channels WHERE id = $1`, input.ChannelID).Scan(&wsID)
+	if !h.isWorkspaceAdmin(r, wsID, userID) {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "workspace admin privileges required")
+		return
+	}
 
+	token, _ := crypto.GenerateRandomToken(24)
 	whID := uuid.NewString()
 	_, err := h.pool.Exec(r.Context(),
 		`INSERT INTO webhooks (id, workspace_id, channel_id, name, type, token, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -65,8 +80,12 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	// Webhook tokens are secrets — only expose those of workspaces the caller administers.
 	rows, err := h.pool.Query(r.Context(),
-		`SELECT id, name, type, token, channel_id, is_active, created_at FROM webhooks ORDER BY created_at DESC LIMIT 50`)
+		`SELECT id, name, type, token, channel_id, is_active, created_at FROM webhooks
+		 WHERE workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = $1 AND role IN ('owner','admin'))
+		 ORDER BY created_at DESC LIMIT 50`, userID)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -91,7 +110,19 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
 	whID := r.PathValue("webhook_id")
+
+	var wsID string
+	if err := h.pool.QueryRow(r.Context(), `SELECT workspace_id FROM webhooks WHERE id = $1`, whID).Scan(&wsID); err != nil {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "webhook not found")
+		return
+	}
+	if !h.isWorkspaceAdmin(r, wsID, userID) {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "workspace admin privileges required")
+		return
+	}
+
 	h.pool.Exec(r.Context(), `DELETE FROM webhooks WHERE id = $1`, whID)
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "deleted"})
 }

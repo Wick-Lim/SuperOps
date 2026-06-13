@@ -4,11 +4,20 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/meilisearch/meilisearch-go"
 )
 
 const messagesIndex = "messages"
+
+// quoteFilter escapes a value for safe interpolation into a Meilisearch filter
+// expression (defends against breaking out of the quoted string).
+func quoteFilter(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `"`, `\"`)
+	return `"` + v + `"`
+}
 
 type Service struct {
 	client meilisearch.ServiceManager
@@ -27,27 +36,25 @@ type MessageDoc struct {
 func NewService(host, masterKey string, logger *slog.Logger) (*Service, error) {
 	client := meilisearch.New(host, meilisearch.WithAPIKey(masterKey))
 
-	// Ensure index exists
-	_, err := client.GetIndex(messagesIndex)
-	if err != nil {
-		_, err = client.CreateIndex(&meilisearch.IndexConfig{
+	// Ensure index exists.
+	if _, err := client.GetIndex(messagesIndex); err != nil {
+		if _, err = client.CreateIndex(&meilisearch.IndexConfig{
 			Uid:        messagesIndex,
 			PrimaryKey: "id",
-		})
-		if err != nil {
+		}); err != nil {
 			return nil, fmt.Errorf("create index: %w", err)
 		}
-
-		// Configure searchable/filterable attributes
-		idx := client.Index(messagesIndex)
-		idx.UpdateSearchableAttributes(&[]string{"content"})
-		filterable := []interface{}{"channel_id", "workspace_id", "user_id", "created_at"}
-		idx.UpdateFilterableAttributes(&filterable)
-		sortable := []string{"created_at"}
-		idx.UpdateSortableAttributes(&sortable)
-
 		logger.Info("created Meilisearch index", "index", messagesIndex)
 	}
+
+	// Apply attribute settings idempotently on every startup so schema changes
+	// take effect for existing indexes too.
+	idx := client.Index(messagesIndex)
+	idx.UpdateSearchableAttributes(&[]string{"content"})
+	filterable := []interface{}{"channel_id", "workspace_id", "user_id", "created_at"}
+	idx.UpdateFilterableAttributes(&filterable)
+	sortable := []string{"created_at"}
+	idx.UpdateSortableAttributes(&sortable)
 
 	logger.Info("connected to Meilisearch", "host", host)
 	return &Service{client: client, logger: logger}, nil
@@ -80,12 +87,12 @@ type SearchResult struct {
 func (s *Service) Search(ctx context.Context, workspaceID, query string, channelID, userID string, limit int) (*SearchResult, error) {
 	idx := s.client.Index(messagesIndex)
 
-	filter := fmt.Sprintf("workspace_id = \"%s\"", workspaceID)
+	filter := "workspace_id = " + quoteFilter(workspaceID)
 	if channelID != "" {
-		filter += fmt.Sprintf(" AND channel_id = \"%s\"", channelID)
+		filter += " AND channel_id = " + quoteFilter(channelID)
 	}
 	if userID != "" {
-		filter += fmt.Sprintf(" AND user_id = \"%s\"", userID)
+		filter += " AND user_id = " + quoteFilter(userID)
 	}
 
 	if limit == 0 {

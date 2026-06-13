@@ -5,10 +5,12 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 )
 
 type Hub struct {
+	id         string // unique per process; used to skip our own NATS broadcasts
 	clients    map[string]*Client // userID -> client
 	mu         sync.RWMutex
 	register   chan *Client
@@ -19,6 +21,7 @@ type Hub struct {
 
 func NewHub(logger *slog.Logger) *Hub {
 	return &Hub{
+		id:         uuid.NewString(),
 		clients:    make(map[string]*Client),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
@@ -64,6 +67,20 @@ func (h *Hub) BroadcastToChannel(channelID, msgType string, data interface{}, ex
 
 	// 2. Publish to NATS for other instances
 	h.publishToNATS(channelID, msg, excludeUserID)
+}
+
+// BroadcastLocal delivers a message to locally-connected subscribers of a
+// channel WITHOUT re-publishing to NATS. It is used by the event relay, which
+// already receives each application event on every replica via core NATS — so
+// publishing again would cause duplicate delivery. Because a client is
+// connected to exactly one replica, local delivery on every replica yields
+// exactly-once delivery per client.
+func (h *Hub) BroadcastLocal(channelID, msgType string, data interface{}, excludeUserID string) {
+	msg, err := json.Marshal(OutboundMessage{Type: msgType, Data: data})
+	if err != nil {
+		return
+	}
+	h.localBroadcastRaw(channelID, msg, excludeUserID)
 }
 
 func (h *Hub) BroadcastToUser(userID, msgType string, data interface{}) {

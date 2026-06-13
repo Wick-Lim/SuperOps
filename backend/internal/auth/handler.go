@@ -3,6 +3,7 @@ package auth
 import (
 	"net/http"
 
+	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
@@ -14,12 +15,45 @@ func NewHandler(service *Service) *Handler {
 	return &Handler{service: service}
 }
 
-func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/v1/auth/login", h.Login)
-	mux.HandleFunc("POST /api/v1/auth/refresh", h.Refresh)
-	mux.HandleFunc("POST /api/v1/auth/logout", h.Logout)
-	mux.HandleFunc("POST /api/v1/auth/accept-invite", h.AcceptInvite)
-	mux.HandleFunc("GET /api/v1/auth/invite/{token}", h.GetInviteInfo)
+// RegisterRoutes registers the public auth endpoints. limiter (may be nil)
+// wraps the brute-forceable endpoints (login, refresh, accept-invite).
+func (h *Handler) RegisterRoutes(mux *http.ServeMux, limiter func(http.Handler) http.Handler) {
+	if limiter == nil {
+		limiter = func(n http.Handler) http.Handler { return n }
+	}
+	mux.Handle("POST /api/v1/auth/login", limiter(http.HandlerFunc(h.Login)))
+	mux.Handle("POST /api/v1/auth/refresh", limiter(http.HandlerFunc(h.Refresh)))
+	mux.Handle("POST /api/v1/auth/logout", http.HandlerFunc(h.Logout))
+	mux.Handle("POST /api/v1/auth/accept-invite", limiter(http.HandlerFunc(h.AcceptInvite)))
+	mux.Handle("GET /api/v1/auth/invite/{token}", limiter(http.HandlerFunc(h.GetInviteInfo)))
+}
+
+// RegisterProtectedRoutes registers auth endpoints that require an authenticated session.
+func (h *Handler) RegisterProtectedRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
+	mux.Handle("POST /api/v1/auth/change-password", authMw(http.HandlerFunc(h.ChangePassword)))
+}
+
+func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+
+	var input struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
+		return
+	}
+	if len(input.NewPassword) < 8 {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "new password must be at least 8 characters")
+		return
+	}
+
+	if err := h.service.ChangePassword(r.Context(), userID, input.OldPassword, input.NewPassword); err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error())
+		return
+	}
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "password changed"})
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {

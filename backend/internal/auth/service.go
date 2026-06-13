@@ -2,15 +2,18 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
 
 func extractIP(remoteAddr string) string {
@@ -136,35 +139,80 @@ func (s *Service) AcceptInvite(ctx context.Context, token, username, password, f
 	}
 
 	userID := uuid.NewString()
-	u := &user.User{
-		ID:           userID,
-		Email:        email,
-		Username:     username,
-		FullName:     fullName,
-		PasswordHash: hash,
-		IsActive:     true,
+
+	// Create the account, add it to the workspace + #general, and consume the
+	// invite atomically: a partial failure must never leave an orphaned user.
+	err = database.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO users (id, email, username, full_name, password_hash, is_active)
+			 VALUES ($1, $2, $3, $4, $5, true)`,
+			userID, email, username, fullName, hash,
+		); err != nil {
+			return fmt.Errorf("create user: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)
+			 ON CONFLICT (workspace_id, user_id) DO NOTHING`,
+			workspaceID, userID, role,
+		); err != nil {
+			return fmt.Errorf("add workspace member: %w", err)
+		}
+
+		// Join #general if it exists (INSERT ... SELECT yields zero rows if absent).
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO channel_members (channel_id, user_id, role)
+			 SELECT id, $2, 'member' FROM channels WHERE workspace_id = $1 AND slug = 'general' LIMIT 1
+			 ON CONFLICT DO NOTHING`,
+			workspaceID, userID,
+		); err != nil {
+			return fmt.Errorf("join general channel: %w", err)
+		}
+
+		// Consume the invite; the status guard prevents a concurrent double-accept.
+		tag, err := tx.Exec(ctx,
+			`UPDATE invitations SET status = 'accepted' WHERE id = $1 AND status = 'pending'`, inviteID)
+		if err != nil {
+			return fmt.Errorf("consume invite: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return errors.New("invite already used")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if err := s.userRepo.Create(ctx, u); err != nil {
-		return nil, fmt.Errorf("create user: %w", err)
-	}
-
-	// Add to workspace
-	s.pool.Exec(ctx,
-		`INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)`,
-		workspaceID, userID, role,
-	)
-
-	// Add to #general channel
-	s.pool.Exec(ctx,
-		`INSERT INTO channel_members (channel_id, user_id, role) VALUES (
-			(SELECT id FROM channels WHERE workspace_id = $1 AND slug = 'general' LIMIT 1), $2, 'member'
-		)`, workspaceID, userID,
-	)
-
-	// Mark invite as accepted
-	s.pool.Exec(ctx, `UPDATE invitations SET status = 'accepted' WHERE id = $1`, inviteID)
 
 	return s.issueTokens(ctx, userID, userAgent, ipAddress)
+}
+
+// ChangePassword updates a user's password after verifying the current one,
+// then revokes all of the user's sessions so other devices must re-authenticate.
+func (s *Service) ChangePassword(ctx context.Context, userID, oldPassword, newPassword string) error {
+	u, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if u == nil {
+		return errors.New("user not found")
+	}
+	// Users created without a password (none currently) may set one freely.
+	if u.PasswordHash != "" && !crypto.CheckPassword(oldPassword, u.PasswordHash) {
+		return errors.New("current password is incorrect")
+	}
+
+	hash, err := crypto.HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1`, userID, hash); err != nil {
+		return fmt.Errorf("update password: %w", err)
+	}
+
+	_ = s.repo.DeleteUserSessions(ctx, userID)
+	return nil
 }
 
 type InviteInfo struct {
