@@ -141,9 +141,10 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// Router
 	mux := http.NewServeMux()
 
-	// Health endpoints (no auth)
+	// Health + metrics endpoints (no auth)
 	mux.HandleFunc("GET /health", healthHandler(pool, redisClient))
 	mux.HandleFunc("GET /ready", healthHandler(pool, redisClient))
+	mux.HandleFunc("GET /metrics", metricsHandler(hub))
 
 	// Rate limiters (Redis-backed). A strict per-IP limit guards the
 	// brute-forceable auth endpoints; a generous per-user limit guards the API.
@@ -196,6 +197,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 			Window:            time.Minute,
 		})(handler)
 	}
+	handler = MetricsMiddleware(handler)
 	handler = httputil.RequestIDMiddleware(handler)
 	handler = httputil.LoggingMiddleware(logger)(handler)
 	handler = httputil.RecoveryMiddleware(logger)(handler)

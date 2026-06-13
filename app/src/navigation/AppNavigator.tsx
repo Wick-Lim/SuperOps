@@ -8,12 +8,26 @@ import LoginScreen from '../screens/LoginScreen'
 import InviteScreen from '../screens/InviteScreen'
 import OnboardingScreen from '../screens/OnboardingScreen'
 import WorkspaceScreen from '../screens/WorkspaceScreen'
+import SearchScreen from '../screens/SearchScreen'
+import NotificationsScreen from '../screens/NotificationsScreen'
+import NewChannelScreen from '../screens/NewChannelScreen'
+import NewDMScreen from '../screens/NewDMScreen'
+import MembersScreen from '../screens/MembersScreen'
+import SettingsScreen from '../screens/SettingsScreen'
+import AdminScreen from '../screens/AdminScreen'
 
 export type RootStackParamList = {
   Login: undefined
   Invite: { token?: string }
   Onboarding: undefined
-  Workspace: { workspaceId: string }
+  Workspace: { workspaceId?: string } | undefined
+  Search: undefined
+  Notifications: undefined
+  NewChannel: undefined
+  NewDM: undefined
+  Members: { channelId: string }
+  Settings: undefined
+  Admin: undefined
 }
 
 const Stack = createNativeStackNavigator<RootStackParamList>()
@@ -57,6 +71,13 @@ export default function AppNavigator() {
           <>
             <Stack.Screen name="Onboarding" component={OnboardingScreen} />
             <Stack.Screen name="Workspace" component={WorkspaceScreen} />
+            <Stack.Screen name="Search" component={SearchScreen} />
+            <Stack.Screen name="Notifications" component={NotificationsScreen} />
+            <Stack.Screen name="NewChannel" component={NewChannelScreen} />
+            <Stack.Screen name="NewDM" component={NewDMScreen} />
+            <Stack.Screen name="Members" component={MembersScreen} />
+            <Stack.Screen name="Settings" component={SettingsScreen} />
+            <Stack.Screen name="Admin" component={AdminScreen} />
           </>
         )}
       </Stack.Navigator>

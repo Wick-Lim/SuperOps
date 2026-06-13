@@ -4,6 +4,7 @@ import { View, ActivityIndicator } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { useAuthStore } from './src/stores/authStore'
 import AppNavigator from './src/navigation/AppNavigator'
+import ErrorBoundary from './src/components/ErrorBoundary'
 
 export default function App() {
   const hydrated = useAuthStore((s) => s.hydrated)
@@ -24,7 +25,9 @@ export default function App() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <StatusBar style="light" />
-      <AppNavigator />
+      <ErrorBoundary>
+        <AppNavigator />
+      </ErrorBoundary>
     </GestureHandlerRootView>
   )
 }
