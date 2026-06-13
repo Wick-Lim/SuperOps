@@ -250,12 +250,22 @@ Frame: `{"type": "event_type", "seq": 1, "data": {...}}`
 ## Testing
 
 ```bash
-# Backend (Go)
+# Backend unit tests (Go)
 cd backend && go test ./... -race
+
+# Backend integration tests — drive the fully-wired app over an httptest server
+# against real Postgres/Redis/NATS (start the dev stack first, then migrate):
+cd backend && go test -tags=integration ./test/integration/... -v
+# Covers auth, messaging + reaction hydration, RBAC/invite flow, channel
+# membership authz, and a real WebSocket end-to-end message-delivery test.
 
 # App (TypeScript)
 cd app && npx tsc --noEmit
 ```
+
+CI (`.github/workflows/ci.yml`) runs lint/vet/unit tests, the integration suite
+against service containers, `tsc`, both Docker image builds, and `helm lint` +
+`helm template`.
 
 ### Seed demo data
 

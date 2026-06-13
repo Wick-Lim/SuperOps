@@ -29,9 +29,61 @@ jobs:
         working-directory: backend
         run: go vet ./...
 
-      - name: Test
+      - name: Unit tests
         working-directory: backend
         run: go test ./... -race -count=1
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: superops
+          POSTGRES_PASSWORD: superops
+          POSTGRES_DB: superops
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U superops"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      nats:
+        image: nats:2
+        ports: ['4222:4222']
+    env:
+      DB_HOST: localhost
+      DB_PORT: '5432'
+      DB_USER: superops
+      DB_PASSWORD: superops
+      DB_NAME: superops
+      DB_SSLMODE: disable
+      REDIS_ADDR: localhost:6379
+      REDIS_PASSWORD: ''
+      NATS_URL: nats://localhost:4222
+      JWT_SECRET: ci_jwt_secret_at_least_32_characters_long
+      ADMIN_EMAIL: admin@company.com
+      ADMIN_PASSWORD: changeme_admin_password
+      # No MinIO/Meilisearch in CI — app.New degrades gracefully (file/search disabled).
+      MEILI_HOST: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: backend/go.sum
+
+      - name: Run migrations
+        working-directory: backend
+        run: go run ./cmd/migrate -direction up
+
+      - name: Integration tests
+        working-directory: backend
+        run: go test -tags=integration ./test/integration/... -count=1 -v
 
   app:
     runs-on: ubuntu-latest
@@ -50,3 +102,31 @@ jobs:
       - name: Type check
         working-directory: app
         run: npx tsc --noEmit
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -f deploy/docker/Dockerfile.backend -t superops-backend:ci .
+      - name: Build frontend (web) image
+        run: docker build -f deploy/docker/Dockerfile.frontend -t superops-frontend:ci .
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint and render chart
+        run: |
+          # nats is an HTTPS repo (bitnami deps are OCI and need no add).
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm dependency build deploy/k8s/helm/superops
+          helm lint deploy/k8s/helm/superops
+          helm template superops deploy/k8s/helm/superops \
+            --set jwt.secret=ci-secret \
+            --set postgresql.auth.password=ci-pg \
+            --set redis.auth.password=ci-redis \
+            --set minio.auth.rootPassword=ci-minio \
+            --set meilisearch.masterKey=ci-meili \
+            > /dev/null
