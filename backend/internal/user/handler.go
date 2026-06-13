@@ -114,13 +114,14 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
+	callerID := authctx.UserID(r.Context())
 	q := r.URL.Query().Get("q")
 	if q == "" {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "query parameter 'q' is required")
 		return
 	}
 
-	users, err := h.repo.Search(r.Context(), q, 20)
+	users, err := h.repo.SearchExcludingBlocked(r.Context(), callerID, q, 20)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

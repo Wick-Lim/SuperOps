@@ -3,6 +3,7 @@ package message
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -44,6 +45,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("GET /api/v1/messages/{message_id}/reactions", authMw(http.HandlerFunc(h.GetReactions)))
 	mux.Handle("GET /api/v1/messages/{message_id}/thread", authMw(http.HandlerFunc(h.ListThread)))
 	mux.Handle("POST /api/v1/messages/{message_id}/thread", authMw(http.HandlerFunc(h.ReplyThread)))
+	mux.Handle("GET /api/v1/channels/{channel_id}/scheduled", authMw(http.HandlerFunc(h.ListScheduled)))
+	mux.Handle("DELETE /api/v1/channels/{channel_id}/scheduled/{message_id}", authMw(http.HandlerFunc(h.CancelScheduled)))
 	mux.Handle("GET /api/v1/channels/{channel_id}/pins", authMw(http.HandlerFunc(h.ListPins)))
 	mux.Handle("POST /api/v1/channels/{channel_id}/messages/{message_id}/pin", authMw(http.HandlerFunc(h.Pin)))
 	mux.Handle("DELETE /api/v1/channels/{channel_id}/messages/{message_id}/pin", authMw(http.HandlerFunc(h.Unpin)))
@@ -132,17 +135,20 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var input struct {
-		Content     string  `json:"content"`
-		ContentType string  `json:"content_type"`
-		ParentID    *string `json:"parent_id"`
+		Content     string     `json:"content"`
+		ContentType string     `json:"content_type"`
+		ParentID    *string    `json:"parent_id"`
+		FileIDs     []string   `json:"file_ids"`
+		ScheduledAt *time.Time `json:"scheduled_at"`
 	}
 	if err := httputil.DecodeJSON(r, &input); err != nil {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
 		return
 	}
 
-	if input.Content == "" {
-		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "content is required")
+	// A message must carry text or at least one attachment.
+	if input.Content == "" && len(input.FileIDs) == 0 {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "content or file_ids is required")
 		return
 	}
 	if input.ContentType == "" {
@@ -158,14 +164,30 @@ func (h *Handler) Send(w http.ResponseWriter, r *http.Request) {
 		ContentType: input.ContentType,
 	}
 
+	// Scheduled send: persist as pending; the worker promotes & broadcasts it later.
+	if input.ScheduledAt != nil && input.ScheduledAt.After(time.Now()) {
+		if err := h.repo.CreateScheduled(r.Context(), msg, *input.ScheduledAt); err != nil {
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return
+		}
+		_ = h.repo.LinkFiles(r.Context(), msg.ID, userID, input.FileIDs)
+		if created, _ := h.repo.GetByID(r.Context(), msg.ID); created != nil {
+			msg = created
+		}
+		httputil.JSON(w, http.StatusCreated, msg)
+		return
+	}
+
 	if err := h.repo.Create(r.Context(), msg); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
+	_ = h.repo.LinkFiles(r.Context(), msg.ID, userID, input.FileIDs)
 
 	if created, _ := h.repo.GetByID(r.Context(), msg.ID); created != nil {
 		msg = created
 	}
+	_ = h.repo.Hydrate(r.Context(), []*Message{msg})
 
 	h.publishCh(r.Context(), chID, evtMessageNew, msg)
 
@@ -193,7 +215,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		messages = []*Message{}
 	}
 
-	if err := h.repo.HydrateReactions(r.Context(), messages); err != nil {
+	if err := h.repo.Hydrate(r.Context(), messages); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
@@ -211,7 +233,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_ = h.repo.HydrateReactions(r.Context(), []*Message{msg})
+	_ = h.repo.Hydrate(r.Context(), []*Message{msg})
 	httputil.JSON(w, http.StatusOK, msg)
 }
 
@@ -247,7 +269,7 @@ func (h *Handler) Edit(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
-	_ = h.repo.HydrateReactions(r.Context(), []*Message{updated})
+	_ = h.repo.Hydrate(r.Context(), []*Message{updated})
 
 	h.publishCh(r.Context(), updated.ChannelID, evtMessageUpdated, updated)
 
@@ -374,7 +396,7 @@ func (h *Handler) ListThread(w http.ResponseWriter, r *http.Request) {
 	if messages == nil {
 		messages = []*Message{}
 	}
-	_ = h.repo.HydrateReactions(r.Context(), messages)
+	_ = h.repo.Hydrate(r.Context(), messages)
 	httputil.JSON(w, http.StatusOK, messages)
 }
 
@@ -428,6 +450,39 @@ func (h *Handler) ReplyThread(w http.ResponseWriter, r *http.Request) {
 	httputil.JSON(w, http.StatusCreated, msg)
 }
 
+func (h *Handler) ListScheduled(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	chID := r.PathValue("channel_id")
+	if !h.requireMember(w, r, chID) {
+		return
+	}
+	messages, err := h.repo.ListScheduled(r.Context(), chID, userID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if messages == nil {
+		messages = []*Message{}
+	}
+	_ = h.repo.Hydrate(r.Context(), messages)
+	httputil.JSON(w, http.StatusOK, messages)
+}
+
+func (h *Handler) CancelScheduled(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	msgID := r.PathValue("message_id")
+	ok, err := h.repo.CancelScheduled(r.Context(), msgID, userID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if !ok {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "scheduled message not found")
+		return
+	}
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "canceled"})
+}
+
 func (h *Handler) ListPins(w http.ResponseWriter, r *http.Request) {
 	chID := r.PathValue("channel_id")
 	if !h.requireMember(w, r, chID) {
@@ -441,7 +496,7 @@ func (h *Handler) ListPins(w http.ResponseWriter, r *http.Request) {
 	if messages == nil {
 		messages = []*Message{}
 	}
-	_ = h.repo.HydrateReactions(r.Context(), messages)
+	_ = h.repo.Hydrate(r.Context(), messages)
 	httputil.JSON(w, http.StatusOK, messages)
 }
 

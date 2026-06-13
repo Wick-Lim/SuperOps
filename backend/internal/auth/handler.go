@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
@@ -31,6 +32,58 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, limiter func(http.Handler) 
 // RegisterProtectedRoutes registers auth endpoints that require an authenticated session.
 func (h *Handler) RegisterProtectedRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
 	mux.Handle("POST /api/v1/auth/change-password", authMw(http.HandlerFunc(h.ChangePassword)))
+	mux.Handle("GET /api/v1/auth/totp/status", authMw(http.HandlerFunc(h.TOTPStatus)))
+	mux.Handle("POST /api/v1/auth/totp/setup", authMw(http.HandlerFunc(h.TOTPSetup)))
+	mux.Handle("POST /api/v1/auth/totp/verify", authMw(http.HandlerFunc(h.TOTPVerify)))
+	mux.Handle("POST /api/v1/auth/totp/disable", authMw(http.HandlerFunc(h.TOTPDisable)))
+}
+
+func (h *Handler) TOTPStatus(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	httputil.JSON(w, http.StatusOK, map[string]bool{"enabled": h.service.TOTPEnabled(r.Context(), userID)})
+}
+
+func (h *Handler) TOTPSetup(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	setup, err := h.service.SetupTOTP(r.Context(), userID)
+	if err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error())
+		return
+	}
+	httputil.JSON(w, http.StatusOK, setup)
+}
+
+func (h *Handler) TOTPVerify(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	var input struct {
+		Code string `json:"code"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil || input.Code == "" {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "code is required")
+		return
+	}
+	codes, err := h.service.EnableTOTP(r.Context(), userID, input.Code)
+	if err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error())
+		return
+	}
+	httputil.JSON(w, http.StatusOK, map[string]interface{}{"enabled": true, "backup_codes": codes})
+}
+
+func (h *Handler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	var input struct {
+		Code string `json:"code"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil || input.Code == "" {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "code is required")
+		return
+	}
+	if err := h.service.DisableTOTP(r.Context(), userID, input.Code); err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error())
+		return
+	}
+	httputil.JSON(w, http.StatusOK, map[string]bool{"enabled": false})
 }
 
 func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +123,11 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	tokens, err := h.service.Login(r.Context(), input, r.UserAgent(), r.RemoteAddr)
 	if err != nil {
+		if errors.Is(err, ErrTOTPRequired) {
+			// Password was correct; the client must now supply a TOTP code.
+			httputil.JSONError(w, http.StatusUnauthorized, "TOTP_REQUIRED", "two-factor code required")
+			return
+		}
 		httputil.JSONError(w, http.StatusUnauthorized, "UNAUTHORIZED", err.Error())
 		return
 	}

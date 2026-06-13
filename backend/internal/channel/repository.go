@@ -165,6 +165,54 @@ func (r *Repository) UpdateReadAt(ctx context.Context, channelID, userID string)
 	return nil
 }
 
+// SetArchived sets the is_archived flag on a channel.
+func (r *Repository) SetArchived(ctx context.Context, channelID string, archived bool) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE channels SET is_archived = $2, updated_at = NOW() WHERE id = $1`,
+		channelID, archived,
+	)
+	if err != nil {
+		return fmt.Errorf("set archived: %w", err)
+	}
+	return nil
+}
+
+// IsWorkspaceMember reports whether userID belongs to the given workspace.
+func (r *Repository) IsWorkspaceMember(ctx context.Context, workspaceID, userID string) (bool, error) {
+	var exists bool
+	err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)`,
+		workspaceID, userID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check workspace member: %w", err)
+	}
+	return exists, nil
+}
+
+// FindDirectChannel locates an existing 1:1 'dm' channel in the workspace whose
+// members are exactly userA and userB (and no others). Returns nil if none exists.
+func (r *Repository) FindDirectChannel(ctx context.Context, workspaceID, userA, userB string) (*Channel, error) {
+	c := &Channel{}
+	err := r.pool.QueryRow(ctx,
+		`SELECT c.id, c.workspace_id, c.name, c.slug, c.description, c.type, c.topic, c.is_archived, c.creator_id, c.last_message_at, c.created_at, c.updated_at
+		 FROM channels c
+		 WHERE c.workspace_id = $1 AND c.type = 'dm'
+		   AND (SELECT COUNT(*) FROM channel_members cm WHERE cm.channel_id = c.id) = 2
+		   AND EXISTS(SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = $2)
+		   AND EXISTS(SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = $3)
+		 LIMIT 1`,
+		workspaceID, userA, userB,
+	).Scan(&c.ID, &c.WorkspaceID, &c.Name, &c.Slug, &c.Description, &c.Type, &c.Topic, &c.IsArchived, &c.CreatorID, &c.LastMessageAt, &c.CreatedAt, &c.UpdatedAt)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find direct channel: %w", err)
+	}
+	return c, nil
+}
+
 func (r *Repository) scanChannels(rows pgx.Rows) ([]*Channel, error) {
 	var channels []*Channel
 	for rows.Next() {

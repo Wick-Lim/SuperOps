@@ -19,6 +19,9 @@ func NewHandler(repo *Repository) *Handler {
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
 	mux.Handle("POST /api/v1/workspaces/{workspace_id}/channels", authMw(http.HandlerFunc(h.Create)))
+	mux.Handle("POST /api/v1/workspaces/{workspace_id}/channels/dm", authMw(http.HandlerFunc(h.CreateDM)))
+	mux.Handle("POST /api/v1/workspaces/{workspace_id}/channels/{channel_id}/archive", authMw(http.HandlerFunc(h.Archive)))
+	mux.Handle("POST /api/v1/workspaces/{workspace_id}/channels/{channel_id}/unarchive", authMw(http.HandlerFunc(h.Unarchive)))
 	mux.Handle("GET /api/v1/workspaces/{workspace_id}/channels", authMw(http.HandlerFunc(h.List)))
 	mux.Handle("GET /api/v1/workspaces/{workspace_id}/channels/browse", authMw(http.HandlerFunc(h.Browse)))
 	mux.Handle("GET /api/v1/workspaces/{workspace_id}/channels/{channel_id}", authMw(http.HandlerFunc(h.Get)))
@@ -226,4 +229,145 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "marked as read"})
+}
+
+func (h *Handler) CreateDM(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+	wsID := r.PathValue("workspace_id")
+
+	var input struct {
+		UserIDs []string `json:"user_ids"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
+		return
+	}
+
+	// Caller must be a member of the workspace.
+	ok, err := h.repo.IsWorkspaceMember(r.Context(), wsID, userID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if !ok {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a workspace member")
+		return
+	}
+
+	// Build the unique set of participants: caller plus the requested others.
+	seen := map[string]bool{userID: true}
+	others := make([]string, 0, len(input.UserIDs))
+	for _, uid := range input.UserIDs {
+		if uid == "" || seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		others = append(others, uid)
+	}
+
+	if len(others) == 0 {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "at least one other user_id is required")
+		return
+	}
+
+	// Validate every other participant is a member of the workspace.
+	for _, uid := range others {
+		ok, err := h.repo.IsWorkspaceMember(r.Context(), wsID, uid)
+		if err != nil {
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return
+		}
+		if !ok {
+			httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "user_id is not a workspace member")
+			return
+		}
+	}
+
+	chType := TypeDM
+	if len(others) > 1 {
+		chType = TypeGroupDM
+	}
+
+	// For 1:1 DMs, be idempotent: return an existing dm channel if one exists.
+	if chType == TypeDM {
+		existing, err := h.repo.FindDirectChannel(r.Context(), wsID, userID, others[0])
+		if err != nil {
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return
+		}
+		if existing != nil {
+			httputil.JSON(w, http.StatusOK, existing)
+			return
+		}
+	}
+
+	ch := &Channel{
+		ID:          uuid.NewString(),
+		WorkspaceID: wsID,
+		Name:        nil,
+		Slug:        nil,
+		Type:        chType,
+		CreatorID:   &userID,
+	}
+
+	if err := h.repo.Create(r.Context(), ch); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+
+	// Add the caller and all other participants as members.
+	participants := append([]string{userID}, others...)
+	for _, uid := range participants {
+		if err := h.repo.AddMember(r.Context(), &ChannelMember{
+			ChannelID: ch.ID,
+			UserID:    uid,
+			Role:      "member",
+		}); err != nil {
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return
+		}
+	}
+
+	httputil.JSON(w, http.StatusCreated, ch)
+}
+
+func (h *Handler) Archive(w http.ResponseWriter, r *http.Request) {
+	h.setArchived(w, r, true)
+}
+
+func (h *Handler) Unarchive(w http.ResponseWriter, r *http.Request) {
+	h.setArchived(w, r, false)
+}
+
+func (h *Handler) setArchived(w http.ResponseWriter, r *http.Request, archived bool) {
+	userID := authctx.UserID(r.Context())
+	chID := r.PathValue("channel_id")
+
+	member, err := h.repo.GetMember(r.Context(), chID, userID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if member == nil || member.Role != "admin" {
+		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "insufficient permissions")
+		return
+	}
+
+	ch, err := h.repo.GetByID(r.Context(), chID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if ch == nil {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "channel not found")
+		return
+	}
+
+	if err := h.repo.SetArchived(r.Context(), chID, archived); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+
+	ch.IsArchived = archived
+	httputil.JSON(w, http.StatusOK, ch)
 }

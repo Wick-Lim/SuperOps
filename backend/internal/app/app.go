@@ -16,7 +16,9 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/admin"
 	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
+	"github.com/Wick-Lim/SuperOps/backend/internal/block"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
+	"github.com/Wick-Lim/SuperOps/backend/internal/emoji"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
@@ -180,6 +182,8 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	messageHandler.RegisterRoutes(mux, authMw)
 	webhookHandler := webhook.NewHandler(pool)
 	webhookHandler.RegisterRoutes(mux, authMw)
+	emoji.NewHandler(pool).RegisterRoutes(mux, authMw)
+	block.NewHandler(pool).RegisterRoutes(mux, authMw)
 
 	// WebSocket (handles its own auth)
 	wsHandler.RegisterRoutes(mux)

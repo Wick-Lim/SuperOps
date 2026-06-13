@@ -13,7 +13,8 @@ import (
 
 // messageColumns is the canonical column list (and scan order) for a message row.
 const messageColumns = `id, channel_id, user_id, parent_id, content, content_type,
-	is_edited, is_deleted, reply_count, is_pinned, pinned_by, pinned_at, created_at, updated_at`
+	is_edited, is_deleted, reply_count, is_pinned, pinned_by, pinned_at,
+	scheduled_at, is_scheduled, created_at, updated_at`
 
 type Repository struct {
 	pool *pgxpool.Pool
@@ -50,6 +51,97 @@ func (r *Repository) Create(ctx context.Context, m *Message) error {
 		}
 		return nil
 	})
+}
+
+// CreateScheduled inserts a message in the scheduled (not-yet-sent) state. It
+// does not bump channel last_message_at or reply_count — the worker does that
+// when the message becomes due.
+func (r *Repository) CreateScheduled(ctx context.Context, m *Message, scheduledAt time.Time) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO messages (id, channel_id, user_id, parent_id, content, content_type, is_scheduled, scheduled_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)`,
+		m.ID, m.ChannelID, m.UserID, m.ParentID, m.Content, m.ContentType, scheduledAt,
+	)
+	if err != nil {
+		return fmt.Errorf("create scheduled message: %w", err)
+	}
+	return nil
+}
+
+// ListScheduled returns a user's pending scheduled messages in a channel.
+func (r *Repository) ListScheduled(ctx context.Context, channelID, userID string) ([]*Message, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+messageColumns+`
+		 FROM messages
+		 WHERE channel_id = $1 AND user_id = $2 AND is_scheduled = TRUE AND is_deleted = FALSE
+		 ORDER BY scheduled_at ASC`, channelID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list scheduled: %w", err)
+	}
+	defer rows.Close()
+	return r.scanMessages(rows)
+}
+
+// CancelScheduled deletes a not-yet-sent scheduled message owned by the user.
+func (r *Repository) CancelScheduled(ctx context.Context, messageID, userID string) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
+		`DELETE FROM messages WHERE id = $1 AND user_id = $2 AND is_scheduled = TRUE`, messageID, userID)
+	if err != nil {
+		return false, fmt.Errorf("cancel scheduled: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// LinkFiles attaches the caller's previously-uploaded files to a message.
+func (r *Repository) LinkFiles(ctx context.Context, messageID, userID string, fileIDs []string) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx,
+		`UPDATE files SET message_id = $1 WHERE id = ANY($2) AND user_id = $3 AND message_id IS NULL`,
+		messageID, fileIDs, userID)
+	if err != nil {
+		return fmt.Errorf("link files: %w", err)
+	}
+	return nil
+}
+
+// hydrateFiles attaches file metadata to messages with a single query.
+func (r *Repository) hydrateFiles(ctx context.Context, messages []*Message) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	ids := make([]string, len(messages))
+	byID := make(map[string]*Message, len(messages))
+	for i, m := range messages {
+		ids[i] = m.ID
+		byID[m.ID] = m
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, message_id, name, content_type, size_bytes FROM files WHERE message_id = ANY($1)`, ids)
+	if err != nil {
+		return fmt.Errorf("hydrate files: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var msgID string
+		f := &FileRef{}
+		if err := rows.Scan(&f.ID, &msgID, &f.Name, &f.ContentType, &f.SizeBytes); err != nil {
+			return fmt.Errorf("scan file: %w", err)
+		}
+		if m, ok := byID[msgID]; ok {
+			m.Files = append(m.Files, f)
+		}
+	}
+	return rows.Err()
+}
+
+// Hydrate attaches both reactions and files to the given messages.
+func (r *Repository) Hydrate(ctx context.Context, messages []*Message) error {
+	if err := r.hydrateReactions(ctx, messages); err != nil {
+		return err
+	}
+	return r.hydrateFiles(ctx, messages)
 }
 
 func (r *Repository) GetByID(ctx context.Context, id string) (*Message, error) {
@@ -242,7 +334,7 @@ func scanArgs(m *Message) []any {
 	return []any{
 		&m.ID, &m.ChannelID, &m.UserID, &m.ParentID, &m.Content, &m.ContentType,
 		&m.IsEdited, &m.IsDeleted, &m.ReplyCount, &m.IsPinned, &m.PinnedBy, &m.PinnedAt,
-		&m.CreatedAt, &m.UpdatedAt,
+		&m.ScheduledAt, &m.IsScheduled, &m.CreatedAt, &m.UpdatedAt,
 	}
 }
 

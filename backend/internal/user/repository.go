@@ -95,6 +95,37 @@ func (r *Repository) Search(ctx context.Context, query string, limit int) ([]*Us
 	return users, nil
 }
 
+// SearchExcludingBlocked behaves like Search but excludes users who have
+// blocked the caller as well as users the caller has blocked.
+func (r *Repository) SearchExcludingBlocked(ctx context.Context, callerID, query string, limit int) ([]*User, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, email, username, full_name, COALESCE(password_hash,''), avatar_url, timezone, locale, is_bot, is_active, last_active_at, created_at, updated_at
+		 FROM users
+		 WHERE is_active = TRUE
+		   AND id != $3
+		   AND (username ILIKE $1 OR full_name ILIKE $1 OR email ILIKE $1)
+		   AND id NOT IN (SELECT blocked_id FROM user_blocks WHERE blocker_id = $3)
+		   AND id NOT IN (SELECT blocker_id FROM user_blocks WHERE blocked_id = $3)
+		 ORDER BY username
+		 LIMIT $2`,
+		"%"+query+"%", limit, callerID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search users excluding blocked: %w", err)
+	}
+	defer rows.Close()
+
+	var users []*User
+	for rows.Next() {
+		u, err := r.scanUserFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, nil
+}
+
 func (r *Repository) scanUser(row pgx.Row) (*User, error) {
 	u := &User{}
 	err := row.Scan(&u.ID, &u.Email, &u.Username, &u.FullName, &u.PasswordHash, &u.AvatarURL, &u.Timezone, &u.Locale, &u.IsBot, &u.IsActive, &u.LastActiveAt, &u.CreatedAt, &u.UpdatedAt)

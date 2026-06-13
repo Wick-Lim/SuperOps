@@ -54,6 +54,7 @@ func NewService(repo *Repository, userRepo *user.Repository, pool *pgxpool.Pool,
 type LoginInput struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	TOTPCode string `json:"totp_code"`
 }
 
 func (s *Service) Login(ctx context.Context, input LoginInput, userAgent, ipAddress string) (*TokenPair, error) {
@@ -70,6 +71,19 @@ func (s *Service) Login(ctx context.Context, input LoginInput, userAgent, ipAddr
 
 	if !crypto.CheckPassword(input.Password, u.PasswordHash) {
 		return nil, fmt.Errorf("invalid credentials")
+	}
+
+	// Second factor, if enabled.
+	var secret string
+	var totpEnabled bool
+	s.pool.QueryRow(ctx, `SELECT COALESCE(totp_secret,''), totp_enabled FROM users WHERE id = $1`, u.ID).Scan(&secret, &totpEnabled)
+	if totpEnabled {
+		if input.TOTPCode == "" {
+			return nil, ErrTOTPRequired
+		}
+		if !s.verifyTOTPOrBackup(ctx, u.ID, secret, input.TOTPCode) {
+			return nil, fmt.Errorf("invalid 2fa code")
+		}
 	}
 
 	return s.issueTokens(ctx, u.ID, userAgent, ipAddress)
