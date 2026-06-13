@@ -57,6 +57,7 @@ Native apps for **iOS, Android, macOS, and Windows** from a single React Native 
 | Android | Expo / `npx expo run:android` |
 | macOS | `react-native-macos` |
 | Windows | `react-native-windows` |
+| Web | `npx expo start --web` (dev) · static export via `deploy/docker/Dockerfile.frontend` (prod) |
 
 ## Quick Start
 
@@ -148,7 +149,13 @@ Includes: backend HPA (2-10 replicas), worker, pre-install migration job, ingres
 ```
 
 **Multi-replica WebSocket delivery:**
-Each backend instance runs a local WebSocket Hub. Messages are delivered to local clients AND published to NATS `ws.broadcast.{channelId}`. Other instances receive via NATS and forward to their local clients. No sticky sessions required.
+Each backend instance runs a local WebSocket Hub plus an event relay. Application
+events (messages, reactions, notifications) are published once to NATS
+(`superops.{workspace}.{resource}.{action}`); every replica's relay receives the
+event and delivers it to its own locally-connected clients — exactly-once per
+client since each client connects to a single replica, with no sticky sessions.
+Client-originated ephemeral events (typing) use a separate `ws.broadcast.{channel}`
+path with an origin-instance guard so the publishing replica doesn't double-deliver.
 
 ## Project Structure
 
@@ -207,20 +214,25 @@ All endpoints under `/api/v1`. Response envelope:
 
 | Group | Key Endpoints |
 |-------|--------------|
-| **Auth** | `POST /auth/register`, `/login`, `/refresh`, `/logout` |
-| **Users** | `GET /users/me`, `PATCH /users/me`, `GET /users/search?q=` |
-| **Workspaces** | `POST /workspaces`, `GET /workspaces/{id}/members` |
-| **Channels** | `POST /workspaces/{id}/channels`, `POST .../join`, `POST .../leave` |
-| **Messages** | `POST /channels/{id}/messages`, `GET ...?cursor=&limit=` |
-| **Threads** | `GET /messages/{id}/thread`, `POST /messages/{id}/thread` |
-| **Reactions** | `POST /channels/{id}/messages/{id}/reactions` |
-| **DM** | `POST /workspaces/{id}/dm` |
-| **Files** | `POST /files/upload` (multipart), `GET /files/{id}` |
+| **Auth** | `POST /auth/login`, `/refresh`, `/logout`, `/accept-invite`, `GET /auth/invite/{token}`, `POST /auth/change-password` |
+| **2FA (TOTP)** | `GET /auth/totp/status`, `POST /auth/totp/setup`, `/verify`, `/disable` |
+| **Users** | `GET /users/me`, `PATCH /users/me`, `PUT /users/me/status`, `GET /users/{id}`, `/users/search?q=` |
+| **Workspaces** | `POST /workspaces`, `GET/PATCH/DELETE /workspaces/{id}`, members CRUD, `GET /workspaces/{id}/presence` |
+| **Channels** | `POST /workspaces/{id}/channels`, `/browse`, `/join`, `/leave`, `/archive`, `/unarchive`, members |
+| **Direct messages** | `POST /workspaces/{id}/channels/dm` (1:1 idempotent + group) |
+| **Messages** | `POST/GET /channels/{id}/messages` (cursor paginated), `PATCH/DELETE .../{mid}`, `file_ids`/`scheduled_at` on send |
+| **Threads** | `GET/POST /messages/{id}/thread` |
+| **Reactions** | `POST/DELETE /channels/{id}/messages/{mid}/reactions`, `GET /messages/{id}/reactions` |
+| **Pins / Bookmarks** | `POST/DELETE .../{mid}/pin`, `GET /channels/{id}/pins`, `POST/DELETE /messages/{id}/bookmark`, `GET /bookmarks` |
+| **Scheduled** | `GET /channels/{id}/scheduled`, `DELETE .../{mid}` |
+| **Files** | `POST /files/upload` (multipart), `GET/DELETE /files/{id}` |
 | **Search** | `GET /workspaces/{id}/search?q=&channel=&from=` |
-| **Notifications** | `GET /notifications`, `PUT .../read-all`, `GET .../unread-count` |
-| **Admin** | `GET /admin/stats`, `/admin/users`, `/admin/audit-logs` |
+| **Notifications** | `GET /notifications`, `PUT .../{id}/read`, `/read-all`, `GET .../unread-count` |
+| **Blocks / Emoji** | `GET/POST/DELETE /blocks`, `GET/POST/DELETE /workspaces/{id}/emojis` |
+| **Webhooks** | `POST/GET/DELETE /webhooks`, `POST /webhooks/incoming/{token}` |
+| **Admin** | `GET /admin/stats`, `/admin/users`, `/admin/audit-logs`, `/admin/invitations` (workspace-admin gated) |
 | **WebSocket** | `GET /ws?token={jwt}` |
-| **Health** | `GET /health`, `GET /ready` |
+| **Ops** | `GET /health`, `GET /ready`, `GET /metrics` (Prometheus) |
 
 ## WebSocket Protocol
 
@@ -239,10 +251,20 @@ Frame: `{"type": "event_type", "seq": 1, "data": {...}}`
 
 ```bash
 # Backend (Go)
-cd backend && go test ./... -v
+cd backend && go test ./... -race
 
 # App (TypeScript)
 cd app && npx tsc --noEmit
+```
+
+### Seed demo data
+
+With the infrastructure up and the server having booted once (so the admin
+account + default workspace exist), populate demo users, a `#random` channel,
+and sample messages:
+
+```bash
+cd backend && go run ./cmd/seed     # demo users log in with password: demo_password_123
 ```
 
 ## Operations
