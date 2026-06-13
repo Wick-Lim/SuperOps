@@ -26,6 +26,18 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # Web client (React Native Web static export served by nginx).
+  frontend:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
   worker:
     build:
       context: ../../

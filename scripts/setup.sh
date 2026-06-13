@@ -12,9 +12,9 @@ command -v docker >/dev/null 2>&1 || { echo "Docker is required. Install from ht
 echo "Installing backend dependencies..."
 cd backend && go mod download && cd ..
 
-# Frontend dependencies
-echo "Installing frontend dependencies..."
-cd frontend && npm ci && cd ..
+# App dependencies (React Native / Expo)
+echo "Installing app dependencies..."
+cd app && npm ci && cd ..
 
 # Docker env
 if [ ! -f deploy/docker/.env ]; then
@@ -29,11 +29,13 @@ cd deploy/docker && docker compose -f docker-compose.yml -f docker-compose.dev.y
 echo "Waiting for PostgreSQL..."
 until docker exec docker-postgres-1 pg_isready -U superops 2>/dev/null; do sleep 1; done
 
-# Run migrations
+# Run migrations (config loader requires JWT_SECRET + ADMIN_* even for migrate)
 echo "Running database migrations..."
-cd backend && JWT_SECRET=dev_secret_change_me_32chars_long DB_HOST=localhost DB_PASSWORD=changeme_db_password go run ./cmd/migrate -direction up && cd ..
+DEV_ENV="JWT_SECRET=dev_secret_change_me_32chars_long DB_HOST=localhost DB_PASSWORD=changeme_db_password REDIS_PASSWORD=changeme_redis_password ADMIN_EMAIL=admin@company.com ADMIN_PASSWORD=changeme_admin_password"
+cd backend && env $DEV_ENV go run ./cmd/migrate -direction up && cd ..
 
 echo ""
 echo "=== Setup Complete ==="
-echo "Start backend:  cd backend && JWT_SECRET=dev_secret_change_me_32chars_long DB_HOST=localhost DB_PASSWORD=changeme_db_password REDIS_PASSWORD=changeme_redis_password go run ./cmd/superops"
-echo "Start frontend: cd frontend && npm run dev"
+echo "Start backend:  cd backend && env $DEV_ENV go run ./cmd/superops"
+echo "Seed demo data: cd backend && env $DEV_ENV go run ./cmd/seed   # demo users password: demo_password_123"
+echo "Start app:      cd app && npx expo start                       # press i/a/w for iOS/Android/web"

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,7 +18,13 @@ type Config struct {
 	Meili     MeiliConfig
 	Admin     AdminConfig
 	RateLimit RateLimitConfig
+	CORS      CORSConfig
+	MetricsToken string // if set, GET /metrics requires this bearer token
 	LogLevel  string
+}
+
+type CORSConfig struct {
+	AllowedOrigins []string
 }
 
 type RateLimitConfig struct {
@@ -140,7 +147,11 @@ func LoadConfig() (*Config, error) {
 			AuthPerMinute: envInt("RATE_LIMIT_AUTH_PER_MIN", 10),
 			TrustProxy:    envBool("RATE_LIMIT_TRUST_PROXY", true),
 		},
-		LogLevel: envStr("LOG_LEVEL", "info"),
+		CORS: CORSConfig{
+			AllowedOrigins: envList("CORS_ALLOWED_ORIGINS", []string{"*"}),
+		},
+		MetricsToken: envStr("METRICS_TOKEN", ""),
+		LogLevel:     envStr("LOG_LEVEL", "info"),
 	}
 
 	if cfg.JWT.Secret == "" {
@@ -176,6 +187,24 @@ func envBool(key string, fallback bool) bool {
 		}
 	}
 	return fallback
+}
+
+func envList(key string, fallback []string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {

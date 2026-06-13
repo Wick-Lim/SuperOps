@@ -22,6 +22,14 @@ backend:
     targetCPUUtilization: 70
   env:
     LOG_LEVEL: "info"
+    # Transport security — set to "require" (Postgres) / "true" (MinIO) once TLS
+    # certs are provisioned for in-cluster traffic.
+    DB_SSLMODE: "disable"
+    MINIO_USE_SSL: "false"
+    # Rate limiting (the app sits behind the nginx ingress, which sets X-Forwarded-For).
+    RATE_LIMIT_TRUST_PROXY: "true"
+    # CORS — restrict to your web origin(s) in production, comma-separated.
+    CORS_ALLOWED_ORIGINS: "*"
 
 worker:
   replicas: 1

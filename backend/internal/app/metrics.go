@@ -2,11 +2,13 @@ package app
 
 import (
 	"bufio"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -72,8 +74,21 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func metricsHandler(hub *ws.Hub) http.HandlerFunc {
+func metricsHandler(hub *ws.Hub, token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Optional bearer-token guard so /metrics isn't world-readable when the
+		// endpoint is reachable outside a trusted scrape network.
+		if token != "" {
+			provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if provided == "" {
+				provided = r.URL.Query().Get("token")
+			}
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+		}
+
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		wsActive := len(hub.GetOnlineUserIDs())

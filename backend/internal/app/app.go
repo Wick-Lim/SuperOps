@@ -147,7 +147,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// Health + metrics endpoints (no auth)
 	mux.HandleFunc("GET /health", healthHandler(pool, redisClient))
 	mux.HandleFunc("GET /ready", healthHandler(pool, redisClient))
-	mux.HandleFunc("GET /metrics", metricsHandler(hub))
+	mux.HandleFunc("GET /metrics", metricsHandler(hub, cfg.MetricsToken))
 
 	// Rate limiters (Redis-backed). A strict per-IP limit guards the
 	// brute-forceable auth endpoints; a generous per-user limit guards the API.
@@ -207,10 +207,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	handler = httputil.LoggingMiddleware(logger)(handler)
 	handler = httputil.RecoveryMiddleware(logger)(handler)
 	handler = cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"*"},
-		AllowCredentials: true,
+		AllowedOrigins: cfg.CORS.AllowedOrigins,
+		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders: []string{"Authorization", "Content-Type", "X-Request-ID"},
+		// Auth is via Bearer tokens (no cookies), so credentialed CORS is not
+		// needed — and "*" origins with credentials is rejected by browsers.
+		AllowCredentials: false,
 		MaxAge:           86400,
 	}).Handler(handler)
 
