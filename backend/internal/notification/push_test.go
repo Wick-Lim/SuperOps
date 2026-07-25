@@ -294,7 +294,11 @@ func TestDeregisteringADeviceStopsItsPushes(t *testing.T) {
 	}
 
 	delete(f.devices, f.recipient)
-	f.messageID = f.messageID[:len(f.messageID)-1] + "0" // a different message
+	// A different message. Replacing the last character with a fixed one was a
+	// 1-in-16 flake: a uuid already ending in that character produced the SAME
+	// id, the delivery deduped, and the assertion below failed for a reason
+	// unrelated to what it tests. Flip to a character the original is not.
+	f.messageID = differentID(f.messageID)
 	f.deliver(t)
 
 	if n := len(f.pusher.sent()); n != 1 {
@@ -350,4 +354,25 @@ func TestFanOutWithoutAPusherStillNotifies(t *testing.T) {
 	if n := f.notificationRows(t, f.recipient); n != 1 {
 		t.Fatalf("%d notification rows with push disabled, want 1", n)
 	}
+}
+
+// differentID returns an id that is guaranteed not to equal in, by flipping the
+// last character between two values rather than assigning a fixed one.
+//
+// The fixed-character version was a 1-in-16 flake: a uuid that already ended in
+// that character was left unchanged, so a test meaning "now deliver a different
+// message" delivered the same one, hit the idempotency guard, and failed with a
+// message that pointed at deduplication rather than at the test's own bug. It
+// only ever appeared with a reachable Postgres, which is why the suite looked
+// stable.
+func differentID(in string) string {
+	if in == "" {
+		return "0"
+	}
+	last := in[len(in)-1]
+	next := byte('0')
+	if last == '0' {
+		next = '1'
+	}
+	return in[:len(in)-1] + string(next)
 }
