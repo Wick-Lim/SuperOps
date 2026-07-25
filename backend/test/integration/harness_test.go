@@ -39,8 +39,10 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/app"
+	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
+	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/logger"
 )
 
@@ -782,4 +784,21 @@ func (c *wsClient) poll(d time.Duration, types ...string) (wsFrame, bool) {
 			return wsFrame{}, false
 		}
 	}
+}
+
+// storage returns the app's object-storage backend, for a test that has to look
+// at the bucket rather than at the API.
+func (h *harness) storage(t *testing.T) storage.Backend {
+	t.Helper()
+	if h.app.Storage == nil {
+		t.Skip("object storage not configured")
+	}
+	return h.app.Storage
+}
+
+// fileRepo returns the collector's repository, so a test can ask the REAL
+// predicate rather than restating it.
+func (h *harness) fileRepo(t *testing.T) *file.Repository {
+	t.Helper()
+	return file.NewRepository(h.app.DB)
 }

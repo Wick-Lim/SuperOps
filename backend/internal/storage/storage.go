@@ -96,8 +96,9 @@ type ObjectInfo struct {
 // So the split is: ORIGINALS are presigned as attachments with an opaque
 // content type, and are therefore never rendered by the browser, which leaves
 // the CSP nothing to protect. INLINE rendering uses the thumbnail, which the
-// server generated and whose type is always image/webp. Small inline originals
-// keep the proxied path with its existing headers.
+// SERVER generated and whose type comes from a closed set (see drive's
+// thumbMediaTypes). Small inline originals keep the proxied path with its
+// existing headers.
 //
 // Both fields are required rather than optional for that reason: a zero
 // PresignOptions would be a presigned URL that renders in the browser on our

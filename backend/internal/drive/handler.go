@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -532,6 +534,27 @@ func (h *Handler) presign(ctx context.Context, file *File) string {
 	return url
 }
 
+// thumbMediaTypes is the closed set of thumbnail formats and the type each is
+// served as. A key whose extension is absent gets NO presigned URL.
+//
+// Closed, and fail-closed, because the thumbnail is the ONE object Drive serves
+// INLINE from a presigned URL — where no CSP header can travel. The safety
+// property is that the served type is single, known-safe, and produced by the
+// server. Deriving it from the key rather than hardcoding one value is what
+// keeps that true if the generator's format ever changes: the previous version
+// of this function labelled ANY key found in the column image/webp, which would
+// have served a JPEG (or anything else) under a lie.
+//
+// ".webp" is reserved for the day a pure-Go WebP encoder is worth the
+// dependency; golang.org/x/image/webp is decode-only today, which is why
+// internal/thumb writes JPEG.
+var thumbMediaTypes = map[string]string{
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".webp": "image/webp",
+}
+
 func (h *Handler) presignThumb(ctx context.Context, file *File) string {
 	if h.storage == nil {
 		return ""
@@ -541,11 +564,12 @@ func (h *Handler) presignThumb(ctx context.Context, file *File) string {
 		`SELECT COALESCE(thumbnail_key, '') FROM files WHERE id = $1`, file.ID).Scan(&key); err != nil || key == "" {
 		return ""
 	}
-	// The ONE thing Drive serves inline from a presigned URL. It is safe
-	// because the server generated it and its type is always image/webp — a
-	// single known-safe type is what makes inline rendering sound at all.
+	mediaType, known := thumbMediaTypes[strings.ToLower(path.Ext(key))]
+	if !known {
+		return ""
+	}
 	url, err := h.storage.PresignGet(ctx, key, presignTTL, storage.PresignOptions{
-		ContentType: "image/webp",
+		ContentType: mediaType,
 		Disposition: "inline",
 	})
 	if err != nil {

@@ -53,6 +53,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/push"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
+	"github.com/Wick-Lim/SuperOps/backend/internal/thumb"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/logger"
@@ -387,6 +388,16 @@ func run() int {
 	l.Info("audit anchoring ready", "sink", auditSink.Name())
 
 	if store := openStorage(ctx, cfg, l); store != nil {
+		// The thumbnailer. Its own durable so a hostile image cannot stall
+		// search indexing, and its own subject so it gets the storage key and
+		// the content type the indexer has no business knowing.
+		thumbs := thumb.NewConsumer(pool, store, l)
+		bind(durableSpec{
+			durable: "thumbnailer",
+			filter:  "superops.*.thumbnail.requested",
+			handle:  thumbs.Handle,
+		})
+
 		fileRepo := file.NewRepository(pool)
 		start(jobObjectGC, objectGCStartDelay, objectGCInterval, func(c context.Context) error {
 			return runObjectGC(c, pool, fileRepo, store, l)

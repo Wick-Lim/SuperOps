@@ -89,7 +89,8 @@ type NewRequest struct {
 	Name     string
 }
 
-// Preview is a generated thumbnail. Always image/webp — see Kind.Thumb.
+// Preview is a generated thumbnail. internal/thumb decides the format; see
+// Kind.Thumb.
 type Preview struct {
 	Bytes  []byte
 	Width  int
@@ -139,9 +140,11 @@ type Kind struct {
 	// belongs to the phase that owns the block model.
 	Text func(ctx context.Context, src io.Reader) (string, error)
 
-	// Thumb produces a preview image, or ErrNoPreview. Always image/webp on the
-	// way out: the thumbnail is the ONE thing Drive serves inline from a
-	// presigned URL, and a single known-safe type is what makes that sound.
+	// Thumb produces a preview image, or ErrNoPreview. internal/thumb decides the
+	// format — image/jpeg today — and the thumbnail is the ONE object Drive
+	// serves inline from a presigned URL, so what matters is that the type is
+	// single, known-safe and produced by the server. It is NOT webp:
+	// golang.org/x/image/webp is decode-only.
 	Thumb func(ctx context.Context, src io.ReadSeeker) (Preview, error)
 
 	// Versioned reports whether POST /content may create a new version.

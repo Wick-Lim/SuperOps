@@ -191,6 +191,7 @@ func (h *Handler) UploadFile(w http.ResponseWriter, r *http.Request) {
 	h.record(ctx, workspaceID, "drive.file_uploaded", "file", fileID,
 		map[string]interface{}{"name": name, "size_bytes": header.Size, "folder_id": folderID})
 	h.events.PublishFile(ctx, ActionUploaded, out)
+	h.events.RequestThumbnail(ctx, out)
 
 	desc, err := h.describe(ctx, out, authz.CapAdmin)
 	if err != nil {

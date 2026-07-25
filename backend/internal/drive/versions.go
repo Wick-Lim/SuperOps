@@ -253,6 +253,10 @@ func (h *Handler) ReplaceContent(w http.ResponseWriter, r *http.Request) {
 	h.record(ctx, f.WorkspaceID, "drive.version_created", "file", f.ID,
 		map[string]interface{}{"version": out.Version, "size_bytes": header.Size})
 	h.events.PublishFile(ctx, ActionUpdated, out)
+	// New bytes, new preview. thumbnail_key was cleared in the transaction, so
+	// until this lands the file simply has none — which is correct, and better
+	// than a preview of what it used to be.
+	h.events.RequestThumbnail(ctx, out)
 
 	desc, err := h.describe(ctx, out, authz.CapAdmin)
 	if err != nil {
@@ -325,6 +329,7 @@ func (h *Handler) RestoreVersion(w http.ResponseWriter, r *http.Request) {
 	h.record(ctx, f.WorkspaceID, "drive.version_restored", "file", f.ID,
 		map[string]interface{}{"version": n})
 	h.events.PublishFile(ctx, ActionUpdated, out)
+	h.events.RequestThumbnail(ctx, out)
 
 	desc, err := h.describe(ctx, out, authz.CapAdmin)
 	if err != nil {

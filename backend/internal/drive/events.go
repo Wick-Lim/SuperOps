@@ -30,6 +30,13 @@ const (
 	ActionUploaded = "file.uploaded"
 	ActionUpdated  = "file.updated"
 	ActionDeleted  = "file.deleted"
+
+	// ActionThumbnailRequested asks the thumbnailer for a preview. Its own
+	// action rather than a second consumer on file.uploaded, because the
+	// thumbnailer needs the storage key and the content type — which the search
+	// indexer has no business knowing — and because a preview that fails must
+	// not affect indexing.
+	ActionThumbnailRequested = "thumbnail.requested"
 )
 
 // Publisher emits Drive events. A nil *Publisher is a working no-op, so a
@@ -113,5 +120,44 @@ func (p *Publisher) PublishFile(ctx context.Context, action string, f *File) {
 		// fresh; paging somebody would be about a stale search result.
 		p.logger.Warn("publish drive file event; the row is committed and the index will "+
 			"converge on the next reindex", "subject", subject, "file_id", f.ID, "error", err)
+	}
+}
+
+// thumbnailRequest is what internal/thumb's consumer decodes.
+type thumbnailRequest struct {
+	FileID      string `json:"file_id"`
+	StorageKey  string `json:"storage_key"`
+	ContentType string `json:"content_type"`
+}
+
+// RequestThumbnail asks for a preview of a file's current bytes.
+//
+// Called after every write that changes them — upload, and each new version —
+// and never for a collab type, which has none. Like every publish here it is
+// post-commit and best effort: a missing preview is a missing preview.
+func (p *Publisher) RequestThumbnail(ctx context.Context, f *File) {
+	if p == nil || f == nil || f.storageKey == "" {
+		return
+	}
+	subject := fmt.Sprintf("superops.%s.%s", f.WorkspaceID, ActionThumbnailRequested)
+
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), publishTimeout)
+	defer cancel()
+
+	// The message id is (file, storage key): a retry collapses, and a NEW
+	// version — which has a new key — is a different request rather than a
+	// duplicate of the old one.
+	msgID := "thumb:" + f.ID + ":" + f.storageKey
+
+	if err := p.nats.PublishDurable(pubCtx, subject, msgID, natspkg.Event{
+		Type: ActionThumbnailRequested,
+		Data: thumbnailRequest{
+			FileID:      f.ID,
+			StorageKey:  f.storageKey,
+			ContentType: f.ContentType,
+		},
+	}); err != nil {
+		p.logger.Warn("request thumbnail; the file is stored and simply has no preview",
+			"subject", subject, "file_id", f.ID, "error", err)
 	}
 }

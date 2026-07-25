@@ -33,6 +33,7 @@ type driveDescriptor struct {
 	Capability       string  `json:"capability"`
 	CollabDocumentID *string `json:"collab_document_id"`
 	ContentURL       *string `json:"content_url"`
+	ThumbnailURL     *string `json:"thumbnail_url"`
 	FolderID         *string `json:"folder_id"`
 }
 

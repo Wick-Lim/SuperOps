@@ -63,6 +63,11 @@ type App struct {
 	// directly.
 	Authz *authz.Checker
 
+	// Storage is the object-storage backend, or nil when none is configured.
+	// Exported for the same reason Authz is: a test or an operational tool has
+	// to be able to look at the bucket, and handlers are given it directly.
+	Storage storage.Backend
+
 	// audit is closed on shutdown so the Tier 2 buffer drains instead of
 	// discarding the records for the last requests this replica served.
 	audit *audit.Service
@@ -436,14 +441,15 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	}
 
 	appInstance := &App{
-		Config: cfg,
-		Logger: logger,
-		DB:     pool,
-		Redis:  redisClient,
-		NATS:   natsClient,
-		Hub:    hub,
-		Authz:  az,
-		audit:  auditService,
+		Config:  cfg,
+		Logger:  logger,
+		Storage: fileStorage,
+		DB:      pool,
+		Redis:   redisClient,
+		NATS:    natsClient,
+		Hub:     hub,
+		Authz:   az,
+		audit:   auditService,
 	}
 
 	// Router
