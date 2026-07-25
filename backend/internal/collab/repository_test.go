@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/ws"
 )
@@ -428,5 +429,82 @@ func TestPayloadSizeIsEnforcedByPostgres(t *testing.T) {
 	_, _, err := f.repo.AppendUpdate(context.Background(), doc.ID, f.member, make([]byte, MaxUpdateBytes+1))
 	if err == nil {
 		t.Fatal("an oversized update was accepted by Postgres")
+	}
+}
+
+// EnsureDocumentTx is what Drive's registry calls: the files row, the
+// acl_object row and the collaborative document are one commit.
+func TestEnsureDocumentTxIsIdempotentAndTenantScoped(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	resourceID := f.newDriveFile(t)
+
+	create := func(pool interface {
+		Begin(context.Context) (pgx.Tx, error)
+	}, workspaceID, actor string) error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if err := f.repo.EnsureDocumentTx(ctx, tx, workspaceID, "document", resourceID, actor); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+
+	if err := create(f.pool, f.workspaceID, f.owner); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	// Kind.New must be idempotent on (workspace, file id): a retried request
+	// must not create a second document for the same file.
+	if err := create(f.pool, f.workspaceID, f.member); err != nil {
+		t.Fatalf("second create: %v", err)
+	}
+
+	var n int
+	if err := f.pool.QueryRow(ctx,
+		`SELECT count(*) FROM collab_documents WHERE resource_type = 'document' AND resource_id = $1`,
+		resourceID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("collab_documents rows for one file = %d, want 1", n)
+	}
+
+	// Another workspace claiming the same resource must be refused, not handed
+	// the first one's document — that would be a cross-tenant reach by guessing
+	// a file id.
+	other := newFixture(t)
+	if err := create(f.pool, other.workspaceID, other.owner); !errors.Is(err, ErrResourceConflict) {
+		t.Errorf("cross-workspace create = %v, want ErrResourceConflict", err)
+	}
+}
+
+// A rollback must take the document with it, or a failed "new document" leaves
+// a collab_documents row for a files row that was never committed — reachable
+// by id and belonging to nobody.
+func TestEnsureDocumentTxRollsBack(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	resourceID := f.newDriveFile(t)
+
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.repo.EnsureDocumentTx(ctx, tx, f.workspaceID, "document", resourceID, f.owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := f.repo.GetByResource(ctx, "document", resourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc != nil {
+		t.Error("the document survived a rolled-back transaction")
 	}
 }

@@ -57,6 +57,40 @@ func (r *Repository) GetByResource(ctx context.Context, resourceType, resourceID
 // exist before someone opens it. The insert is ON CONFLICT DO NOTHING followed
 // by a read rather than a read followed by an insert, because two people
 // opening the same file at the same moment is the normal case, not the edge.
+// EnsureDocumentTx creates the document inside the CALLER's transaction.
+//
+// Drive needs this: creating a "new document" writes the files row, the
+// acl_object row and this in one commit, so that a collab_documents row cannot
+// exist for a file that does not — which would be a document reachable by id
+// and belonging to nobody.
+//
+// It returns only an error. A caller inside a transaction is creating the
+// document, not opening it, and handing back a *Document read mid-transaction
+// invites using state that a rollback is about to discard.
+//
+// Idempotent on (resource_type, resource_id), because Kind.New must be: a
+// retried request must not create a second document for the same file.
+func (r *Repository) EnsureDocumentTx(ctx context.Context, tx pgx.Tx, workspaceID, resourceType, resourceID, createdBy string) error {
+	var ownerWorkspace string
+	err := tx.QueryRow(ctx,
+		`INSERT INTO collab_documents (workspace_id, resource_type, resource_id, created_by)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (resource_type, resource_id) DO UPDATE
+		     SET resource_id = collab_documents.resource_id
+		 RETURNING workspace_id::text`,
+		workspaceID, resourceType, resourceID, nullableID(createdBy)).Scan(&ownerWorkspace)
+	if err != nil {
+		return fmt.Errorf("create collaboration document: %w", err)
+	}
+	// DO UPDATE rather than DO NOTHING so the existing row is returned and this
+	// check can run at all: with DO NOTHING a conflict yields no row, and the
+	// function would report success for a document owned by another tenant.
+	if ownerWorkspace != workspaceID {
+		return ErrResourceConflict
+	}
+	return nil
+}
+
 func (r *Repository) EnsureDocument(ctx context.Context, workspaceID, resourceType, resourceID, createdBy string) (*Document, error) {
 	doc, err := scanDocument(r.pool.QueryRow(ctx,
 		`INSERT INTO collab_documents (workspace_id, resource_type, resource_id, created_by)
