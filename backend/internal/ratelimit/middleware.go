@@ -140,11 +140,33 @@ func (c Config) window() time.Duration {
 
 // MiddlewareByIP rate-limits strictly by client IP — used to protect
 // unauthenticated, brute-forceable endpoints (login, refresh, accept-invite).
+//
+// The bucket includes the request PATH, which is right for every route whose
+// path is fixed and WRONG for one whose path contains the thing being guessed.
+// See MiddlewareByIPBucket.
 func MiddlewareByIP(rdb *redis.Client, cfg Config) func(http.Handler) http.Handler {
+	return MiddlewareByIPBucket(rdb, cfg, "")
+}
+
+// MiddlewareByIPBucket rate-limits by client IP under a FIXED bucket name.
+//
+// It exists because MiddlewareByIP keys on r.URL.Path, and a route whose path
+// carries a secret — POST /drive/links/{token}/resolve — would give every guess
+// its own bucket. The endpoint would be advertised as rate limited, would appear
+// rate limited in the config, and would not be: an attacker walking the token
+// space would never hit a limit, because no two attempts share a key.
+//
+// An empty bucket falls back to the path, which is the correct default for every
+// route whose path is fixed.
+func MiddlewareByIPBucket(rdb *redis.Client, cfg Config, bucket string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			scope := bucket
+			if scope == "" {
+				scope = r.URL.Path
+			}
 			ip := clientIP(r, cfg.TrustProxy, cfg.TrustedProxyHops)
-			enforce(w, r, rdb, fmt.Sprintf("ratelimit:ip:%s:%s", r.URL.Path, ip), cfg, next)
+			enforce(w, r, rdb, fmt.Sprintf("ratelimit:ip:%s:%s", scope, ip), cfg, next)
 		})
 	}
 }

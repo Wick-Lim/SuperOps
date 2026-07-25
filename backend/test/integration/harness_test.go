@@ -802,3 +802,15 @@ func (h *harness) fileRepo(t *testing.T) *file.Repository {
 	t.Helper()
 	return file.NewRepository(h.app.DB)
 }
+
+// resolveLink exchanges a share-link token, UNAUTHENTICATED. No Authorization
+// header: the token is the whole credential, and sending one alongside would
+// hide a route that only works for people who are already signed in.
+func (h *harness) resolveLink(t *testing.T, token, password string) (int, apiResp) {
+	t.Helper()
+	var body any
+	if password != "" {
+		body = map[string]string{"password": password}
+	}
+	return h.do(t, http.MethodPost, "/api/v1/drive/links/"+token+"/resolve", "", body)
+}

@@ -1212,21 +1212,8 @@ func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj Obj
 	var live []ObjectRef
 	var truncated bool
 	if err := database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
-		st, err := lockObject(ctx, tx, ref)
-		if err != nil {
-			return err
-		}
-		if st == nil {
-			// No object means no grant to remove and no keys to rewrite.
-			return nil
-		}
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM acl_grant
-			 WHERE object_type = $1 AND object_id = $2 AND subject_type = $3 AND subject_id = $4`,
-			ref.Type, ref.ID, sub.Type, sub.ID); err != nil {
-			return fmt.Errorf("delete grant: %w", err)
-		}
-		if err := rewriteSubtreeKeys(ctx, tx, st.path); err != nil {
+		st, err := revokeIn(ctx, tx, ref, sub)
+		if err != nil || st == nil {
 			return err
 		}
 		live, truncated, err = liveDescendants(ctx, tx, st.path)
@@ -1485,6 +1472,62 @@ func (c *Checker) MoveTx(ctx context.Context, tx pgx.Tx, obj, newParent ObjectRe
 	// refuses the same things Move does. Reusing it keeps one implementation of
 	// the path rewrite rather than a second that can drift.
 	return registerIn(ctx, tx, ref, parentRef)
+}
+
+// RevokeTx is Revoke inside the caller's transaction, WITHOUT the Revoker.
+//
+// It exists for revoking a share link, where the grant and the link row have to
+// die together: leaving the grant would mean a "revoked" link still materialized
+// its key on every object in the subtree — revocation that changed a flag the
+// resolve path reads and that no other path does.
+//
+// It drops no live sessions. A link session is a bearer token with its own short
+// TTL and no WebSocket, so there is nothing open to close; a caller revoking a
+// USER's grant wants Revoke.
+func (c *Checker) RevokeTx(ctx context.Context, tx pgx.Tx, subject SubjectRef, obj ObjectRef) error {
+	sub, ok, err := subject.normalize()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("revoke on %s: invalid subject id", obj)
+	}
+	ref, ok, err := obj.normalize()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("revoke from %s: invalid object id", sub)
+	}
+	_, err = revokeIn(ctx, tx, ref, sub)
+	return err
+}
+
+// revokeIn deletes one grant and rewrites the subtree's keys. It returns the
+// object's state so the caller can drive the Revoker, or nil when there was no
+// object — no object means no grant to remove and no keys to rewrite.
+func revokeIn(ctx context.Context, tx pgx.Tx, ref ObjectRef, sub SubjectRef) (*objectState, error) {
+	st, err := lockObject(ctx, tx, ref)
+	if err != nil || st == nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM acl_grant
+		 WHERE object_type = $1 AND object_id = $2 AND subject_type = $3 AND subject_id = $4`,
+		ref.Type, ref.ID, sub.Type, sub.ID); err != nil {
+		return nil, fmt.Errorf("delete grant: %w", err)
+	}
+	if err := rewriteSubtreeKeys(ctx, tx, st.path); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
+// IsWorkspaceMember reports whether a user belongs to a workspace. Exported
+// because sharing has to refuse a grant to somebody outside it, and that is a
+// product rule rather than an ACL one.
+func (c *Checker) IsWorkspaceMember(ctx context.Context, workspaceID, userID string) (bool, error) {
+	return c.isWorkspaceMember(ctx, workspaceID, userID)
 }
 
 // UnregisterTx removes an ACL-native object's rows, inside the caller's

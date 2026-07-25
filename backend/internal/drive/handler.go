@@ -79,9 +79,27 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("POST /api/v1/drive/files/{file_id}/move", authMw(http.HandlerFunc(h.MoveFile)))
 	mux.Handle("DELETE /api/v1/drive/files/{file_id}", authMw(http.HandlerFunc(h.TrashFile)))
 	mux.Handle("POST /api/v1/drive/files/{file_id}/content", authMw(http.HandlerFunc(h.ReplaceContent)))
+
+	mux.Handle("GET /api/v1/drive/{object_type}/{object_id}/shares", authMw(http.HandlerFunc(h.ListShares)))
+	mux.Handle("PUT /api/v1/drive/{object_type}/{object_id}/shares", authMw(http.HandlerFunc(h.PutShare)))
+	mux.Handle("DELETE /api/v1/drive/{object_type}/{object_id}/shares/{subject_type}/{subject_id}",
+		authMw(http.HandlerFunc(h.DeleteShare)))
+	mux.Handle("POST /api/v1/drive/{object_type}/{object_id}/links", authMw(http.HandlerFunc(h.CreateLink)))
+	mux.Handle("GET /api/v1/drive/{object_type}/{object_id}/links", authMw(http.HandlerFunc(h.ListLinks)))
+	mux.Handle("DELETE /api/v1/drive/links/{link_id}", authMw(http.HandlerFunc(h.RevokeLink)))
 	mux.Handle("GET /api/v1/drive/files/{file_id}/versions", authMw(http.HandlerFunc(h.ListVersions)))
 	mux.Handle("GET /api/v1/drive/files/{file_id}/versions/{version}/content", authMw(http.HandlerFunc(h.VersionContent)))
 	mux.Handle("POST /api/v1/drive/files/{file_id}/versions/{version}/restore", authMw(http.HandlerFunc(h.RestoreVersion)))
+}
+
+// RegisterLinkRoutes is separate from RegisterRoutes because this one route is
+// UNAUTHENTICATED and needs a rate limiter the others do not: its path contains
+// a guessable secret, so the composition root wraps it in a FIXED-bucket
+// limiter. See ratelimit.MiddlewareByIPBucket.
+func (h *Handler) RegisterLinkRoutes(mux *http.ServeMux, mw func(http.Handler) http.Handler) {
+	// POST, not GET. A token in a GET lands in a Referer, in browser history
+	// and in a prefetch.
+	mux.Handle("POST /api/v1/drive/links/{token}/resolve", mw(http.HandlerFunc(h.ResolveLink)))
 }
 
 func (h *Handler) Registry(w http.ResponseWriter, _ *http.Request) {
@@ -139,6 +157,19 @@ func fail(w http.ResponseWriter, err error) {
 		httputil.JSONError(w, http.StatusConflict, "NOT_VERSIONED",
 			"this object's content is edited collaboratively; uploaded bytes would be "+
 				"discarded by the next merge")
+	case errors.Is(err, ErrLinkInvalid):
+		// ONE answer for unknown, revoked, expired and used-up alike.
+		// Distinguishing them tells somebody walking the token space which
+		// guesses landed on a real row.
+		httputil.JSONError(w, http.StatusNotFound, "LINK_INVALID",
+			"this link is not valid")
+	case errors.Is(err, ErrLinkPassword):
+		httputil.JSONError(w, http.StatusUnauthorized, "LINK_PASSWORD_REQUIRED",
+			"this link requires a password")
+	case errors.Is(err, ErrEscalation):
+		httputil.JSONError(w, http.StatusForbidden, "ESCALATION", err.Error())
+	case errors.Is(err, ErrNotAMember):
+		httputil.JSONError(w, http.StatusBadRequest, "NOT_A_MEMBER", err.Error())
 	case errors.Is(err, ErrUnknownType):
 		httputil.JSONError(w, http.StatusBadRequest, "UNKNOWN_FILE_TYPE",
 			"no editor is registered for that file type on this deployment")

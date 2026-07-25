@@ -161,12 +161,25 @@ const (
 	// tenancy statement: acl_object.workspace_id decides that, and a workspace
 	// grant on an object in another tenant would still fail the path CHECK.
 	SubjectWorkspace = "workspace"
+
+	// SubjectLink is a share link: one anonymous holder of one token, granted
+	// on one object.
+	//
+	// Its key prefix is 'g-' rather than a sixth prefix, and that is deliberate.
+	// internal/search's validKey accepts a CLOSED set and a key that fails it is
+	// DROPPED from the filter — and a dropped narrowing term WIDENS the query,
+	// which for a tenancy filter is a cross-tenant leak. Widening that validator
+	// in order to ship a link is exactly the change docs/plans/README.md ruling
+	// 3 exists to prevent, and 'g-' already means "a subject that is not one
+	// person".
+	SubjectLink = "link"
 )
 
 var subjectKeyPrefix = map[string]string{
 	SubjectUser:      "u-",
 	SubjectGroup:     "g-",
 	SubjectWorkspace: "w-",
+	SubjectLink:      "g-",
 }
 
 // ObjectRef names one object: a type and a uuid. It is a value, not an
@@ -195,6 +208,12 @@ func GroupSubject(groupID string) SubjectRef { return SubjectRef{Type: SubjectGr
 // how an object becomes workspace-shared; see SubjectWorkspace.
 func WorkspaceSubject(workspaceID string) SubjectRef {
 	return SubjectRef{Type: SubjectWorkspace, ID: workspaceID}
+}
+
+// LinkSubject names one share link. Its key is what a resolved link session
+// holds, and it is the ONLY key such a session holds.
+func LinkSubject(linkID string) SubjectRef {
+	return SubjectRef{Type: SubjectLink, ID: linkID}
 }
 
 // Ref constructors for the types that exist today.

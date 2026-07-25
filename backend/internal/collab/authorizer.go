@@ -48,9 +48,34 @@ func NewWorkspaceAuthorizer(checker *authz.Checker) *WorkspaceAuthorizer {
 	return &WorkspaceAuthorizer{checker: checker}
 }
 
+// CanRead and CanWrite authorize against the DOCUMENT'S OWN RESOURCE, not
+// against its workspace.
+//
+// They gated on the workspace while Drive did not exist: a document had no place
+// in the tree to inherit from, and inventing one would have been an ACL the
+// drift verifier could not reconcile. Drive exists now, collab_documents.
+// resource_id is a real foreign key to files(id) (migration 025), and the
+// workspace check has become actively wrong — sharing one folder with a guest
+// would hand them read on EVERY collaborative document in the tenant, because
+// the guest is a workspace member and that was the whole question being asked.
+//
+// The ObjectRef is built from resource_id, never from resource_type:
+// resource_type is the editor-registry key ("document", "spreadsheet") and
+// acl_object.object_type is an ACL type. They are different vocabularies that
+// happen to share a word.
+//
+// The workspace check remains as the FALLBACK for a document with no resource,
+// which is the shape every pre-Drive row has and the shape a test fixture can
+// still produce. Falling back rather than refusing keeps this behaviour-
+// preserving for those; falling back to something WIDER than the resource check
+// is safe only because a resource-less document is one nothing else can reach
+// either.
 func (a *WorkspaceAuthorizer) CanRead(ctx context.Context, doc *Document, userID string) (bool, error) {
 	if doc == nil {
 		return false, nil
+	}
+	if doc.ResourceID != "" {
+		return a.checker.Can(ctx, authz.UserSubject(userID), authz.FileObject(doc.ResourceID), authz.CapRead)
 	}
 	return a.checker.Can(ctx, authz.UserSubject(userID), authz.WorkspaceObject(doc.WorkspaceID), authz.CapRead)
 }
@@ -58,6 +83,9 @@ func (a *WorkspaceAuthorizer) CanRead(ctx context.Context, doc *Document, userID
 func (a *WorkspaceAuthorizer) CanWrite(ctx context.Context, doc *Document, userID string) (bool, error) {
 	if doc == nil {
 		return false, nil
+	}
+	if doc.ResourceID != "" {
+		return a.checker.Can(ctx, authz.UserSubject(userID), authz.FileObject(doc.ResourceID), authz.CapWrite)
 	}
 	return a.canEdit(ctx, doc.WorkspaceID, userID)
 }

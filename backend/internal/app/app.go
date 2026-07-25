@@ -535,6 +535,23 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	channelHandler.RegisterRoutes(mux, authMw)
 	collabHandler.RegisterRoutes(mux, authMw)
 	driveHandler.RegisterRoutes(mux, authMw)
+	// Resolving a share link is unauthenticated and its path CONTAINS the
+	// secret being guessed, so it gets a FIXED rate-limit bucket rather than
+	// the default per-path one — which would give every guess its own budget
+	// and make the limit decorative. It shares the auth routes' strict budget,
+	// because it is the same shape of endpoint: an unauthenticated credential
+	// check.
+	driveHandler.RegisterLinkRoutes(mux, func(next http.Handler) http.Handler {
+		if !cfg.RateLimit.Enabled {
+			return next
+		}
+		return ratelimit.MiddlewareByIPBucket(redisClient, ratelimit.Config{
+			RequestsPerMinute: cfg.RateLimit.AuthPerMinute,
+			Window:            time.Minute,
+			TrustProxy:        cfg.RateLimit.TrustProxy,
+			TrustedProxyHops:  cfg.RateLimit.TrustedProxyHops,
+		}, "drive-link-resolve")(next)
+	})
 	presenceHandler.RegisterRoutes(mux, authMw)
 	if fileHandler != nil {
 		fileHandler.RegisterRoutes(mux, authMw)

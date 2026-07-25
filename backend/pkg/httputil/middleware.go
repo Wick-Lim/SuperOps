@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -67,7 +68,7 @@ func LoggingMiddleware(log *slog.Logger) func(http.Handler) http.Handler {
 
 				attrs := []any{
 					"method", r.Method,
-					"path", r.URL.Path,
+					"path", redactPath(r.URL.Path),
 					"status", sw.status,
 					"duration_ms", time.Since(start).Milliseconds(),
 					"remote_addr", r.RemoteAddr,
@@ -136,4 +137,36 @@ func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// secretPathPrefixes are routes whose PATH carries a credential.
+//
+// A share-link token is a bearer credential for content: whoever holds it reads
+// the object. LoggingMiddleware writes r.URL.Path at INFO on every request, so
+// without this every resolve attempt would put a working token into the log —
+// where it outlives the link, gets shipped to whatever aggregator the operator
+// runs, and is readable by everyone with access to it.
+//
+// A prefix rather than a regex, and a list rather than a guess: a route is added
+// here deliberately, by the person who put a secret in a path.
+var secretPathPrefixes = []string{
+	"/api/v1/drive/links/",
+}
+
+// redactPath replaces the secret-bearing segment of a path with a placeholder,
+// keeping the shape so the log is still useful for finding the route.
+func redactPath(path string) string {
+	for _, prefix := range secretPathPrefixes {
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(path, prefix)
+		// The secret is the first segment; anything after it is route structure
+		// and is kept.
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			return prefix + "<redacted>" + rest[i:]
+		}
+		return prefix + "<redacted>"
+	}
+	return path
 }
