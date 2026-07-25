@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
@@ -157,6 +159,22 @@ func linkFiles(ctx context.Context, tx pgx.Tx, messageID, userID string, fileIDs
 	}
 	if int(tag.RowsAffected()) != len(ids) {
 		return ErrFilesUnavailable
+	}
+
+	// Attaching a file RELOCATES it: acl_object_expected hangs an attached file
+	// off its message's channel rather than off the workspace, so its key set
+	// goes from "the uploader alone" to "whoever may read the channel". Leaving
+	// that to the hourly drift job would mean a file posted in a channel was
+	// unreadable by everyone else in it — and searchable by nobody — until the
+	// job ran.
+	//
+	// One call per file rather than a batch: the attachment count per message is
+	// bounded by the API, and a batch statement here would be a second copy of
+	// the view filter.
+	for _, id := range ids {
+		if err := authz.MaterializeTx(ctx, tx, authz.FileObject(id)); err != nil {
+			return fmt.Errorf("materialize attached file ACL: %w", err)
+		}
 	}
 	return nil
 }

@@ -82,11 +82,17 @@ func IsBadInput(err error) bool { return errors.Is(err, errBadInput) }
 // CreateFile is "new from the registry": one transaction writing the files row,
 // Kind.New and nothing else.
 //
-// The acl_object row is NOT written here. A file is a DERIVED type — its row and
-// its path come from acl_object_expected, computed from folder_id — so writing
-// one by hand would be reverted by the next Rebuild and reported as drift in
-// between. That asymmetry with CreateFolder is the whole derived/native
-// distinction, and it is why authz.Register refuses a file outright.
+// A file is a DERIVED type, so its acl_object row and its keys are COMPUTED from
+// folder_id rather than written by hand — authz.Register refuses a file outright,
+// and a hand-placed row would be reverted by the next Rebuild.
+//
+// But computed does not mean "eventually". authz.MaterializeTx runs the same
+// views Rebuild does, filtered to this one object, in this transaction. Without
+// it the file exists, opens fine (Capability resolves it from files.folder_id
+// directly) and is ABSENT FROM ITS OWN FOLDER'S LISTING until the hourly drift
+// job runs — because every list path filters on acl_key. It then appears on its
+// own, up to an hour later. That is the listing-versus-opening split
+// docs/plans/README.md ruling 5 exists to prevent, and it shipped once.
 func (r *Repository) CreateFile(ctx context.Context, workspaceID, folderID, name, fileType, actorID string) (*File, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len([]rune(name)) > MaxNameLength {
@@ -138,6 +144,10 @@ func (r *Repository) CreateFile(ctx context.Context, workspaceID, folderID, name
 			Name:        name,
 		}); err != nil {
 			return err
+		}
+
+		if err := authz.MaterializeTx(ctx, tx, authz.FileObject(id)); err != nil {
+			return fmt.Errorf("materialize file ACL: %w", err)
 		}
 
 		out, err = scanFile(tx.QueryRow(ctx, `SELECT `+fileColumns+` FROM files WHERE id = $1`, id))
@@ -305,14 +315,26 @@ func (r *Repository) MoveFile(ctx context.Context, id, newFolderID, actorID stri
 		return nil, ErrTrashed
 	}
 
-	out, err := scanFile(r.pool.QueryRow(ctx,
-		`UPDATE files SET folder_id = $2, updated_by = $3 WHERE id = $1 AND trashed_at IS NULL
-		 RETURNING `+fileColumns, id, newFolderID, nullable(actorID)))
-	if err != nil {
+	var out *File
+	if err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		var scanErr error
+		out, scanErr = scanFile(tx.QueryRow(ctx,
+			`UPDATE files SET folder_id = $2, updated_by = $3 WHERE id = $1 AND trashed_at IS NULL
+			 RETURNING `+fileColumns, id, newFolderID, nullable(actorID)))
+		if scanErr != nil {
+			return scanErr
+		}
+		if out == nil {
+			return ErrTrashed
+		}
+		// The ACL follows in the SAME transaction, in both directions: the new
+		// folder's key is added and the old folder's is removed. Deferring it to
+		// the drift job would leave the file listed in the folder it just left —
+		// which is worse than the create case, because it is a file appearing
+		// somewhere it no longer belongs rather than nowhere at all.
+		return authz.MaterializeTx(ctx, tx, authz.FileObject(id))
+	}); err != nil {
 		return nil, err
-	}
-	if out == nil {
-		return nil, ErrTrashed
 	}
 	return out, nil
 }

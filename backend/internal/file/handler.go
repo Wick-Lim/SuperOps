@@ -19,6 +19,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
@@ -176,11 +177,20 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.pool.Exec(ctx,
-		`INSERT INTO files (id, workspace_id, user_id, name, content_type, size_bytes, storage_key)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		fileID, workspaceID, userID, name, contentType, header.Size, storageKey,
-	); err != nil {
+	// The row and its ACL are one commit. A files row with no acl_key rows is
+	// invisible to every list path — including search — until the hourly drift
+	// job runs, and then it appears on its own. MaterializeTx runs the same
+	// views that job does, filtered to this object.
+	if err := database.WithTx(ctx, h.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO files (id, workspace_id, user_id, name, content_type, size_bytes, storage_key)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			fileID, workspaceID, userID, name, contentType, header.Size, storageKey,
+		); err != nil {
+			return err
+		}
+		return authz.MaterializeTx(ctx, tx, authz.FileObject(fileID))
+	}); err != nil {
 		// Do not leave the object behind if the metadata row could not be written.
 		_ = h.storage.Delete(ctx, storageKey)
 		httputil.HandleError(w, httputil.NewInternal(err))

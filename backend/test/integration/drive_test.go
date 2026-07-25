@@ -400,3 +400,83 @@ func TestDriveChildrenPaginateAcrossAPageBoundary(t *testing.T) {
 			"drops rows exactly at a page boundary", len(seen), total)
 	}
 }
+
+// A file must appear in its own folder's listing the instant it is created.
+//
+// It did not. drive.CreateFile wrote the files row and nothing else, and the
+// children listing filters on acl_key — which for a file is materialized from
+// acl_object_expected by the hourly drift job. So a new document was invisible
+// in the folder it was just created in, and then appeared on its own up to an
+// hour later.
+//
+// Every existing listing assertion in this file lists FOLDERS, which are
+// ACL-native and registered in their own transaction, and the descriptor tests
+// open the file BY ID — which resolves from files.folder_id directly and works
+// fine. The gap between those two paths is exactly the listing-versus-opening
+// split docs/plans/README.md ruling 5 exists to prevent, and it is why this
+// test lists rather than opens.
+func TestDriveFileAppearsInItsFolderImmediately(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	root := h.driveRoot(t, admin, ws)
+	folder := h.createFolder(t, admin, ws, root.ID, "immediate")
+
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/drive/files", admin,
+		map[string]string{"folder_id": folder.ID, "name": "just made", "file_type": "document"})
+	var created driveDescriptor
+	decodeInto(t, resp.Data, &created)
+
+	found := false
+	for _, e := range h.children(t, admin, folder.ID) {
+		if e.File != nil && e.File.ID == created.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("a file created one request ago is not in its own folder's listing; " +
+			"it would appear on its own when the hourly ACL drift job next runs, which is " +
+			"the worst possible shape for a bug report")
+	}
+}
+
+// The other direction, and the worse one: a moved file must leave the folder it
+// came from. A key that is only ever inserted is a key that never goes away, and
+// the file would keep appearing in its previous folder's listing forever —
+// visible somewhere it no longer belongs, rather than nowhere at all.
+func TestDriveMovedFileLeavesItsOldFolderImmediately(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	root := h.driveRoot(t, admin, ws)
+	from := h.createFolder(t, admin, ws, root.ID, "from")
+	to := h.createFolder(t, admin, ws, root.ID, "to")
+
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/drive/files", admin,
+		map[string]string{"folder_id": from.ID, "name": "travelling", "file_type": "document"})
+	var file driveDescriptor
+	decodeInto(t, resp.Data, &file)
+
+	h.req(t, http.StatusOK, http.MethodPost, "/api/v1/drive/files/"+file.ID+"/move", admin,
+		map[string]string{"folder_id": to.ID})
+
+	inFrom, inTo := false, false
+	for _, e := range h.children(t, admin, from.ID) {
+		if e.File != nil && e.File.ID == file.ID {
+			inFrom = true
+		}
+	}
+	for _, e := range h.children(t, admin, to.ID) {
+		if e.File != nil && e.File.ID == file.ID {
+			inTo = true
+		}
+	}
+	if inFrom {
+		t.Error("the moved file is still listed in the folder it left")
+	}
+	if !inTo {
+		t.Error("the moved file is not listed in the folder it moved to")
+	}
+}

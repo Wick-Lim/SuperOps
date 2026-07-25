@@ -1038,6 +1038,42 @@ func (c *Checker) GrantTx(ctx context.Context, tx pgx.Tx, actor, subject Subject
 	return grantIn(ctx, tx, ref, sub, capability, stored, grantedBy)
 }
 
+// ErrNativeType is returned by MaterializeTx for an ACL-native object. Those
+// have no expected state to compute — Register wrote their row — so asking to
+// materialize one is a caller confusing the two halves of the model.
+var ErrNativeType = errors.New("object type is ACL-native; its row is written by Register, not computed")
+
+// MaterializeTx brings ONE derived object's acl_object and acl_key rows up to
+// date, inside the caller's transaction.
+//
+// It exists because "derived" describes where the rows come from, not when they
+// arrive. They come from acl_object_expected via Rebuild, which runs hourly — so
+// a file created a second ago has no acl_object row and no acl_key rows, and
+// every LIST path filters on acl_key. The object is openable (Capability
+// resolves a file from files.folder_id directly) and invisible in the listing it
+// belongs to, and then it appears on its own up to an hour later.
+//
+// That is the listing-versus-opening split, and it is the exact failure
+// docs/plans/README.md ruling 5 names. Any handler that creates or relocates a
+// derived object calls this in the same transaction.
+//
+// It is a FILTER over the same views Rebuild uses, never a second computation of
+// the path: a hand-written path here would disagree with the view and the drift
+// verifier would report its own disagreement as production drift.
+func MaterializeTx(ctx context.Context, tx pgx.Tx, obj ObjectRef) error {
+	ref, ok, err := obj.normalize()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("materialize %s: invalid object id", obj)
+	}
+	if !derivedTypes[ref.Type] {
+		return fmt.Errorf("materialize %s: %w", ref, ErrNativeType)
+	}
+	return materializeDerived(ctx, tx, ref)
+}
+
 // materializeDerived inserts one derived object's acl_object row from
 // acl_object_expected, and its keys from acl_key_expected.
 //
@@ -1049,9 +1085,34 @@ func materializeDerived(ctx context.Context, tx pgx.Tx, ref ObjectRef) error {
 		SELECT object_type, object_id, workspace_id, path
 		  FROM acl_object_expected
 		 WHERE object_type = $1 AND object_id = $2
-		    ON CONFLICT (object_type, object_id) DO NOTHING`,
+		    ON CONFLICT (object_type, object_id) DO UPDATE
+		   SET workspace_id = EXCLUDED.workspace_id,
+		       path         = EXCLUDED.path,
+		       updated_at   = NOW()
+		 WHERE acl_object.workspace_id IS DISTINCT FROM EXCLUDED.workspace_id
+		    OR acl_object.path         IS DISTINCT FROM EXCLUDED.path`,
 		ref.Type, ref.ID); err != nil {
 		return fmt.Errorf("materialize %s: %w", ref, err)
+	}
+	// DO UPDATE, not DO NOTHING: this is also the MOVE path. A file moved to
+	// another folder keeps its row and changes its path, and an insert that
+	// skipped the conflict would leave it authorized against the folder it
+	// used to be in — visible in a listing it has left.
+
+	// Keys are reconciled, not merely added. A move makes the OLD container key
+	// wrong, and a key that is only ever inserted is a key that never goes away:
+	// the file would keep appearing in its previous folder's listing forever.
+	// Delete-then-insert rather than truncate, so a concurrent reader never sees
+	// an object with no keys and concludes it is unreadable.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM acl_key k
+		 WHERE k.object_type = $1 AND k.object_id = $2
+		   AND NOT EXISTS (SELECT 1 FROM acl_key_expected e
+		                    WHERE e.object_type = k.object_type
+		                      AND e.object_id   = k.object_id
+		                      AND e.key         = k.key)`,
+		ref.Type, ref.ID); err != nil {
+		return fmt.Errorf("prune stale keys for %s: %w", ref, err)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO acl_key (object_type, object_id, key)
