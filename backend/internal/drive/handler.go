@@ -30,12 +30,30 @@ type CollabLookup interface {
 	DocumentIDForResource(ctx context.Context, resourceType, resourceID string) (string, error)
 }
 
+// CollabRevoker drops live editor sessions when a share is withdrawn.
+//
+// A separate interface from CollabLookup because it is satisfied by a different
+// type — the lookup is the collab repository, this is the collab service, which
+// is the only thing holding the hub — and because a nil one must degrade to the
+// old behaviour rather than to a panic. A deployment with no collaboration
+// layer has no rooms to revoke.
+//
+// It takes an acl_object PATH, not an id: revoking a share on a folder must cut
+// every editor session beneath it, and the path is what expresses "beneath".
+type CollabRevoker interface {
+	// RevokeFileAccess cuts userID (or everyone, when empty) out of every
+	// editor room at or under path. Returns the count and whether the fan-out
+	// was truncated.
+	RevokeFileAccess(ctx context.Context, userID, path string) (int, bool)
+}
+
 type Handler struct {
 	repo    *Repository
 	authz   *authz.Checker
 	kinds   *registry.Registry
 	storage storage.Backend
 	collab  CollabLookup
+	revoker CollabRevoker
 	audit   *audit.Service
 	events  *Publisher
 }
@@ -52,6 +70,12 @@ func NewHandler(pool *pgxpool.Pool, az *authz.Checker, kinds *registry.Registry,
 		events:  events,
 	}
 }
+
+// SetCollabRevoker is late binding, for the same reason app.go's liveRevoker is:
+// the collaboration service authorizes through the checker and Drive revokes
+// through the collaboration service, so one of the two references has to be
+// filled in after construction.
+func (h *Handler) SetCollabRevoker(r CollabRevoker) { h.revoker = r }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
 	// The registry is served to every authenticated caller so the client

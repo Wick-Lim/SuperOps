@@ -360,6 +360,41 @@ func (r *Repository) DeleteDocument(ctx context.Context, documentID string) (boo
 // runs drive -> interface <- collab. Returning a bare id rather than a
 // *Document is deliberate — the descriptor names the room to join, and handing
 // back head_seq and snapshot_seq would invite a client to reason about the log.
+// DocumentIDsUnderPath resolves every collaborative document whose Drive object
+// sits at or beneath an acl_object path.
+//
+// ONE query, not a lookup per file. Revoking a share on a folder can touch
+// thousands of objects, and a query each would turn a share panel click into a
+// storm — the same reason the ACL itself is a materialized path rather than a
+// closure table.
+//
+// The join runs collab_documents -> acl_object rather than the other way round
+// because collab_documents is the small table: only files with an editor have a
+// row, and a workspace's Drive is mostly plain uploads.
+func (r *Repository) DocumentIDsUnderPath(ctx context.Context, path string, limit int) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT d.id::text
+		  FROM collab_documents d
+		  JOIN acl_object o
+		    ON o.object_type = 'file' AND o.object_id = d.resource_id
+		 WHERE o.path = $1 OR o.path LIKE $1 || '%'
+		 LIMIT $2`, path, limit)
+	if err != nil {
+		return nil, fmt.Errorf("look up collaboration documents under %q: %w", path, err)
+	}
+	defer rows.Close()
+
+	out := make([]string, 0, 16)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan collaboration document id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (r *Repository) DocumentIDForResource(ctx context.Context, resourceType, resourceID string) (string, error) {
 	var id string
 	err := r.pool.QueryRow(ctx,

@@ -225,9 +225,54 @@ func (h *Handler) DeleteShare(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+
+	// POST-COMMIT, and only for a user subject. authz's own live-revocation
+	// fan-out covers channels and collab documents and deliberately not files —
+	// see collab.Service.RevokeFileAccess for why widening it is the wrong fix.
+	// Without this, somebody removed from a document keeps typing in it for up
+	// to ws.membershipRecheckPeriod, which is five minutes on the pillar whose
+	// entire premise is live collaboration.
+	//
+	// A group subject is skipped for the same reason liveRevoker skips it: a
+	// group holds no connections, and its members' sessions go when their own
+	// grants do.
+	if subject.Type == authz.SubjectUser {
+		h.revokeLiveEditors(ctx, subject.ID, ref)
+	}
+
 	h.record(ctx, refWorkspace(ctx, h, ref), "drive.unshared", ref.Type, ref.ID,
 		map[string]interface{}{"subject": subjectID})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// revokeLiveEditors drops the editor sessions a withdrawn grant covered.
+//
+// Best effort by design: the grant is already gone, every subsequent HTTP
+// request re-authorizes, and failing a completed revocation because the hub was
+// unreachable would leave the panel showing a share that no longer exists. What
+// it costs when it fails is latency — the membership recheck still closes the
+// session — so a warning is the right severity and a 500 is not.
+func (h *Handler) revokeLiveEditors(ctx context.Context, userID string, ref authz.ObjectRef) {
+	if h.revoker == nil {
+		return
+	}
+	// The PATH, not the id: revoking a share on a folder must cut every editor
+	// session beneath it, and inheritance is a materialized path.
+	var path string
+	if err := h.repo.pool.QueryRow(ctx,
+		`SELECT path FROM acl_object WHERE object_type = $1 AND object_id = $2`,
+		ref.Type, ref.ID).Scan(&path); err != nil || path == "" {
+		h.logger().Warn("could not resolve the ACL path to revoke live editor sessions",
+			"object", ref.String(), "error", err)
+		return
+	}
+	n, truncated := h.revoker.RevokeFileAccess(ctx, userID, path)
+	if truncated {
+		// Loud, because the remainder falls back to the five-minute recheck and
+		// nothing else will ever say so.
+		h.logger().Warn("live editor revocation truncated; the remainder falls back to the "+
+			"periodic membership recheck", "object", ref.String(), "revoked", n)
+	}
 }
 
 // refWorkspace resolves an object's workspace for the audit entry. Best effort:

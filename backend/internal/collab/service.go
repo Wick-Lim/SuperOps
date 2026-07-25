@@ -278,3 +278,46 @@ func (s *Service) RevokeAccess(userID, documentID string) {
 func (s *Service) RevokeDocument(documentID string) {
 	s.hub.RevokeRoomForAll(documentID)
 }
+
+// maxRevokedRooms bounds one fan-out. Revoking a share on a workspace's Drive
+// root would otherwise enumerate every editor object in the tenant inside a
+// request. Truncation is LOGGED by the caller and the five-minute membership
+// recheck (ws.membershipRecheckPeriod) remains the backstop for whatever was
+// past the limit — which is exactly the position every file was in before this
+// existed.
+const maxRevokedRooms = 512
+
+// RevokeFileAccess cuts one user out of the rooms of every editor object at or
+// beneath an ACL path, immediately and across replicas.
+//
+// It exists because authz's live-revocation fan-out deliberately does NOT cover
+// files. `liveTypes` is {channel, doc} and the comment there is honest about
+// why: "there is no such thing as an open file session; the next download
+// re-authorizes". That was true until a file could be an open editor. Widening
+// liveTypes is the wrong fix — liveDescendants filters on it, so a folder Move
+// would enumerate every file beneath it against the same 512 cap and truncate
+// on any real folder, taking the channel revocations down with it.
+//
+// So this is targeted: Drive calls it for the one object whose share changed,
+// post-commit and best effort, and the collab layer resolves the rooms.
+//
+// Returns how many rooms were revoked and whether the list was truncated.
+func (s *Service) RevokeFileAccess(ctx context.Context, userID, path string) (int, bool) {
+	ids, err := s.repo.DocumentIDsUnderPath(ctx, path, maxRevokedRooms+1)
+	if err != nil {
+		s.logger.Error("resolve collaboration rooms for revocation", "path", path, "error", err)
+		return 0, false
+	}
+	truncated := len(ids) > maxRevokedRooms
+	if truncated {
+		ids = ids[:maxRevokedRooms]
+	}
+	for _, id := range ids {
+		if userID == "" {
+			s.hub.RevokeRoomForAll(id)
+		} else {
+			s.hub.RevokeRoom(userID, id)
+		}
+	}
+	return len(ids), truncated
+}

@@ -356,6 +356,9 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// Closes the cycle: the checker revokes document sessions through the
 	// service, and the service authorizes through the checker.
 	revoker.collab.Store(collabSvc)
+	// Drive revokes editor sessions directly rather than through authz's
+	// liveTypes fan-out — see collab.Service.RevokeFileAccess.
+	driveHandler.SetCollabRevoker(collabSvc)
 
 	// Handlers
 	authHandler := auth.NewHandler(authService)
