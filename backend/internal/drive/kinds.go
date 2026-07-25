@@ -16,23 +16,22 @@ import (
 // adds one function below and one client component; nothing else in Drive
 // changes.
 
-// StubDocumentKind is the collab-backed type that exists BEFORE the Docs phase.
+// DocumentKind is the block editor.
 //
-// docs/plans/02-drive.md §8 asks for exactly this, and the reasoning is worth
-// keeping: everything in Drive is written against "an object in a bucket", and
-// for a CRDT-backed type that is false. Download, versioning, quota accounting,
-// search extraction, copy and purge each need a different answer, and a design
-// document cannot force them to have one.
+// It began as a stub — a collab_documents row and nothing else — so that every
+// Drive endpoint had to answer "what does this mean for a thing with no bytes?"
+// in code rather than in a design document. That worked: download, versioning,
+// quota accounting, copy and purge each got a real answer in Phase 1 instead of
+// a surprise in Phase 3.
 //
-// A stub `document` — a collab_documents row and nothing else, no editor, no
-// client component — makes every Drive endpoint answer the question in code.
-// Anything that only works because "the file has bytes" fails loudly against
-// it, in Phase 1, where fixing it costs a day. Discovered in Phase 3 it costs a
-// schema change plus three editors' worth of client code.
-//
-// The Docs phase replaces this with the real Kind: same Type, same
-// StorageMode, plus Text once there is a Go-side snapshot reader.
-func StubDocumentKind(collab CollabCreator) registry.Kind {
+// What it gains here is the projection. NOT Text, which the stub's comment
+// anticipated "once there is a Go-side snapshot reader" — there will not be
+// one. There is no io.Reader that IS a CRDT document, and reconstructing a
+// ProseMirror tree from collab_snapshots in Go is the same class of work
+// migration 015 refuses for the same reason: an implementation that disagreed
+// with the client's would be a corruption bug debuggable from neither side.
+// registry.validate now refuses the combination outright.
+func DocumentKind(collab CollabCreator) registry.Kind {
 	return registry.Kind{
 		Type:        "document",
 		DisplayName: "Document",
@@ -52,6 +51,12 @@ func StubDocumentKind(collab CollabCreator) registry.Kind {
 		// POST /content answers 409 rather than accepting bytes the next merge
 		// would discard.
 		Versioned: false,
+
+		// The body comes from the editor that has the document in memory, over
+		// POST /drive/files/{id}/projection, and is stored as derived state.
+		// This is what makes the document findable by its text; without it the
+		// index holds a title and nothing else.
+		ClientProjected: true,
 	}
 }
 

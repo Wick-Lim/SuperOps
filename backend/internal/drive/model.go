@@ -109,6 +109,15 @@ type Descriptor struct {
 
 	// ThumbnailURL is set when a preview exists, for either mode.
 	ThumbnailURL *string `json:"thumbnail_url"`
+
+	// Projection is how far the client-published body has fallen behind the
+	// CRDT log. Null for a blob kind, which has no projection at all — a zeroed
+	// one would read as "projected, and empty".
+	//
+	// Not debug output. The client compares head_seq to projection_seq to
+	// decide whether to re-project on open, and an operator reads the same gap
+	// to see the pipeline failing before a user reports unsearchable documents.
+	Projection *ProjectionStatus `json:"projection"`
 }
 
 // Entry is one row of a folder listing. Folders and files come back in one

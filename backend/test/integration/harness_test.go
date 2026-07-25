@@ -415,15 +415,32 @@ func (h *harness) invite(t *testing.T, inviterToken, workspaceID, email, role st
 	return tok
 }
 
-// newUser mints a brand-new account inside workspaceID.
+// newUser mints a brand-new account inside workspaceID, as a member.
 func (h *harness) newUser(t *testing.T, inviterToken, workspaceID, prefix string) *actor {
+	t.Helper()
+	return h.newUserWithRole(t, inviterToken, workspaceID, prefix, "member")
+}
+
+// newGuest mints an account whose workspace role caps it at read.
+//
+// The distinction matters wherever a test wants a caller who genuinely cannot
+// write: a MEMBER already holds write on Drive through the workspace grant
+// (workspaceCapability maps RoleMember to CapWrite), and a per-object share is
+// a floor, not a ceiling — so sharing "read" with a member changes nothing and
+// a test built on one would pass for the wrong reason or not at all.
+func (h *harness) newGuest(t *testing.T, inviterToken, workspaceID, prefix string) *actor {
+	t.Helper()
+	return h.newUserWithRole(t, inviterToken, workspaceID, prefix, "guest")
+}
+
+func (h *harness) newUserWithRole(t *testing.T, inviterToken, workspaceID, prefix, role string) *actor {
 	t.Helper()
 	n := time.Now().UnixNano()
 	a := &actor{
 		email: fmt.Sprintf("%s-%d@demo.local", prefix, n),
 		pass:  actorPassword,
 	}
-	tok := h.invite(t, inviterToken, workspaceID, a.email, "member")
+	tok := h.invite(t, inviterToken, workspaceID, a.email, role)
 
 	r := h.req(t, http.StatusCreated, "POST", "/api/v1/auth/accept-invite", "", map[string]string{
 		"token":     tok,
@@ -629,6 +646,20 @@ func (h *harness) searchHits(t *testing.T, token, workspaceID, query string) []s
 		ids = append(ids, hit.ID)
 	}
 	return ids
+}
+
+// whoami returns the caller's own user id, for a fixture that has to write a
+// row attributed to them.
+func (h *harness) whoami(t *testing.T, token string) string {
+	t.Helper()
+	var me struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, h.req(t, http.StatusOK, "GET", "/api/v1/users/me", token, nil).Data, &me)
+	if me.ID == "" {
+		t.Fatal("GET /users/me returned no id")
+	}
+	return me.ID
 }
 
 // searchHitsOfType is searchHits narrowed to one facet, which is how a caller

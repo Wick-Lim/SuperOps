@@ -61,15 +61,31 @@ type ACLSource interface {
 	KeysForObject(ctx context.Context, objectType, objectID string) ([]string, error)
 }
 
+// BodySource reads an object's client-published body projection.
+//
+// It exists for the same reason ACLSource does: the fact belongs to the
+// database, not to the event. A document body is up to 1 MiB and the file event
+// fires on every rename and move, so carrying it on a JetStream message would
+// put a megabyte on the wire to record that somebody renamed a file.
+//
+// nil is allowed and indexes titles only, which is the safe end. A read error
+// is RETURNED, not swallowed — same rule as the ACL read: indexing a document
+// with content that does not match it is worse than not indexing it.
+type BodySource interface {
+	BodyForFile(ctx context.Context, fileID string) (string, error)
+}
+
 type Indexer struct {
 	service *Service
 	// acl reads the materialized keys for an object. Optional; see ACLSource.
-	acl    ACLSource
+	acl ACLSource
+	// bodies reads the client-published projection. Optional; see BodySource.
+	bodies BodySource
 	logger *slog.Logger
 }
 
-func NewIndexer(service *Service, acl ACLSource, logger *slog.Logger) *Indexer {
-	return &Indexer{service: service, acl: acl, logger: logger}
+func NewIndexer(service *Service, acl ACLSource, bodies BodySource, logger *slog.Logger) *Indexer {
+	return &Indexer{service: service, acl: acl, bodies: bodies, logger: logger}
 }
 
 // HandleMessage indexes — or unindexes — the message an event describes.
@@ -199,8 +215,20 @@ func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
 		}
 	}
 
+	// The body, from the database rather than the event. Only for a type that
+	// has one: a plain upload's bytes are on disk and nothing extracts them
+	// today, so asking would be a query per file event that always answers "".
+	var body string
+	if idx.bodies != nil && typ != TypeFile {
+		body, err = idx.bodies.BodyForFile(ctx, event.ID)
+		if err != nil {
+			return fmt.Errorf("read projected body for %s %s: %w", typ, event.ID, err)
+		}
+	}
+
 	doc := FileDoc{
 		Type:        typ,
+		Body:        body,
 		ID:          event.ID,
 		WorkspaceID: workspaceID,
 		ChannelID:   event.ChannelID,

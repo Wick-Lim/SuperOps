@@ -43,7 +43,7 @@ func (h *harness) indexDriveFile(t *testing.T, workspaceID, fileID string) {
 		t.Fatalf("read file fixture: %v", err)
 	}
 
-	indexer := search.NewIndexer(h.search, h.app.Authz, slog.Default())
+	indexer := search.NewIndexer(h.search, h.app.Authz, h.app.Drive, slog.Default())
 	event := map[string]any{
 		"id": fileID, "user_id": userID, "name": name, "file_type": fileType,
 		"created_at": createdAt.UTC().Format(time.RFC3339Nano),
@@ -95,7 +95,7 @@ func (h *harness) unindexDriveFile(t *testing.T, workspaceID, fileID string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	indexer := search.NewIndexer(h.search, h.app.Authz, slog.Default())
+	indexer := search.NewIndexer(h.search, h.app.Authz, h.app.Drive, slog.Default())
 	if err := indexer.HandleFile(ctx, &nats.Msg{
 		Subject: "superops." + workspaceID + ".file.deleted",
 		Data:    data,

@@ -10,7 +10,7 @@ named, and explicit cuts.
 | [01-phase0-remainder](01-phase0-remainder.md) | Phase 0 — unified inbox + audit | **Implemented** (`020`, `021`) |
 | [02-drive](02-drive.md) | Phase 1 — Drive + editor registry | **Implemented** (`025`–`028`) |
 | [03-work-tracking](03-work-tracking.md) | Phase 2 — issues, boards, cycles | **Implemented** (`030`, `031`) |
-| [04-docs](04-docs.md) | Phase 3 — block editor | Plan |
+| [04-docs](04-docs.md) | Phase 3 — block editor | **Backend implemented** (`035`); client in flight |
 | [05-spreadsheet](05-spreadsheet.md) | Phase 4 — grid + formula engine | Plan |
 | [06-design-surface](06-design-surface.md) | Phase 5 — bounded design surface | Plan |
 | [07-huddle](07-huddle.md) | — huddles (order-independent) | Plan |
@@ -42,7 +42,7 @@ without colliding with a phase that has not started:
 | `020`–`024` | unified inbox + audit (plan 01) — `020` taken (`inbox_events`, `inbox_items`, `notification_prefs`, `inbox_digest_state`, backfill), `021` taken (`audit_logs` → TEXT `resource_id`, monthly partitions, `dedupe_key`, chain, `audit_chain_heads`); `022`–`024` free |
 | `025`–`029` | Drive + editor registry (plan 02) — `025` taken (`drive_folders`, `files` reshape, `file_versions`, `workspace_storage`, the `collab_documents` FK, the `workspace` grant subject, both expected-state views), `026` taken (quota: `collab_bytes_at`, `idx_files_workspace`, the `file_versions` backfill and the `bytes_used` re-derivation), `027` taken (trash: `purge_after` and its indexes), `028` taken (sharing: `drive_share_links`, the `link` grant subject, `acl_key_expected` arm 5); `029` free |
 | `030`–`034` | work tracking (plan 03) — `030` taken (the product-wide `comments` table, keyed to `acl_object`), `031` taken (projects, issues, states, labels, cycles, ordering); `033`–`034` free. `032` is HELD for the `p-` project container key and should not be spent on anything else — see ruling 6. |
-| `035`–`039` | docs (plan 04) |
+| `035`–`039` | docs (plan 04) — `035` taken (`file_projections`, `file_projection_refs`, `comment_anchors`, `idx_collab_documents_updated`); `036`–`039` free. **`file_projections` is product-wide**: the spreadsheet and the design surface project into the same table and add none of their own — see ruling 8. |
 | `040`–`044` | spreadsheet (plan 05) |
 | `045`–`049` | design surface (plan 06) |
 | `050`–`054` | huddle (plan 07) |
@@ -269,6 +269,46 @@ is gone or the feature is a lie the first time somebody reads the table.
 Mentions are `<@uuid>`, never `@name`: names are not unique, they change, and
 resolving one at read time makes a comment's meaning depend on who is called
 what today.
+
+---
+
+### 8. Ruling 4, settled: `ClientProjected` is the mechanism, and `Text` is dead for collab (high)
+
+Ruling 4 said one projection mechanism belongs in the registry contract, "with
+each editor supplying only the extraction". It was declared and never built:
+`registry.Kind.Text` had zero callers, and its own comment conceded why — a type
+can only implement it if it ships a Go-side snapshot reader, and there is no
+`io.Reader` that IS a CRDT document.
+
+**It cannot be built in that shape and it will not be.** Reconstructing a
+ProseMirror tree from `collab_snapshots` in Go is the same class of work
+migration `015` refuses, with the same failure mode: an implementation that
+disagreed with the client's would be a corruption bug debuggable from neither
+side.
+
+**Landed** as one registry field and one table:
+
+  * `Kind.ClientProjected bool` — the collab half of the mechanism; `Text` is
+    the blob half. `validate()` refuses `StorageCollab && Text != nil` and
+    `ClientProjected && !StorageCollab`, so an editor inventing its own
+    projection is a registration-time error rather than a review comment.
+  * `file_projections` (migration `035`) — ONE table, keyed on `files.id`, not
+    on `collab_documents.id`. The three editor plans each proposed their own
+    table in their own id space; this is the reconciliation.
+  * `POST /api/v1/drive/files/{file_id}/projection` in `internal/drive`, not in
+    a per-editor package, because docs, spreadsheets and designs need the
+    identical thing.
+
+So the spreadsheet and the design surface add **no table, no route and no
+migration**. They set one bool and ship one TypeScript extractor. If the backend
+for the second editor is not close to zero, the registry did not work.
+
+Five rules make trusting a client-supplied body safe, and each is a test in
+`test/integration/projection_test.go` rather than a paragraph here: monotonic on
+seq in one statement; never above the log head; authorized on `write` at POST
+time over HTTP so a revoked editor cannot land one last rewrite; bounded, with
+every limit a refusal rather than a truncation; and never authoritative — losing
+the whole table costs search until re-projection and costs zero writing.
 
 ---
 

@@ -244,7 +244,14 @@ func run() int {
 		l.Info("search disabled by configuration")
 	}
 	if searchSvc != nil {
-		indexer := search.NewIndexer(searchSvc, az, l)
+		// The body source is the Drive repository: a document's searchable text
+		// is the client-published projection, read from the database rather than
+		// carried on the event. A registry with no kinds is deliberate here —
+		// this repository is used for one query that touches no kind at all, and
+		// giving the worker a second registration list would make "which editors
+		// exist" a thing two processes could disagree about.
+		bodies := drive.NewRepository(pool, az, registry.New())
+		indexer := search.NewIndexer(searchSvc, az, bodies, l)
 		bind(durableSpec{durable: "indexer", filter: "superops.*.message.*", handle: indexer.HandleMessage})
 		// Files were never indexed. search.Indexer has had HandleFile since the
 		// search feature shipped and nothing ever bound it, so uploading a file

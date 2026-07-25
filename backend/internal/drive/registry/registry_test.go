@@ -217,7 +217,7 @@ func TestRegistryDescriptorsAreAStableContract(t *testing.T) {
 	}
 }
 
-// StubDocumentForTest mirrors drive.StubDocumentKind without importing it
+// StubDocumentForTest mirrors drive.DocumentKind without importing it
 // (drive imports this package, so the dependency runs one way only).
 func StubDocumentForTest() Kind {
 	return Kind{

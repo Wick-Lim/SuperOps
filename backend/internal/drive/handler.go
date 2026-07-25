@@ -79,6 +79,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("POST /api/v1/drive/files/{file_id}/move", authMw(http.HandlerFunc(h.MoveFile)))
 	mux.Handle("DELETE /api/v1/drive/files/{file_id}", authMw(http.HandlerFunc(h.TrashFile)))
 	mux.Handle("POST /api/v1/drive/files/{file_id}/content", authMw(http.HandlerFunc(h.ReplaceContent)))
+	// The projection: the client-published rendering of a document the server
+	// cannot read. In internal/drive rather than in a per-editor package,
+	// because docs, spreadsheets and designs need the identical thing and three
+	// implementations of it is the failure the registry exists to prevent.
+	mux.Handle("POST /api/v1/drive/files/{file_id}/projection", authMw(http.HandlerFunc(h.PutProjection)))
 
 	mux.Handle("GET /api/v1/drive/{object_type}/{object_id}/shares", authMw(http.HandlerFunc(h.ListShares)))
 	mux.Handle("PUT /api/v1/drive/{object_type}/{object_id}/shares", authMw(http.HandlerFunc(h.PutShare)))
@@ -521,6 +526,16 @@ func (h *Handler) describe(ctx context.Context, file *File, capability authz.Cap
 
 	switch kind.Storage {
 	case registry.StorageCollab:
+		// How far the searchable body has fallen behind the log. The client
+		// re-projects on open when the gap is non-zero, which is the only
+		// backstop that exists for a document edited and closed before its
+		// debounce fired — the server cannot produce content and pretending
+		// otherwise needs the Node sidecar this design rejects.
+		status, err := h.repo.ProjectionStatusFor(ctx, file.ID)
+		if err != nil {
+			return nil, err
+		}
+		desc.Projection = status
 		if h.collab != nil {
 			docID, err := h.collab.DocumentIDForResource(ctx, file.FileType, file.ID)
 			if err != nil {

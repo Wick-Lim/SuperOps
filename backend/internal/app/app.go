@@ -70,6 +70,12 @@ type App struct {
 	// to be able to look at the bucket, and handlers are given it directly.
 	Storage storage.Backend
 
+	// Drive is exported so a test can drive the same search.BodySource the
+	// worker uses. Without it a test would have to restate what the worker
+	// reads, which is how an indexer and its test agree with each other and
+	// with nothing else.
+	Drive *drive.Repository
+
 	// audit is closed on shutdown so the Tier 2 buffer drains instead of
 	// discarding the records for the last requests this replica served.
 	audit *audit.Service
@@ -318,16 +324,17 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// editor that is not configured in a deployment is not discoverable in it —
 	// see internal/drive/registry.
 	//
-	// The stub `document` kind is the one plan 02 §8 asks for: a
-	// collab_documents row and nothing else, no editor, no client component. It
-	// exists so every Drive endpoint answers the collab question in code rather
-	// than in a design doc, in Phase 1 where fixing it costs a day.
+	// `document` is the block editor. Adding the next one — a spreadsheet, a
+	// design surface — is one more Register line here and one client component;
+	// no table, no route, no migration. That is what the registry is for, and
+	// the projection field is what makes it true for the searchable body too.
 	driveKinds := registry.New()
-	if err := driveKinds.Register(drive.StubDocumentKind(collabRepo)); err != nil {
+	if err := driveKinds.Register(drive.DocumentKind(collabRepo)); err != nil {
 		natsClient.Close()
 		pool.Close()
 		return nil, fmt.Errorf("register drive kinds: %w", err)
 	}
+	driveRepo := drive.NewRepository(pool, az, driveKinds)
 	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService,
 		drive.NewPublisher(natsClient, logger))
 
@@ -462,6 +469,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		Config:  cfg,
 		Logger:  logger,
 		Storage: fileStorage,
+		Drive:   driveRepo,
 		DB:      pool,
 		Redis:   redisClient,
 		NATS:    natsClient,

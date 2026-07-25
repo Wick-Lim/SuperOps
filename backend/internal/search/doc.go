@@ -364,8 +364,15 @@ type FileDoc struct {
 	WorkspaceID string `json:"workspace_id"`
 	// Type is what this file is indexed as, from FileObjectType. Empty means
 	// TypeFile, so a caller that predates the editors keeps working.
-	Type      ObjectType `json:"-"`
-	ChannelID string     `json:"channel_id"`
+	Type ObjectType `json:"-"`
+	// Body is the client-published projection of a collab object, or empty for
+	// a blob whose bytes nothing extracts.
+	//
+	// DERIVED state, never content: it is what makes a document findable by its
+	// text, and corrupting it costs search until the next projection and costs
+	// zero writing. See search.BodySource.
+	Body      string `json:"body"`
+	ChannelID string `json:"channel_id"`
 	// FolderID is set for a Drive file. It backs the "search inside this folder"
 	// narrowing and is not an access decision.
 	FolderID string `json:"folder_id"`
@@ -415,6 +422,7 @@ func (f FileDoc) Doc() Doc {
 		FolderID:    f.FolderID,
 		UserID:      f.UserID,
 		Title:       f.Name,
+		Content:     f.Body,
 		ACL:         acl,
 		CreatedAt:   f.CreatedAt,
 		IsDeleted:   f.IsDeleted,
