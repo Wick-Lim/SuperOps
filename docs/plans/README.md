@@ -41,7 +41,7 @@ without colliding with a phase that has not started:
 | `016`–`019` | object permissions (plan 00) — `016` taken (`acl_object`, `acl_grant`, `acl_key`, the two expected-state views and the backfill); `017`–`019` free |
 | `020`–`024` | unified inbox + audit (plan 01) — `020` taken (`inbox_events`, `inbox_items`, `notification_prefs`, `inbox_digest_state`, backfill), `021` taken (`audit_logs` → TEXT `resource_id`, monthly partitions, `dedupe_key`, chain, `audit_chain_heads`); `022`–`024` free |
 | `025`–`029` | Drive + editor registry (plan 02) — `025` taken (`drive_folders`, `files` reshape, `file_versions`, `workspace_storage`, the `collab_documents` FK, the `workspace` grant subject, both expected-state views), `026` taken (quota: `collab_bytes_at`, `idx_files_workspace`, the `file_versions` backfill and the `bytes_used` re-derivation), `027` taken (trash: `purge_after` and its indexes), `028` taken (sharing: `drive_share_links`, the `link` grant subject, `acl_key_expected` arm 5); `029` free |
-| `030`–`034` | work tracking (plan 03) — `030` taken (the product-wide `comments` table, keyed to `acl_object`); `031`–`034` free. `032` is HELD for the `p-` project container key and should not be spent on anything else — see ruling 6. |
+| `030`–`034` | work tracking (plan 03) — `030` taken (the product-wide `comments` table, keyed to `acl_object`), `031` taken (projects, issues, states, labels, cycles, ordering); `033`–`034` free. `032` is HELD for the `p-` project container key and should not be spent on anything else — see ruling 6. |
 | `035`–`039` | docs (plan 04) |
 | `040`–`044` | spreadsheet (plan 05) |
 | `045`–`049` | design surface (plan 06) |

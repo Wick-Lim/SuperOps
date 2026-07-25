@@ -31,6 +31,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/emoji"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
+	"github.com/Wick-Lim/SuperOps/backend/internal/issue"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
@@ -339,6 +340,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// alternative is this package importing every pillar.
 	commentHandler := comment.NewHandler(pool, az,
 		comment.NewNATSNotifier(natsClient), comment.NewTitler(pool), auditService)
+
+	// Work tracking. `project` and `issue` are ACL-NATIVE, so their acl_object
+	// rows are written by RegisterTx in the same transaction as the row they
+	// describe — internal/authz's derivedTypes is unchanged and migration 031
+	// adds no arm to either expected-state view.
+	issueHandler := issue.NewHandler(pool, az, comment.NewNATSNotifier(natsClient), auditService)
 	// Closes the cycle: the checker revokes document sessions through the
 	// service, and the service authorizes through the checker.
 	revoker.collab.Store(collabSvc)
@@ -547,6 +554,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	collabHandler.RegisterRoutes(mux, authMw)
 	driveHandler.RegisterRoutes(mux, authMw)
 	commentHandler.RegisterRoutes(mux, authMw)
+	issueHandler.RegisterRoutes(mux, authMw)
 	// Resolving a share link is unauthenticated and its path CONTAINS the
 	// secret being guessed, so it gets a FIXED rate-limit bucket rather than
 	// the default per-path one — which would give every guess its own budget

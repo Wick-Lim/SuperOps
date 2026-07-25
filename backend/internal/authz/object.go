@@ -111,6 +111,19 @@ const (
 	// the second object type with a LIVE surface, and liveTypes below has to
 	// enumerate those.
 	TypeDoc = "doc"
+
+	// TypeProject and TypeIssue are work tracking (migration 031). Both are
+	// ACL-NATIVE: Register writes their rows and derivedTypes below is
+	// unchanged.
+	//
+	// A project is deliberately NOT in containerKeyPrefix. Giving it a key
+	// prefix would mean widening acl_key's closed character class AND
+	// internal/search's validator — and a key that fails that validator is
+	// DROPPED, which widens the filter it was meant to narrow. An issue instead
+	// inherits its project's grants through the ordinary subtree join, which
+	// costs one acl_key row per (issue, grant) and needs no new vocabulary.
+	TypeProject = "project"
+	TypeIssue   = "issue"
 )
 
 // liveTypes are the object types a subject can hold an open, already-authorized
@@ -227,6 +240,8 @@ func WorkspaceObject(id string) ObjectRef { return ObjectRef{Type: TypeWorkspace
 func ChannelObject(id string) ObjectRef   { return ObjectRef{Type: TypeChannel, ID: id} }
 func FileObject(id string) ObjectRef      { return ObjectRef{Type: TypeFile, ID: id} }
 func FolderObject(id string) ObjectRef    { return ObjectRef{Type: TypeFolder, ID: id} }
+func ProjectObject(id string) ObjectRef   { return ObjectRef{Type: TypeProject, ID: id} }
+func IssueObject(id string) ObjectRef     { return ObjectRef{Type: TypeIssue, ID: id} }
 
 func (o ObjectRef) String() string  { return o.Type + ":" + o.ID }
 func (s SubjectRef) String() string { return s.Type + ":" + s.ID }
