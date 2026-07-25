@@ -153,7 +153,11 @@ func (s *Service) GetBulkStatus(ctx context.Context, userIDs []string) map[strin
 	for _, uid := range userIDs {
 		cmds[uid] = pipe.Get(ctx, statusKey(uid))
 	}
-	pipe.Exec(ctx)
+	// Exec's error is intentionally discarded: it reports only the first
+	// failure, and a GET on a key that does not exist — the normal "user is
+	// offline" case — surfaces as redis.Nil. Every command's own result is
+	// inspected below, where an error correctly maps to StatusOffline.
+	_, _ = pipe.Exec(ctx)
 
 	for uid, cmd := range cmds {
 		val, err := cmd.Result()

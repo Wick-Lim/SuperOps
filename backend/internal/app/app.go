@@ -310,7 +310,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// Middleware chain, written outside-in from the bottom up. RequestID is
 	// outermost (after CORS) so the correlation id exists for RecoveryMiddleware
 	// and LoggingMiddleware, and for logger.FromContext inside handlers.
-	var handler http.Handler = httputil.EnvelopeMuxErrors(mux)
+	handler := httputil.EnvelopeMuxErrors(mux)
 	if cfg.RateLimit.Enabled {
 		handler = ratelimit.APIMiddleware(redisClient, ratelimit.Config{
 			RequestsPerMinute: cfg.RateLimit.APIPerMinute,

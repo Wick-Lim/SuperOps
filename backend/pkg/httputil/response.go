@@ -33,16 +33,22 @@ type ErrorBody struct {
 	Details interface{} `json:"details,omitempty"`
 }
 
+// The Encode errors below are deliberately discarded. WriteHeader has already
+// been called, so the status line and headers are on the wire and there is no
+// way to signal a failure to the client; the only realistic cause is the peer
+// having gone away, which the server learns about anyway. Logging here would
+// need a logger in every response helper for no actionable signal.
+
 func JSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(Response{Data: data})
+	_ = json.NewEncoder(w).Encode(Response{Data: data})
 }
 
 func JSONList(w http.ResponseWriter, status int, data interface{}, cursor string, hasMore bool) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(Response{
+	_ = json.NewEncoder(w).Encode(Response{
 		Data: data,
 		Meta: &Meta{Cursor: cursor, HasMore: hasMore},
 	})
@@ -51,7 +57,7 @@ func JSONList(w http.ResponseWriter, status int, data interface{}, cursor string
 func JSONError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(Response{
+	_ = json.NewEncoder(w).Encode(Response{
 		Error: &ErrorBody{Code: code, Message: message},
 	})
 }
@@ -152,7 +158,7 @@ func (w *envelopeWriter) WriteHeader(status int) {
 	// Keep any Allow header the mux set; replace only the body contract.
 	w.Header().Set("Content-Type", "application/json")
 	w.ResponseWriter.WriteHeader(status)
-	json.NewEncoder(w.ResponseWriter).Encode(Response{
+	_ = json.NewEncoder(w.ResponseWriter).Encode(Response{
 		Error: &ErrorBody{Code: code, Message: message},
 	})
 }
