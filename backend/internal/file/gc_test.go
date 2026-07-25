@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -478,5 +480,79 @@ func TestGCPredicatesFailIfReverted(t *testing.T) {
 	if referenced {
 		t.Error("the old StorageKeysPresent predicate DID find the version object, so " +
 			"TestStorageKeysPresentCoversEveryReference would pass against a revert and proves nothing")
+	}
+}
+
+// EVERY COLUMN THAT HOLDS AN OBJECT KEY MUST BE NAMED IN StorageKeysPresent.
+//
+// This is the structural version of docs/plans/README.md ruling 2, and it exists
+// because the human version has already failed twice: four separate plans each
+// proposed rewriting one clause of that query, none aware of the others, and
+// plan 08 stores raw RFC822 originals under a `raw_key` with no files row at all
+// — which as things stand means the bucket sweep deletes every archived email.
+//
+// The sweep works from the bucket INWARDS: a reference this query does not know
+// about is not merely missed, it is proof to the sweeper that the object is
+// garbage. So "somebody remembers to add an arm" is not a control. This test is.
+//
+// It reads the live schema, finds every column whose name says it holds a key,
+// and fails if the query does not mention its table. A pillar that adds one gets
+// a red test naming the table rather than a support ticket about missing files.
+func TestEveryStorageKeyColumnIsNamedInThePredicate(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+
+	rows, err := pool.Query(ctx, `
+		SELECT c.table_name, c.column_name
+		  FROM information_schema.columns c
+		  JOIN information_schema.tables t
+		    ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+		 WHERE c.table_schema = 'public'
+		   AND t.table_type = 'BASE TABLE'
+		   AND c.data_type = 'text'
+		   AND (c.column_name LIKE '%storage_key%'
+		     OR c.column_name LIKE '%thumbnail_key%'
+		     OR c.column_name LIKE 'raw_key'
+		     OR c.column_name LIKE '%object_key%')
+		 ORDER BY c.table_name, c.column_name`)
+	must(t, err)
+	defer rows.Close()
+
+	type column struct{ table, name string }
+	var found []column
+	for rows.Next() {
+		var c column
+		must(t, rows.Scan(&c.table, &c.name))
+		found = append(found, c)
+	}
+	must(t, rows.Err())
+
+	if len(found) == 0 {
+		t.Fatal("no storage-key columns found at all; this test is not testing anything")
+	}
+
+	// The predicate's own text, so the check tracks the query rather than a copy
+	// of it. Reading the source is deliberate: asserting against a hand-written
+	// list here would be the same second-opinion problem one level up.
+	source, err := os.ReadFile("repository.go")
+	must(t, err)
+	predicate := string(source)
+	start := strings.Index(predicate, "func (r *Repository) StorageKeysPresent")
+	if start < 0 {
+		t.Fatal("StorageKeysPresent not found in repository.go")
+	}
+	predicate = predicate[start:]
+
+	for _, c := range found {
+		if !strings.Contains(predicate, "FROM "+c.table) &&
+			!strings.Contains(predicate, "FROM  "+c.table) {
+			t.Errorf("%s.%s holds an object key and StorageKeysPresent never reads %s.\n\n"+
+				"The bucket sweep deletes any object no row in that query names, so every "+
+				"object this column points at would be deleted on the next run — silently, "+
+				"by a job that logs success.\n\n"+
+				"Add an arm to StorageKeysPresent and a case to "+
+				"TestStorageKeysPresentCoversEveryReference in the same change.",
+				c.table, c.name, c.table)
+		}
 	}
 }
