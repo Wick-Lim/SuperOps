@@ -78,7 +78,7 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 	wsID := r.PathValue("workspace_id")
 
-	member, err := h.authz.IsWorkspaceMember(r.Context(), wsID, userID)
+	member, err := h.authz.Can(r.Context(), authz.UserSubject(userID), authz.WorkspaceObject(wsID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -103,7 +103,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 	wsID := r.PathValue("workspace_id")
 
-	member, err := h.authz.IsWorkspaceMember(r.Context(), wsID, userID)
+	member, err := h.authz.Can(r.Context(), authz.UserSubject(userID), authz.WorkspaceObject(wsID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -185,7 +185,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if e.CreatedBy != userID {
-		admin, err := h.authz.IsWorkspaceAdmin(r.Context(), wsID, userID)
+		admin, err := h.authz.Can(r.Context(), authz.UserSubject(userID), authz.WorkspaceObject(wsID), authz.CapAdmin)
 		if err != nil {
 			httputil.HandleError(w, httputil.NewInternal(err))
 			return

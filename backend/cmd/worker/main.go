@@ -1099,32 +1099,47 @@ func union(a, b []string) []string {
 
 // --- acl drift ------------------------------------------------------------------
 
-// runACLDrift recomputes the object-permission materialization and reports
-// where it disagrees with its definition. See docs/plans/00-permissions.md and
+// runACLDrift reconciles the derived half of the object-permission
+// materialization, then recomputes the whole of it and reports where it still
+// disagrees with its definition. See docs/plans/00-permissions.md and
 // internal/authz/rebuild.go.
 //
-// It REPORTS and never repairs, and that is the whole design of the job. A
-// repair would make the symptom go away on the next tick and take the evidence
-// with it — and the evidence is the point, because acl_key is denormalized
-// AUTHORIZATION state. A missing key is somebody unable to see something they
-// should; an extra key is somebody seeing something they should not. Neither is
-// a stale cache, and neither should be silently fixed by a background job that
-// nobody is watching.
+// It used to verify only, on the principle that a job which silently repaired
+// would take the evidence away with the symptom. That principle is right and is
+// still enforced below — but it assumed something was MAINTAINING the derived
+// rows, and nothing is. workspaces, channels and files get their acl_object
+// rows from acl_object_expected, and no handler writes one at creation time, so
+// verify-only reported every object created since the backfill as
+// missing_object, for ever, growing. A watchdog that is permanently red is a
+// watchdog nobody reads, and it is the only watchdog on denormalized
+// authorization state.
 //
-// The drift is surfaced twice: as an ERROR log with named examples, and as this
-// function's return value, which runLoop records in /health's last_error for
-// the job. It does not fail the readiness probe — restarting the worker repairs
-// nothing here — but it is impossible to miss in either place.
+// So the job reconciles first and says exactly what it changed. That is not a
+// silent repair: RebuildStats is logged whenever it is non-zero, so "how much
+// was unmaintained" is a number somebody can watch and alert on, and Verify
+// still runs afterwards over BOTH halves. Anything it reports now is drift the
+// reconcile could not explain — an ACL-native object with the wrong keys, a row
+// whose source is gone — which is the class that was always worth finding.
 //
-// Expect it to be noisy until the cutover: nothing registers an object at
-// creation time yet, so every workspace, channel and file created since the
-// last Rebuild is reported as missing_object. That is the verifier working, not
-// the verifier failing.
+// Reconciling here does NOT make acl_key fresh enough to authorize from for the
+// derived types: this runs hourly, and a key set that is an hour stale would
+// WIDEN a caller's key set, which for a tenancy filter is a leak. That is why
+// authz.KeysFor still answers its channel arm from channel_members rather than
+// from acl_key — see the comment on KeysFor.
+//
+// The remaining drift is surfaced twice: as an ERROR log with named examples,
+// and as this function's return value, which runLoop records in /health's
+// last_error for the job. It does not fail the readiness probe — restarting the
+// worker repairs nothing here — but it is impossible to miss in either place.
 func runACLDrift(ctx context.Context, pool *pgxpool.Pool, az *authz.Checker, l *slog.Logger) error {
+	var stats authz.RebuildStats
 	var report authz.DriftReport
 
 	ran, err := withSingletonLock(ctx, pool, lockACLDrift, func(ctx context.Context) error {
 		var err error
+		if stats, err = az.Rebuild(ctx); err != nil {
+			return err
+		}
 		report, err = az.Verify(ctx, aclDriftSamples)
 		return err
 	})
@@ -1135,12 +1150,23 @@ func runACLDrift(ctx context.Context, pool *pgxpool.Pool, az *authz.Checker, l *
 		l.Debug("acl drift check skipped: another replica holds the lock")
 		return nil
 	}
+	if !stats.Clean() {
+		// Expected and non-zero on every tick that saw a workspace, channel or
+		// file created: those rows are derived and nothing writes them at
+		// creation time. Worth logging at Info rather than swallowing, because a
+		// sudden jump is how a broken write path shows up here.
+		l.Info("acl materialization reconciled",
+			"objects_upserted", stats.ObjectsUpserted,
+			"objects_deleted", stats.ObjectsDeleted,
+			"keys_inserted", stats.KeysInserted,
+			"keys_deleted", stats.KeysDeleted)
+	}
 	if report.Clean() {
 		l.Debug("acl drift check clean")
 		return nil
 	}
 
-	l.Error("acl materialization has drifted",
+	l.Error("acl materialization has drifted and the reconcile did not explain it",
 		"missing_keys", report.MissingKeys,
 		"extra_keys", report.ExtraKeys,
 		"missing_objects", report.MissingObjects,

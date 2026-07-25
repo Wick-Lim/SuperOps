@@ -109,24 +109,15 @@ func requireInfra() bool {
 // TestMain tears the shared app down after the package finishes. Without it the
 // pgx pool, the Redis client, the NATS connection and the hub goroutine outlive
 // the suite, which -race and leak-sensitive tooling both notice.
+//
+// It used to also read the authz dual-run comparison counter here — the only
+// place it could be read after EVERY test, including the tenancy regressions.
+// That counter is gone with the legacy checker it compared against
+// (docs/plans/00-permissions.md step 5); see authz_test.go for what replaced it
+// and why a zero from an emptied comparison is worse than no number at all.
 func TestMain(m *testing.M) {
 	code := m.Run()
 	if shared != nil {
-		// The dual-run comparison counter is process-wide, so the only place it
-		// can be read after EVERY test — including the tenancy regressions,
-		// which are the requests where a disagreement would matter most — is
-		// here. A test function could only ever assert on the mismatches that
-		// happened to accrue before Go scheduled it.
-		if checks, mismatches, evalErrors := shared.app.Authz.ComparisonStats(); checks > 0 {
-			fmt.Fprintf(os.Stderr, "authz dual-run: %d comparisons, %d mismatches, %d evaluation errors\n",
-				checks, mismatches, evalErrors)
-			if mismatches > 0 && code == 0 {
-				fmt.Fprintln(os.Stderr,
-					"FAIL: the object-level checker disagreed with the legacy checker; "+
-						"grep the log above for \"authz dual-run mismatch\"")
-				code = 1
-			}
-		}
 		shared.srv.Close()
 		shared.app.Close()
 	}
@@ -189,13 +180,6 @@ func buildConfig() *app.Config {
 	cfg.Admin.Email = adminEmail
 	cfg.Admin.Password = adminPass
 	cfg.Admin.Username = "admin"
-	// Dual-run the object-level permission checker against every membership
-	// decision this suite makes (docs/plans/00-permissions.md, step 3). It
-	// changes no answer and can fail no request — it evaluates the new checker
-	// alongside the old method and logs any disagreement. This is the suite that
-	// contains the tenancy regression tests, so it is the one place where paying
-	// two extra queries per authorization check buys the most.
-	cfg.Authz.DualRun = true
 	cfg.RateLimit.Enabled = false // don't throttle the rapid test traffic
 	cfg.CORS.AllowedOrigins = []string{"*"}
 	return cfg

@@ -22,7 +22,7 @@ import (
 // Meilisearch, on purpose.
 //
 // What is being tested is an authorization boundary that is enforced in two
-// places at once: a SQL predicate (authz.ReadableChannelIDs, via AccessKeys)
+// places at once: a SQL predicate (authz.Checker.KeysFor, via AccessKeys)
 // and a Meilisearch filter expression. A mock of either one would assert that
 // this package's Go is unchanged while leaving the part that actually decides
 // whether one tenant can read another's private channels completely unchecked —

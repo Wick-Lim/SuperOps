@@ -49,7 +49,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 // than 403 so workspace ids remain unprobeable.
 func (h *Handler) requireMember(w http.ResponseWriter, r *http.Request) (string, bool) {
 	wsID := r.PathValue("workspace_id")
-	ok, err := h.az.IsWorkspaceMember(r.Context(), wsID, authctx.UserID(r.Context()))
+	ok, err := h.az.Can(r.Context(), authz.UserSubject(authctx.UserID(r.Context())),
+		authz.WorkspaceObject(wsID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return "", false
@@ -134,7 +135,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	wsID := r.PathValue("workspace_id")
 	userID := authctx.UserID(r.Context())
 
-	admin, err := h.az.IsWorkspaceAdmin(r.Context(), wsID, userID)
+	admin, err := h.az.Can(r.Context(), authz.UserSubject(userID), authz.WorkspaceObject(wsID), authz.CapAdmin)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

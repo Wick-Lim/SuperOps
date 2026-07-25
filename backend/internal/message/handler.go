@@ -172,8 +172,13 @@ func (h *Handler) requireMessageChannel(w http.ResponseWriter, r *http.Request, 
 	return ch, h.requireMembership(w, r, ch)
 }
 
+// requireMembership gates on CapWrite, not CapRead. Membership of a channel is
+// permission to POST in it, and a non-member of a PUBLIC channel may read it
+// without being able to write — asking for CapRead here would let any workspace
+// member post in every public channel they have not joined.
 func (h *Handler) requireMembership(w http.ResponseWriter, r *http.Request, ch *authz.ChannelInfo) bool {
-	member, err := h.az.IsChannelMember(r.Context(), ch.ID, authctx.UserID(r.Context()))
+	member, err := h.az.Can(r.Context(), authz.UserSubject(authctx.UserID(r.Context())),
+		authz.ChannelObject(ch.ID), authz.CapWrite)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return false
@@ -189,12 +194,12 @@ func (h *Handler) requireMembership(w http.ResponseWriter, r *http.Request, ch *
 // this channel: channel admins and workspace admins/owners may delete, nobody
 // but the author may edit.
 func (h *Handler) canModerate(r *http.Request, ch *authz.ChannelInfo) (bool, error) {
-	userID := authctx.UserID(r.Context())
-	chanAdmin, err := h.az.IsChannelAdmin(r.Context(), ch.ID, userID)
+	subject := authz.UserSubject(authctx.UserID(r.Context()))
+	chanAdmin, err := h.az.Can(r.Context(), subject, authz.ChannelObject(ch.ID), authz.CapAdmin)
 	if err != nil || chanAdmin {
 		return chanAdmin, err
 	}
-	return h.az.IsWorkspaceAdmin(r.Context(), ch.WorkspaceID, userID)
+	return h.az.Can(r.Context(), subject, authz.WorkspaceObject(ch.WorkspaceID), authz.CapAdmin)
 }
 
 // --- input validation ---

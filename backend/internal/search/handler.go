@@ -29,40 +29,38 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 // AccessKeys resolves the set of access keys a caller holds in a workspace.
 //
 // This is the query side of the model described in doc.go, and it is the only
-// place the caller's key set is built. It answers exclusively from
-// internal/authz — no membership SQL of its own — and it is bounded by the
-// caller's memberships, not by the number of objects in the workspace:
+// place the caller's key set is built. It is bounded by the caller's
+// memberships, not by the number of objects in the workspace:
 //
 //	w-<workspace>  the caller is a member of the workspace
 //	u-<caller>     objects shared with, or owned by, this user
 //	c-<channel>    one per channel the caller may read
+//	f-<folder>     one per folder the caller may read (nothing emits these yet)
 //
 // A non-member gets an empty slice, which buildFilter renders as "no results"
 // rather than "no filter".
+//
+// It is one call into internal/authz — authz.Checker.KeysFor — and that is the
+// whole of the search half of docs/plans/00-permissions.md step 4. The two
+// implementations produce byte-identical strings by construction: this package
+// and internal/authz build a key the same way from the same closed prefix set
+// (`<prefix>-<canonical uuid>`, doc.go's validKey and acl_key's CHECK are the
+// two ends of that one contract), and KeysFor's channel arm resolves the same
+// readable-channel predicate this function used to call directly. The swap
+// therefore cannot change a filter expression — which matters more here than
+// anywhere else in the cutover, because a key that fails validation is dropped,
+// and a dropped narrowing term widens the query. Widening a tenancy filter is a
+// cross-tenant leak, and this is the function TestCrossTenantSearch rests on.
+//
+// The thin wrapper stays rather than the handler calling KeysFor directly: it
+// is what keeps every future search caller — Drive, the editors — from
+// re-deriving a key set of their own, and it is where a search-specific key
+// would be added if one ever existed.
 func AccessKeys(ctx context.Context, az *authz.Checker, workspaceID, userID string) ([]string, error) {
-	// Deliberately re-checked here even though the handler has already refused
-	// non-members: this function is the one thing every future search caller
-	// will reuse, and it must be safe on its own.
-	member, err := az.IsWorkspaceMember(ctx, workspaceID, userID)
-	if err != nil {
-		return nil, err
-	}
-	if !member {
-		return []string{}, nil
-	}
-
-	readable, err := az.ReadableChannelIDs(ctx, workspaceID, userID)
-	if err != nil {
-		return nil, err
-	}
-
-	keys := keySet(WorkspaceKey(workspaceID), UserKey(userID))
-	for _, id := range readable {
-		if k := ChannelKey(id); k != "" {
-			keys = append(keys, k)
-		}
-	}
-	return keys, nil
+	// KeysFor re-checks membership itself and answers with an empty slice for a
+	// non-member, an unknown workspace and an unparseable id alike, so this stays
+	// safe on its own even though every handler has already refused non-members.
+	return az.KeysFor(ctx, authz.UserSubject(userID), workspaceID)
 }
 
 // Search full-text searches every object type in a workspace.
@@ -91,7 +89,7 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	member, err := h.authz.IsWorkspaceMember(ctx, wsID, userID)
+	member, err := h.authz.Can(ctx, authz.UserSubject(userID), authz.WorkspaceObject(wsID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

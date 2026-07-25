@@ -109,7 +109,7 @@ const (
 	keyWorkspace = "w-"
 	// keyChannel grants to everyone who may read a channel. Membership of a
 	// private channel and workspace membership of a public one both resolve to
-	// this key via authz.ReadableChannelIDs, so a message's ACL does not have to
+	// this key via authz.Checker.KeysFor, so a message's ACL does not have to
 	// know whether its channel is public.
 	keyChannel = "c-"
 	// keyUser grants to exactly one user: an explicit share, or an object that
@@ -298,7 +298,7 @@ type MessageDoc struct {
 
 // Doc renders a message as an indexable object.
 //
-// The ACL is exactly the channel key: authz.ReadableChannelIDs already answers
+// The ACL is exactly the channel key: authz.Checker.KeysFor already answers
 // "public channel in a workspace I belong to, or a channel I am a member of"
 // with a channel id list, so one key per message reproduces today's
 // `channel_id IN [...]` filter exactly — including for DMs, which are channels.

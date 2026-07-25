@@ -152,7 +152,7 @@ func TestMessageDocIsChannelScoped(t *testing.T) {
 	if doc.Type != TypeMessage || doc.DocID != "message_"+chB || doc.ID != chB {
 		t.Fatalf("doc identity = %+v", doc)
 	}
-	// One key, and it is the channel: authz.ReadableChannelIDs answers "public
+	// One key, and it is the channel: authz.Checker.KeysFor answers "public
 	// channel in my workspace, or a channel I am in" with channel ids, so this
 	// reproduces the old channel_id allowlist exactly. A workspace key here
 	// would publish every private channel and DM to the whole workspace.

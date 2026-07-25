@@ -27,9 +27,19 @@ type Authorizer interface {
 // WorkspaceAuthorizer is the Phase-0 implementation: a document is readable by
 // any member of its workspace and writable by anyone above guest.
 //
-// Guests are read-only because that is what the role means everywhere else in
-// the product, and because a guest who can write is a guest who can rewrite a
-// document wholesale via a snapshot.
+// It now asks the object-level checker for a capability on the workspace rather
+// than for a role, which is why the ladder is ordered: guest maps to CapRead and
+// member to CapWrite, so "readable by members, writable by anyone above guest"
+// is two capability comparisons instead of a role switch. Guests stay read-only
+// because that is what the role means everywhere else in the product, and
+// because a guest who can write is a guest who can rewrite a document wholesale
+// via a snapshot.
+//
+// The workspace is still the object being authorized. Documents get acl_object
+// rows of their own — and CanRead becomes a Can against the DOCUMENT, sharing
+// and all — when Drive lands the folder hierarchy they hang off; until then a
+// document has no place in the tree to inherit from, and inventing one here
+// would be an ACL the drift verifier could not reconcile.
 type WorkspaceAuthorizer struct {
 	checker *authz.Checker
 }
@@ -42,7 +52,7 @@ func (a *WorkspaceAuthorizer) CanRead(ctx context.Context, doc *Document, userID
 	if doc == nil {
 		return false, nil
 	}
-	return a.checker.IsWorkspaceMember(ctx, doc.WorkspaceID, userID)
+	return a.checker.Can(ctx, authz.UserSubject(userID), authz.WorkspaceObject(doc.WorkspaceID), authz.CapRead)
 }
 
 func (a *WorkspaceAuthorizer) CanWrite(ctx context.Context, doc *Document, userID string) (bool, error) {
@@ -57,14 +67,5 @@ func (a *WorkspaceAuthorizer) CanCreate(ctx context.Context, workspaceID, userID
 }
 
 func (a *WorkspaceAuthorizer) canEdit(ctx context.Context, workspaceID, userID string) (bool, error) {
-	role, err := a.checker.WorkspaceRole(ctx, workspaceID, userID)
-	if err != nil {
-		return false, err
-	}
-	switch role {
-	case authz.RoleOwner, authz.RoleAdmin, authz.RoleMember:
-		return true, nil
-	default:
-		return false, nil
-	}
+	return a.checker.Can(ctx, authz.UserSubject(userID), authz.WorkspaceObject(workspaceID), authz.CapWrite)
 }

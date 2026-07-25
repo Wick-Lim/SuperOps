@@ -45,6 +45,14 @@ func TestWorkspaceRole(t *testing.T) {
 	}
 }
 
+// TestWorkspacePredicates is the workspace half of the tenancy matrix, asserted
+// through the API the product actually enforces — Can, with a capability — and
+// against the predicate Can is composed from, in the same table.
+//
+// Keeping both columns in one test is what replaced the dual-run comparison
+// when step 5 deleted the legacy methods. The comparison could only ever check
+// the pairs that real traffic happened to generate; this checks every pair,
+// deterministically, on every run, with no configuration flag.
 func TestWorkspacePredicates(t *testing.T) {
 	az, w := seed(t)
 
@@ -66,11 +74,18 @@ func TestWorkspacePredicates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
-			if got, err := az.IsWorkspaceMember(ctx, tt.workspaceID, tt.userID); err != nil || got != tt.isMember {
-				t.Errorf("IsWorkspaceMember = %v, %v; want %v, nil", got, err, tt.isMember)
+			subject := UserSubject(tt.userID)
+			obj := WorkspaceObject(tt.workspaceID)
+			if got, err := az.Can(ctx, subject, obj, CapRead); err != nil || got != tt.isMember {
+				t.Errorf("Can(read) = %v, %v; want %v, nil", got, err, tt.isMember)
 			}
-			if got, err := az.IsWorkspaceAdmin(ctx, tt.workspaceID, tt.userID); err != nil || got != tt.isAdmin {
-				t.Errorf("IsWorkspaceAdmin = %v, %v; want %v, nil", got, err, tt.isAdmin)
+			if got, err := az.Can(ctx, subject, obj, CapAdmin); err != nil || got != tt.isAdmin {
+				t.Errorf("Can(admin) = %v, %v; want %v, nil", got, err, tt.isAdmin)
+			}
+			// The predicate Can composes must give the same answer. This is the
+			// equivalence the dual-run comparison used to assert on live traffic.
+			if got, err := az.isWorkspaceMember(ctx, tt.workspaceID, tt.userID); err != nil || got != tt.isMember {
+				t.Errorf("isWorkspaceMember = %v, %v; want %v, nil", got, err, tt.isMember)
 			}
 			if got, err := az.IsWorkspaceOwner(ctx, tt.workspaceID, tt.userID); err != nil || got != tt.isOwner {
 				t.Errorf("IsWorkspaceOwner = %v, %v; want %v, nil", got, err, tt.isOwner)
@@ -264,19 +279,28 @@ func TestChannelRoleAndPredicates(t *testing.T) {
 			if role != tt.wantRole {
 				t.Errorf("ChannelRole = %q, want %q", role, tt.wantRole)
 			}
-			if got, err := az.IsChannelMember(ctx, tt.channelID, tt.userID); err != nil || got != tt.wantMember {
-				t.Errorf("IsChannelMember = %v, %v; want %v, nil", got, err, tt.wantMember)
+			// Membership is CapWrite on the ladder, not CapRead: a non-member of
+			// a public channel holds CapRead on it and must not be counted here.
+			subject := UserSubject(tt.userID)
+			obj := ChannelObject(tt.channelID)
+			if got, err := az.Can(ctx, subject, obj, CapWrite); err != nil || got != tt.wantMember {
+				t.Errorf("Can(write) = %v, %v; want %v, nil", got, err, tt.wantMember)
 			}
-			if got, err := az.IsChannelAdmin(ctx, tt.channelID, tt.userID); err != nil || got != tt.wantAdmin {
-				t.Errorf("IsChannelAdmin = %v, %v; want %v, nil", got, err, tt.wantAdmin)
+			if got, err := az.Can(ctx, subject, obj, CapAdmin); err != nil || got != tt.wantAdmin {
+				t.Errorf("Can(admin) = %v, %v; want %v, nil", got, err, tt.wantAdmin)
+			}
+			if got, err := az.isChannelMember(ctx, tt.channelID, tt.userID); err != nil || got != tt.wantMember {
+				t.Errorf("isChannelMember = %v, %v; want %v, nil", got, err, tt.wantMember)
 			}
 		})
 	}
 }
 
-// TestCanReadChannel is the load-bearing one. The "public channel readable by a
-// stranger" row is the exact gap that allowed cross-tenant browsing.
-func TestCanReadChannel(t *testing.T) {
+// TestChannelReadability is the load-bearing one. The "public channel readable
+// by a stranger" row is the exact gap that allowed cross-tenant browsing, and
+// every row here is asserted twice: through Can, which is what handlers
+// enforce, and through canReadChannel, the predicate Can is composed from.
+func TestChannelReadability(t *testing.T) {
 	az, w := seed(t)
 
 	tests := []struct {
@@ -310,33 +334,44 @@ func TestCanReadChannel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
+			got, err := az.Can(ctx, UserSubject(tt.userID), ChannelObject(tt.channelID), CapRead)
+			if err != nil {
+				t.Fatalf("Can(read): unexpected error %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("Can(read) = %v, want %v", got, tt.want)
+			}
+
 			ch, err := az.Channel(ctx, tt.channelID)
 			if err != nil {
 				t.Fatalf("Channel: unexpected error %v", err)
 			}
-			got, err := az.CanReadChannel(ctx, ch, tt.userID)
+			legacy, err := az.canReadChannel(ctx, ch, tt.userID)
 			if err != nil {
-				t.Fatalf("CanReadChannel: unexpected error %v", err)
+				t.Fatalf("canReadChannel: unexpected error %v", err)
 			}
-			if got != tt.want {
-				t.Errorf("CanReadChannel = %v, want %v", got, tt.want)
+			if legacy != tt.want {
+				t.Errorf("canReadChannel = %v, want %v", legacy, tt.want)
 			}
 		})
 	}
 
 	t.Run("nil channel is not readable", func(t *testing.T) {
-		// A handler that passed the result of Channel() straight through must
-		// get false rather than a nil dereference.
-		got, err := az.CanReadChannel(t.Context(), nil, w.owner)
+		// Callers that pass the result of Channel() straight through must get
+		// false rather than a nil dereference.
+		got, err := az.canReadChannel(t.Context(), nil, w.owner)
 		if err != nil {
-			t.Fatalf("CanReadChannel(nil): unexpected error %v", err)
+			t.Fatalf("canReadChannel(nil): unexpected error %v", err)
 		}
 		if got {
-			t.Error("CanReadChannel(nil) = true, want false")
+			t.Error("canReadChannel(nil) = true, want false")
 		}
 	})
 }
 
+// TestReadableChannelIDs pins the predicate KeysFor's channel arm is built
+// from. It is unexported now — the only caller is KeysFor — but it is still the
+// thing every search filter ultimately narrows on, so it keeps its own table.
 func TestReadableChannelIDs(t *testing.T) {
 	az, w := seed(t)
 
@@ -388,9 +423,9 @@ func TestReadableChannelIDs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := az.ReadableChannelIDs(t.Context(), tt.workspaceID, tt.userID)
+			got, err := az.readableChannelIDs(t.Context(), tt.workspaceID, tt.userID)
 			if err != nil {
-				t.Fatalf("ReadableChannelIDs: unexpected error %v", err)
+				t.Fatalf("readableChannelIDs: unexpected error %v", err)
 			}
 			// Search turns this into a Meilisearch filter. If "no readable
 			// channels" came back as nil and the caller treated nil as "no
@@ -398,18 +433,18 @@ func TestReadableChannelIDs(t *testing.T) {
 			// workspace's messages — so the empty case must be a non-nil,
 			// zero-length slice that a caller can distinguish.
 			if got == nil {
-				t.Fatal("ReadableChannelIDs returned nil; want an empty slice")
+				t.Fatal("readableChannelIDs returned nil; want an empty slice")
 			}
 			if !sameSet(got, tt.want) {
-				t.Errorf("ReadableChannelIDs = %v, want %v", got, tt.want)
+				t.Errorf("readableChannelIDs = %v, want %v", got, tt.want)
 			}
 		})
 	}
 
 	t.Run("private channels of other members are never listed", func(t *testing.T) {
-		got, err := az.ReadableChannelIDs(t.Context(), w.wsA, w.guest)
+		got, err := az.readableChannelIDs(t.Context(), w.wsA, w.guest)
 		if err != nil {
-			t.Fatalf("ReadableChannelIDs: unexpected error %v", err)
+			t.Fatalf("readableChannelIDs: unexpected error %v", err)
 		}
 		for _, id := range got {
 			if id == w.chPrivate || id == w.chDM {

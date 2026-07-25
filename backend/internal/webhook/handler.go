@@ -81,7 +81,7 @@ func (h *Handler) requireAdminOfWebhook(w http.ResponseWriter, r *http.Request, 
 		return "", "", false
 	}
 
-	admin, err := h.authz.IsWorkspaceAdmin(r.Context(), workspaceID, userID)
+	admin, err := h.authz.Can(r.Context(), authz.UserSubject(userID), authz.WorkspaceObject(workspaceID), authz.CapAdmin)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return "", "", false
@@ -124,7 +124,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "channel not found")
 		return
 	}
-	admin, err := h.authz.IsWorkspaceAdmin(ctx, ch.WorkspaceID, userID)
+	admin, err := h.authz.Can(ctx, authz.UserSubject(userID), authz.WorkspaceObject(ch.WorkspaceID), authz.CapAdmin)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

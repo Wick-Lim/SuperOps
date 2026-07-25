@@ -433,7 +433,7 @@ func (r *Repository) RemoveBookmark(ctx context.Context, userID, messageID strin
 // Bookmarking a message does not grant permanent access to it: the join
 // re-applies channel membership on every read, so a user removed from a
 // channel stops seeing its content even though the bookmark row survives. The
-// membership predicate mirrors authz.Checker.IsChannelMember, which is the
+// membership predicate mirrors authz.Checker's channel-membership rung, which is the
 // gate every other read in this package uses; it lives in SQL here only
 // because the filter has to run before LIMIT for has_more to be correct.
 func (r *Repository) ListBookmarks(ctx context.Context, userID string, cur httputil.Cursor, limit int) ([]*Bookmark, error) {

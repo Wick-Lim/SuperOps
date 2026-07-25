@@ -35,7 +35,7 @@ func (h *Handler) WorkspacePresence(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := authctx.UserID(r.Context())
 
-	member, err := h.authz.IsWorkspaceMember(r.Context(), wsID, userID)
+	member, err := h.authz.Can(r.Context(), authz.UserSubject(userID), authz.WorkspaceObject(wsID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -84,6 +84,10 @@ func (h *Handler) ChannelTyping(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := authctx.UserID(r.Context())
 
+	// The existence probe stays even though Can answers CapNone for a channel
+	// that does not exist: "no such channel" must reach the caller as 404 and
+	// "exists but is not yours" as 403, and the object model deliberately
+	// collapses both into "no capability".
 	ch, err := h.authz.Channel(r.Context(), chID)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
@@ -93,7 +97,7 @@ func (h *Handler) ChannelTyping(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, httputil.NewNotFound("channel not found"))
 		return
 	}
-	ok, err := h.authz.CanReadChannel(r.Context(), ch, userID)
+	ok, err := h.authz.Can(r.Context(), authz.UserSubject(userID), authz.ChannelObject(ch.ID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

@@ -117,7 +117,7 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	admin, err := h.authz.IsWorkspaceAdmin(ctx, input.WorkspaceID, actor)
+	admin, err := h.authz.Can(ctx, authz.UserSubject(actor), authz.WorkspaceObject(input.WorkspaceID), authz.CapAdmin)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -405,7 +405,7 @@ func (h *Handler) setRole(w http.ResponseWriter, r *http.Request, actor, uid str
 		return errWritten
 	}
 
-	admin, err := h.authz.IsWorkspaceAdmin(ctx, *workspaceID, actor)
+	admin, err := h.authz.Can(ctx, authz.UserSubject(actor), authz.WorkspaceObject(*workspaceID), authz.CapAdmin)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return errWritten

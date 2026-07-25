@@ -1,4 +1,4 @@
-// Package authz is the canonical source of membership and role decisions.
+// Package authz is the canonical source of authorization decisions.
 //
 // Before this package the same `SELECT EXISTS(... workspace_members ...)` was
 // copy-pasted into file, emoji, webhook, presence, admin and channel handlers
@@ -6,22 +6,33 @@
 // which is how a caller could browse, join and post in a workspace they had no
 // membership in, and full-text search another tenant's private channels.
 //
+// The question a handler asks is "may this SUBJECT do this much to this
+// OBJECT": Checker.Can, with an ordered capability
+// (admin > share > write > comment > read). checker.go is that model;
+// docs/plans/00-permissions.md is why it is shaped that way. The fifteen
+// membership methods that predated it are gone — step 5 of that plan — and
+// what remains here is the layer they were built on: the role and membership
+// lookups that Capability composes, plus the domain predicates (SSO
+// enforcement, blocks) that were never object-shaped at all.
+//
 // Rules of use:
 //   - Authentication stays in middleware; authorization stays in the handler.
-//     Call a Checker method as the first statement of the handler body.
-//   - Methods return (bool, error). Treat err as 500 and !ok as 403/404 —
-//     never collapse the two, or a database outage becomes an authorization
-//     bypass (or a permanent lockout).
+//     Call Can as the first statement of the handler body.
+//   - err is a 500 and !ok is a 403/404 — never collapse the two, or a database
+//     outage becomes an authorization bypass (or a permanent lockout).
 //   - Never authorize a message/file/webhook against an id taken from the URL
-//     when the resource itself names its own parent. Resolve the parent from
-//     the row and check that.
+//     when the resource itself names its own parent. Ask about the object
+//     itself: a file is an object, and Can resolves its own parentage.
+//   - Do not call Can in a loop. A page of rows is KeysFor once, then
+//     FilterReadable — the N+1 this whole design exists to prevent reads as
+//     correct, which is why the batch call is the one with the convenient
+//     signature.
 package authz
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -46,44 +57,30 @@ const (
 // Checker answers authorization questions against Postgres. It holds no
 // per-request state and is safe for concurrent use.
 //
-// Two layers live on it. The fifteen methods below are the membership special
-// case every handler calls today; checker.go adds the general object-level
-// model (Capability, Can, KeysFor, Grant, Revoke, Move). The two are wired
-// together only by compare.go's dual-run mode, which is off unless a deployment
-// asks for it.
+// checker.go carries the model handlers use — Capability, Can, KeysFor,
+// FilterReadable, Grant, Revoke, Move. This file carries the lookups it is
+// composed from (WorkspaceRole, ChannelRole, Channel, MessageChannel) and the
+// predicates that are not object-shaped and never will be: SSO enforcement and
+// user blocks.
 type Checker struct {
 	pool *pgxpool.Pool
 
-	// cmp is nil unless dual-run comparison is enabled. A nil pointer is the
-	// disabled state so the hot path is a single nil check.
-	cmp *comparison
+	// revoker is nil unless the composition root wired a live surface. See
+	// Revoker in checker.go: a revoked grant has to reach connections that were
+	// authorized before it was revoked.
+	revoker Revoker
 }
 
-// Option configures a Checker. Variadic so every existing New(pool) call site
-// keeps compiling and keeps behaving identically.
+// Option configures a Checker. Variadic so a plain New(pool) — which every test
+// and every operational tool uses — keeps working.
 type Option func(*Checker)
 
-// WithComparison enables dual-run comparison against the object-level checker.
-// See compare.go: it changes no answer and can fail no request, and it costs
-// two to three extra queries per authorization check — which is why it is off
-// by default and on in the integration suite.
-func WithComparison(logger *slog.Logger) Option {
-	return func(c *Checker) {
-		if logger == nil {
-			logger = slog.Default()
-		}
-		c.cmp = &comparison{logger: logger}
-	}
-}
-
-// WithComparisonSink registers a callback for every mismatch, in addition to
-// the log. Tests assert on disagreements through it rather than by parsing log
-// output. It implies WithComparison, so the two are never half-configured.
-func WithComparisonSink(logger *slog.Logger, sink func(Mismatch)) Option {
-	return func(c *Checker) {
-		WithComparison(logger)(c)
-		c.cmp.sink = sink
-	}
+// WithRevoker attaches the live surface that Revoke and Move must reach.
+// Without it the mutations still rewrite acl_key correctly and a connection
+// authorized before the revocation keeps its access until the socket's periodic
+// recheck — which is the backstop, not the mechanism, and it is minutes wide.
+func WithRevoker(r Revoker) Option {
+	return func(c *Checker) { c.revoker = r }
 }
 
 func New(pool *pgxpool.Pool, opts ...Option) *Checker {
@@ -118,38 +115,23 @@ func (c *Checker) WorkspaceRole(ctx context.Context, workspaceID, userID string)
 	return role, nil
 }
 
-func (c *Checker) IsWorkspaceMember(ctx context.Context, workspaceID, userID string) (bool, error) {
-	ok, err := c.isWorkspaceMember(ctx, workspaceID, userID)
-	if err == nil {
-		c.compare(ctx, "IsWorkspaceMember", UserSubject(userID), WorkspaceObject(workspaceID), ok, CapRead)
-	}
-	return ok, err
-}
-
-// isWorkspaceMember is the answer without the dual-run comparison. Internal
-// callers use it so one authorization decision produces at most one comparison
-// report rather than one per nested membership query.
+// isWorkspaceMember is the membership predicate Capability's workspace arm and
+// KeysFor are built from. It is unexported: a handler asking "is this person in
+// this workspace" is asking whether they hold CapRead on the workspace object,
+// and Can is the way to ask it — one call site style for every authorization
+// decision in the product, so a reviewer never has to work out which layer a
+// given check went through.
 func (c *Checker) isWorkspaceMember(ctx context.Context, workspaceID, userID string) (bool, error) {
 	role, err := c.WorkspaceRole(ctx, workspaceID, userID)
 	return role != "", err
 }
 
-// IsWorkspaceAdmin reports whether the caller is owner or admin of the given
-// workspace. This is the gate for destructive or membership-changing actions.
-func (c *Checker) IsWorkspaceAdmin(ctx context.Context, workspaceID, userID string) (bool, error) {
-	role, err := c.WorkspaceRole(ctx, workspaceID, userID)
-	if err != nil {
-		return false, err
-	}
-	ok := role == RoleOwner || role == RoleAdmin
-	c.compare(ctx, "IsWorkspaceAdmin", UserSubject(userID), WorkspaceObject(workspaceID), ok, CapAdmin)
-	return ok, nil
-}
-
-// IsWorkspaceOwner has no object-level equivalent and is deliberately not
-// compared: the capability ladder is ordered, owner and admin both map to
-// CapAdmin, and there is no rung between them. Sole ownership stays a role
-// check.
+// IsWorkspaceOwner is the one role question with no object-level equivalent, and
+// it stays a role check for a reason rather than by omission: the capability
+// ladder is ordered, owner and admin both map to CapAdmin, and there is no rung
+// between them. Sole ownership — deleting the workspace, transferring itself —
+// is not "more admin than admin", it is a distinguished single row, so it is
+// asked as one.
 func (c *Checker) IsWorkspaceOwner(ctx context.Context, workspaceID, userID string) (bool, error) {
 	role, err := c.WorkspaceRole(ctx, workspaceID, userID)
 	if err != nil {
@@ -255,49 +237,23 @@ func (c *Checker) ChannelRole(ctx context.Context, channelID, userID string) (st
 	return role, nil
 }
 
-func (c *Checker) IsChannelMember(ctx context.Context, channelID, userID string) (bool, error) {
-	ok, err := c.isChannelMember(ctx, channelID, userID)
-	if err == nil {
-		// Channel membership maps to CapWrite, not CapRead: a member may post,
-		// while a non-member of a PUBLIC channel may only read it. Comparing
-		// against CapRead would call every public channel a match and prove
-		// nothing.
-		c.compare(ctx, "IsChannelMember", UserSubject(userID), ChannelObject(channelID), ok, CapWrite)
-	}
-	return ok, err
-}
-
+// isChannelMember is the membership predicate. Membership maps to CapWrite on
+// the ladder, not CapRead: a member may post, while a non-member of a PUBLIC
+// channel may only read. Handlers ask Can for one or the other — see
+// message.Handler.requireMembership.
 func (c *Checker) isChannelMember(ctx context.Context, channelID, userID string) (bool, error) {
 	role, err := c.ChannelRole(ctx, channelID, userID)
 	return role != "", err
 }
 
-func (c *Checker) IsChannelAdmin(ctx context.Context, channelID, userID string) (bool, error) {
-	role, err := c.ChannelRole(ctx, channelID, userID)
-	if err != nil {
-		return false, err
-	}
-	ok := role == ChannelRoleAdmin
-	c.compare(ctx, "IsChannelAdmin", UserSubject(userID), ChannelObject(channelID), ok, CapAdmin)
-	return ok, nil
-}
-
-// CanReadChannel reports whether the caller may read a channel's contents:
-// membership always suffices, and a public channel is readable by any member
-// of its workspace. Crucially, a public channel is NOT readable by an
+// canReadChannel is the readability predicate Capability's channel arm is built
+// from: membership always suffices, and a public channel is readable by any
+// member of its workspace. Crucially, a public channel is NOT readable by an
 // authenticated stranger — that gap is what allowed cross-tenant browsing.
-func (c *Checker) CanReadChannel(ctx context.Context, ch *ChannelInfo, userID string) (bool, error) {
+func (c *Checker) canReadChannel(ctx context.Context, ch *ChannelInfo, userID string) (bool, error) {
 	if ch == nil {
 		return false, nil
 	}
-	ok, err := c.canReadChannel(ctx, ch, userID)
-	if err == nil {
-		c.compare(ctx, "CanReadChannel", UserSubject(userID), ChannelObject(ch.ID), ok, CapRead)
-	}
-	return ok, err
-}
-
-func (c *Checker) canReadChannel(ctx context.Context, ch *ChannelInfo, userID string) (bool, error) {
 	member, err := c.isChannelMember(ctx, ch.ID, userID)
 	if err != nil || member {
 		return member, err
@@ -329,21 +285,16 @@ func (c *Checker) MessageChannel(ctx context.Context, messageID string) (*Channe
 	return &info, nil
 }
 
-// ReadableChannelIDs returns every channel in a workspace whose contents the
-// caller may read. Search uses this to constrain the Meilisearch filter; a
-// non-member gets an empty slice, which must be rendered as "no results"
-// rather than "no filter".
-func (c *Checker) ReadableChannelIDs(ctx context.Context, workspaceID, userID string) ([]string, error) {
-	ids, err := c.readableChannelIDs(ctx, workspaceID, userID)
-	if err == nil {
-		// The most valuable of the comparisons: this list is what the search
-		// filter is built from, and a difference between it and KeysFor is
-		// exactly the class of bug that widens a tenancy filter.
-		c.compareSets(ctx, "ReadableChannelIDs", UserSubject(userID), WorkspaceObject(workspaceID), ids)
-	}
-	return ids, err
-}
-
+// readableChannelIDs returns every channel in a workspace whose contents the
+// caller may read. It is the channel arm of KeysFor and therefore, one step
+// further out, the thing every search filter is built from — a non-member gets
+// an empty slice, which the caller must render as "no results" rather than as
+// "no filter".
+//
+// Unexported: the only correct consumer is KeysFor, which turns it into c- keys.
+// A caller that wants "the channels I can read" as ids is almost always about
+// to write an N+1, and one that wants to filter a page should be intersecting
+// key sets instead.
 func (c *Checker) readableChannelIDs(ctx context.Context, workspaceID, userID string) ([]string, error) {
 	member, err := c.isWorkspaceMember(ctx, workspaceID, userID)
 	if err != nil {

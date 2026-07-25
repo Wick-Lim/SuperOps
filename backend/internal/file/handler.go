@@ -168,7 +168,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "workspace_id is required")
 		return
 	}
-	member, err := h.authz.IsWorkspaceMember(ctx, workspaceID, userID)
+	member, err := h.authz.Can(ctx, authz.UserSubject(userID), authz.WorkspaceObject(workspaceID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -244,23 +244,24 @@ func (h *Handler) getFile(r *http.Request, id string) (*fileRow, error) {
 	return &f, nil
 }
 
-// canRead authorizes against the channel of the message the file is attached
-// to, not against its workspace. Workspace-level authorization let any member
-// of the workspace fetch a file posted in a private channel or a DM given only
-// its UUID. While a file is still unattached only its uploader can read it.
+// canRead asks the object model whether the caller may read this file.
+//
+// A file is an object with a place in the hierarchy — it hangs off the channel
+// of the message it is attached to, or off its workspace while it is still
+// unattached — so the whole of the old three-step dance (resolve the message,
+// resolve its channel, authorize the channel, fall back to uploader-only when
+// the message was hard-deleted) is the checker's file arm, and this is now one
+// call. The rule it enforces is unchanged and is still not workspace-level:
+// workspace-level authorization is what let any member fetch a file posted in a
+// private channel or a DM given only its UUID.
+//
+// One deliberate narrowing comes with the move. The checker joins the message's
+// channel on the FILE's workspace, so a files row pointing at a message in
+// another tenant — corrupt data, not a reachable state — degrades to
+// uploader-only instead of authorizing against the foreign channel. Fail-closed
+// is the only sane reading of a cross-workspace attachment.
 func (h *Handler) canRead(r *http.Request, f *fileRow, userID string) (bool, error) {
-	if f.MessageID == nil || *f.MessageID == "" {
-		return f.UserID == userID, nil
-	}
-	ch, err := h.authz.MessageChannel(r.Context(), *f.MessageID)
-	if err != nil {
-		return false, err
-	}
-	if ch == nil {
-		// The message was hard-deleted; fall back to uploader-only.
-		return f.UserID == userID, nil
-	}
-	return h.authz.CanReadChannel(r.Context(), ch, userID)
+	return h.authz.Can(r.Context(), authz.UserSubject(userID), authz.FileObject(f.ID), authz.CapRead)
 }
 
 func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
@@ -332,7 +333,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	// Uploader, or an owner/admin of the workspace acting as a moderator.
 	if f.UserID != userID {
-		admin, err := h.authz.IsWorkspaceAdmin(ctx, f.WorkspaceID, userID)
+		admin, err := h.authz.Can(ctx, authz.UserSubject(userID), authz.WorkspaceObject(f.WorkspaceID), authz.CapAdmin)
 		if err != nil {
 			httputil.HandleError(w, httputil.NewInternal(err))
 			return

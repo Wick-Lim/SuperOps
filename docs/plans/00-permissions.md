@@ -4,10 +4,14 @@
 would otherwise invent its own answer, and reconciling nine of those later is
 strictly worse than designing one now.
 
-Status: **steps 1–3 landed** (`migrations/016`, `internal/authz`, the worker's
-`acl_drift` job, `AUTHZ_DUAL_RUN`). Steps 4 and 5 — the per-package cutover and
-the deletion of the old methods — are not started, and every handler that calls
-`IsChannelMember` today still calls it and behaves identically.
+Status: **done** (`migrations/016`, `internal/authz`, the worker's `acl_drift`
+job). Every handler authorizes through `Checker.Can`; the fifteen membership
+methods are deleted, and so is the dual-run comparison that made deleting them
+safe — see step 5 for why keeping it would have been worse than removing it.
+
+One thing was deliberately left where it was: `KeysFor`'s channel arm still
+answers from `channel_members` rather than from `acl_key`. See
+"What was not cut over" below.
 
 ---
 
@@ -205,16 +209,82 @@ again.
    and the drift verifier all answer from them, so no two of them can disagree.
    Re-runnable. No behaviour change.
 3. ~~Dual-run.~~ `AUTHZ_DUAL_RUN`, on in the integration suite. Each compared
-   method also evaluates `Capability` and logs subject, object, both answers and
-   the required capability. It changes no answer and can fail no request.
-4. Cut over per package, smallest first, only once the comparison is silent.
-5. Delete the old methods last.
+   method also evaluated `Capability` and logged subject, object, both answers
+   and the required capability. It changed no answer and could fail no request.
+4. ~~Cut over per package, smallest first, only once the comparison is silent.~~
+   In order: `emoji`, `presence`, `webhook`, `file`, `search`, `message`,
+   `channel`, `workspace`, `admin`+`sso`+`collab`+the WebSocket member checker.
+   `block` and `notification` needed nothing — neither ever asked an
+   object-shaped question.
+
+   The comparison was extended to run in reverse for this step: `Can` also
+   evaluated the predicate its call site used to use, so a converted package
+   stayed compared instead of falling out of the comparison the moment it was
+   converted. Without that, the counter would have decayed to zero exactly as
+   the cutover proceeded and the final report would have read "0 mismatches"
+   out of an empty comparison.
+5. ~~Delete the old methods last.~~ The six with an object-level equivalent are
+   gone: `IsWorkspaceMember`, `IsWorkspaceAdmin`, `IsChannelMember`,
+   `IsChannelAdmin`, `CanReadChannel`, `ReadableChannelIDs`. Their predicates
+   survive unexported, because `Capability` is composed from them.
+
+   `IsWorkspaceOwner` stays, for the reason it was never compared: the ladder is
+   ordered and owner and admin both map to `admin`, so sole ownership is a
+   distinguished row rather than a higher rung. `WorkspaceRole` and
+   `ChannelRole` stay because a role *name* is not a capability — role-change
+   validation compares two roles, which a capability comparison cannot express.
+   `AdminWorkspaceIDs`, `SharesWorkspace`, `Channel`, `MessageChannel`,
+   `PasswordLoginAllowed`, `SSOEnforced`, `IsBlocked` and `BlockedUserIDs` stay
+   because they are lookups or non-ACL domain predicates, not access checks.
+
+   `AUTHZ_DUAL_RUN` and `compare.go` went with them. A comparison needs two
+   independent models; after step 5 the only "legacy" side left is the set of
+   predicates `Capability` is itself composed from, so it would have compared
+   two arrangements of the same primitives and reported agreement forever. That
+   is confidence rather than evidence, which is the failure the comparison
+   existed to prevent. The equivalence it asserted is now asserted better, in
+   `internal/authz`'s own tests: the whole fixture matrix rather than the pairs a
+   test run happened to generate, on every `go test`, with no flag.
 
 The existing tenancy tests — `TestCrossTenantSearch`,
 `TestCrossTenantChannelAccess`, `TestAdminEndpointsAreWorkspaceScoped`,
-`TestCrossChannelIDOR`, `TestWorkspaceRemovalRevokesAccess` — must pass
-unchanged at every step. If a step requires editing one, that is the signal
-that the step changed behaviour.
+`TestCrossChannelIDOR`, `TestWorkspaceRemovalRevokesAccess` — passed unchanged
+at every step, as did `TestDeactivationRevokesRefreshToken`. If a step had
+required editing one, that would have been the signal that the step changed
+behaviour.
+
+### What was not cut over
+
+`KeysFor` resolves the caller's `c-` keys from `channel_members`, not from
+`acl_key`, and that survived the cutover on purpose.
+
+A key set is a **narrowing** term. A missing key costs somebody a search result;
+an extra key is a cross-tenant read. Staleness produces the second one — a
+caller removed from a private channel keeps its `c-` key until the
+materialization catches up — and `acl_key`'s derived half is maintained by the
+worker's hourly reconcile, not by the write that changed it. An hour of
+staleness on a narrowing filter is not a trade worth making to save one indexed
+query.
+
+Nothing else depends on that decision, because **no authorization decision about
+a workspace, channel or file reads `acl_object` or `acl_key` at all**:
+`Capability` resolves those three types from the pre-ACL tables directly, so an
+object created one second ago is authorized correctly with no row of its own.
+That is what makes a missing materialization row unable to widen anything, and
+it is why "register objects on creation" was not needed for correctness.
+
+It was needed for the *watchdog*: nothing wrote those rows, so the drift job
+reported every object created since the backfill as `missing_object`, for ever,
+growing — and a permanently red watchdog is one nobody reads. The job now
+reconciles the derived types (logging exactly what it changed) and then verifies
+both halves, so what it reports is drift the reconcile could not explain.
+
+Flipping the channel arm needs the derived materialization to be transactional
+with the tables it is derived from: a trigger on `channels` /`channel_members` /
+`files`, or a hook on each of the eight write paths that touch them. That has
+its own failure mode — a missed hook is a channel that is invisible or
+unguarded depending on which arm reads it — and belongs in its own change with
+its own migration.
 
 ---
 
@@ -228,10 +298,15 @@ Worth a lint or a review checklist, because it will read as correct.
 plus a periodic verifier that recomputes and reports mismatches, in the worker
 alongside the existing jobs.
 
-**Revocation latency.** A WebSocket subscription authorized at subscribe time
-outlives a revoked grant. The hub already has `RevokeChannelSubscription` and
-`RevokeChannelForAll` from the responsive work — generalize to objects and call
-them from `Revoke` and `Move`.
+**Revocation latency.** ~~A WebSocket subscription authorized at subscribe time
+outlives a revoked grant.~~ Closed: `authz.Revoker` is the (subject, object)
+seam, `Revoke` drives it per subject over the live objects in the revoked
+subtree and `Move` drives it for everyone, both after the transaction commits.
+The composition root maps object types onto
+`ws.Hub.RevokeChannelSubscription` / `RevokeChannelForAll` and
+`collab.Service.RevokeAccess` / `RevokeDocument`, which is what finally gives
+the collaboration revocations a caller. The fan-out is capped; past the cap the
+socket's periodic recheck is the backstop, and the truncation is logged.
 
 **Deep hierarchies.** A path is text; a pathological nesting depth makes it
 long. Cap depth (32 is generous) and reject beyond it.

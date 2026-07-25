@@ -105,7 +105,22 @@ const (
 	// because the path helpers and the f- key prefix already understand it, so
 	// Drive adds rows rather than concepts.
 	TypeFolder = "folder"
+	// TypeDoc names a collaborative document (internal/collab). Nothing
+	// registers one yet — a document has no place in the hierarchy until Drive
+	// gives it a folder to hang off — but the type is named here because it is
+	// the second object type with a LIVE surface, and liveTypes below has to
+	// enumerate those.
+	TypeDoc = "doc"
 )
+
+// liveTypes are the object types a subject can hold an open, already-authorized
+// connection to: a WebSocket subscription to a channel, an editing session in a
+// document. They are the types where withdrawing a grant is not finished when
+// the row is deleted — see Revoker.
+//
+// A file is absent on purpose. There is no such thing as an open file session;
+// the next download re-authorizes.
+var liveTypes = []string{TypeChannel, TypeDoc}
 
 // derivedTypes are the object types whose acl_object row and whose acl_key rows
 // are computed from workspaces/channels/files/channel_members by the

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -163,9 +164,15 @@ func TestBackfilledFileKeysMirrorCanRead(t *testing.T) {
 // Capability against the predicates it must reproduce
 // ---------------------------------------------------------------------------
 
-// TestCapabilityReproducesChannelPredicates walks the whole fixture matrix. It
-// is the unit-test half of the dual-run comparison: whatever CanReadChannel and
-// IsChannelMember answer, Capability must answer the same, for every pair.
+// TestCapabilityReproducesChannelPredicates walks the whole fixture matrix:
+// whatever canReadChannel and isChannelMember answer, Capability must answer
+// the same, for every (user, channel) pair.
+//
+// This is the guarantee that outlived the dual-run comparison. The comparison
+// checked the same equivalence on live traffic and was deleted with the legacy
+// methods in step 5 of docs/plans/00-permissions.md; this checks every pair
+// rather than the pairs a test run happened to generate, on every run, with no
+// configuration flag — which is strictly the better half of the two.
 func TestCapabilityReproducesChannelPredicates(t *testing.T) {
 	c, w := seed(t)
 	ctx := context.Background()
@@ -187,13 +194,13 @@ func TestCapabilityReproducesChannelPredicates(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Channel: %v", err)
 				}
-				legacyRead, err := c.CanReadChannel(ctx, info, userID)
+				legacyRead, err := c.canReadChannel(ctx, info, userID)
 				if err != nil {
-					t.Fatalf("CanReadChannel: %v", err)
+					t.Fatalf("canReadChannel: %v", err)
 				}
-				legacyMember, err := c.IsChannelMember(ctx, channelID, userID)
+				legacyMember, err := c.isChannelMember(ctx, channelID, userID)
 				if err != nil {
-					t.Fatalf("IsChannelMember: %v", err)
+					t.Fatalf("isChannelMember: %v", err)
 				}
 
 				assertCan(t, c, UserSubject(userID), ChannelObject(channelID), CapRead, legacyRead)
@@ -812,4 +819,159 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Revocation reaching live sessions
+// ---------------------------------------------------------------------------
+
+// recordingRevoker captures what the checker asked the live surface to drop.
+type recordingRevoker struct {
+	mu      sync.Mutex
+	perUser []string // "<subject> -> <object>"
+	forAll  []string // "<object>"
+}
+
+func (r *recordingRevoker) RevokeObjectForSubject(subject SubjectRef, obj ObjectRef) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.perUser = append(r.perUser, subject.String()+" -> "+obj.String())
+}
+
+func (r *recordingRevoker) RevokeObjectForAll(obj ObjectRef) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.forAll = append(r.forAll, obj.String())
+}
+
+func (r *recordingRevoker) snapshot() ([]string, []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.perUser...), append([]string(nil), r.forAll...)
+}
+
+func revokingChecker(t *testing.T) (*Checker, *recordingRevoker) {
+	t.Helper()
+	c, _ := seed(t)
+	rec := &recordingRevoker{}
+	return New(c.pool, WithRevoker(rec)), rec
+}
+
+// TestRevokeReachesLiveChannelSessions is plan 00's "revocation latency" risk.
+// Deleting the grant row settles every future request and settles nothing about
+// a subscription that was authorized before it — so Revoke has to reach the
+// hub, and it has to name the channel rather than the folder the grant was on.
+func TestRevokeReachesLiveChannelSessions(t *testing.T) {
+	_, w := rebuilt(t)
+	c, rec := revokingChecker(t)
+	ctx := context.Background()
+	actor := UserSubject(w.owner)
+
+	if err := c.Grant(ctx, actor, UserSubject(w.guest), ChannelObject(w.chPrivate), CapRead); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	// Granting does not revoke anything.
+	if perUser, forAll := rec.snapshot(); len(perUser) != 0 || len(forAll) != 0 {
+		t.Fatalf("Grant drove the revoker: %v / %v", perUser, forAll)
+	}
+
+	if err := c.Revoke(ctx, actor, UserSubject(w.guest), ChannelObject(w.chPrivate)); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	perUser, forAll := rec.snapshot()
+	want := UserSubject(w.guest).String() + " -> " + ChannelObject(w.chPrivate).String()
+	if len(perUser) != 1 || perUser[0] != want {
+		t.Errorf("per-subject revocations = %v, want [%s]", perUser, want)
+	}
+	if len(forAll) != 0 {
+		t.Errorf("revoking one subject dropped everybody: %v", forAll)
+	}
+	mustVerifyClean(t, c)
+}
+
+// TestRevokeReachesTheWholeSubtree: a grant on a container is inherited, so
+// withdrawing it has to drop the live sessions of everything under it — and
+// only of the types that HAVE live sessions. A file has no open session; the
+// next download re-authorizes.
+func TestRevokeReachesTheWholeSubtree(t *testing.T) {
+	_, w := rebuilt(t)
+	c, rec := revokingChecker(t)
+	ctx := context.Background()
+	actor := UserSubject(w.owner)
+
+	folder := ObjectRef{Type: TypeFolder, ID: uuid.NewString()}
+	docA := ObjectRef{Type: TypeDoc, ID: uuid.NewString()}
+	docB := ObjectRef{Type: TypeDoc, ID: uuid.NewString()}
+	mustRegister(t, c, folder, WorkspaceObject(w.wsA))
+	mustRegister(t, c, docA, folder)
+	mustRegister(t, c, docB, folder)
+
+	if err := c.Grant(ctx, actor, UserSubject(w.member), folder, CapWrite); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	if err := c.Revoke(ctx, actor, UserSubject(w.member), folder); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	perUser, _ := rec.snapshot()
+	sort.Strings(perUser)
+	want := []string{
+		UserSubject(w.member).String() + " -> " + docA.String(),
+		UserSubject(w.member).String() + " -> " + docB.String(),
+	}
+	sort.Strings(want)
+	if !equalStrings(perUser, want) {
+		t.Errorf("subtree revocations = %v, want %v (the folder itself has no live session)", perUser, want)
+	}
+	mustVerifyClean(t, c)
+}
+
+// TestMoveRevokesEveryLiveSessionInTheSubtree: a move changes what the subtree
+// inherits for every subject at once, so there is no "who lost access" to
+// compute — everybody is dropped and re-authorizes against the new position.
+func TestMoveRevokesEveryLiveSessionInTheSubtree(t *testing.T) {
+	_, w := rebuilt(t)
+	c, rec := revokingChecker(t)
+	ctx := context.Background()
+	actor := UserSubject(w.owner)
+
+	src := ObjectRef{Type: TypeFolder, ID: uuid.NewString()}
+	dst := ObjectRef{Type: TypeFolder, ID: uuid.NewString()}
+	moving := ObjectRef{Type: TypeFolder, ID: uuid.NewString()}
+	doc := ObjectRef{Type: TypeDoc, ID: uuid.NewString()}
+	mustRegister(t, c, src, WorkspaceObject(w.wsA))
+	mustRegister(t, c, dst, WorkspaceObject(w.wsA))
+	mustRegister(t, c, moving, src)
+	mustRegister(t, c, doc, moving)
+
+	if err := c.Move(ctx, actor, moving, dst); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+
+	perUser, forAll := rec.snapshot()
+	if len(perUser) != 0 {
+		t.Errorf("a move revoked per-subject: %v", perUser)
+	}
+	if len(forAll) != 1 || forAll[0] != doc.String() {
+		t.Errorf("move revocations = %v, want [%s]", forAll, doc.String())
+	}
+	mustVerifyClean(t, c)
+}
+
+// TestRevocationIsOptional: a checker with no live surface still rewrites keys
+// correctly. The revoker closes a latency gap; it is not what makes a
+// revocation correct, and a deployment without a hub must not panic.
+func TestRevocationIsOptional(t *testing.T) {
+	c, w := rebuilt(t)
+	ctx := context.Background()
+	actor := UserSubject(w.owner)
+
+	if err := c.Grant(ctx, actor, UserSubject(w.guest), ChannelObject(w.chPrivate), CapRead); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	if err := c.Revoke(ctx, actor, UserSubject(w.guest), ChannelObject(w.chPrivate)); err != nil {
+		t.Fatalf("Revoke without a revoker: %v", err)
+	}
+	mustVerifyClean(t, c)
 }

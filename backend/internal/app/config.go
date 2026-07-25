@@ -28,28 +28,8 @@ type Config struct {
 	Push         PushConfig
 	Mail         MailConfig
 	SSO          SSOConfig
-	Authz        AuthzConfig
 	MetricsToken string // METRICS_TOKEN — if set, GET /metrics requires this bearer token
 	LogLevel     string
-}
-
-// AuthzConfig configures the authorization layer.
-//
-// It has exactly one setting, and it is a migration aid rather than a product
-// feature: see docs/plans/00-permissions.md, step 3. Object-level permissions
-// are being built underneath the fifteen membership methods that currently
-// protect the messaging product, and DualRun makes each of those methods also
-// evaluate the new checker and log any disagreement — subject, object, both
-// answers — without changing the answer the caller gets.
-//
-// Off by default because it costs two to three extra queries per authorization
-// check. On in the integration suite, which is where the tenancy regression
-// tests live and therefore where a disagreement is worth two orders of
-// magnitude more than it costs.
-type AuthzConfig struct {
-	// DualRun — AUTHZ_DUAL_RUN. Set it in staging for a while before any
-	// package is cut over; a silent comparison is the precondition for step 4.
-	DualRun bool
 }
 
 // MailConfig configures outbound email.
@@ -470,9 +450,6 @@ func LoadConfig() (*Config, error) {
 			PendingTTL:          e.duration("SSO_PENDING_TTL", 5*time.Minute),
 			JWKSCacheTTL:        e.duration("SSO_JWKS_CACHE_TTL", time.Hour),
 			ClockSkew:           e.duration("SSO_CLOCK_SKEW", 2*time.Minute),
-		},
-		Authz: AuthzConfig{
-			DualRun: e.bool("AUTHZ_DUAL_RUN", false),
 		},
 		MetricsToken: e.str("METRICS_TOKEN", ""),
 		LogLevel:     e.str("LOG_LEVEL", "info"),

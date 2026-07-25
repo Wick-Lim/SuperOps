@@ -54,10 +54,10 @@ type App struct {
 	Hub    *ws.Hub
 	Server *http.Server
 
-	// Authz is exported so a test can read the dual-run comparison counters
-	// (authz.Checker.ComparisonStats) and so an operational tool can run the
-	// object-permission backfill against a live pool. Handlers never reach it
-	// through here; they are given the checker directly.
+	// Authz is exported so an operational tool can run the object-permission
+	// backfill (authz.Checker.Rebuild) or the drift verifier against a live
+	// pool. Handlers never reach it through here; they are given the checker
+	// directly.
 	Authz *authz.Checker
 
 	// draining flips as soon as shutdown starts so /ready fails before the
@@ -121,19 +121,32 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	messageRepo := message.NewRepository(pool)
 	notificationRepo := notification.NewRepository(pool)
 
-	// authz.Checker is the single source of truth for membership/role decisions.
-	// Every handler that used to hand-write an EXISTS query now shares it.
+	// WebSocket Hub with NATS bridge for multi-replica support.
+	// - NATS bridge: relays client-originated ephemeral events (typing) between replicas.
+	// - Event relay: fans application domain events (message/reaction/notification) to local clients.
+	// - Room bridge: fans collaboration updates and revocations between replicas,
+	//   so two editors on different pods see each other's keystrokes.
 	//
-	// AUTHZ_DUAL_RUN additionally evaluates the object-level checker alongside
-	// each membership method and logs where the two disagree
-	// (docs/plans/00-permissions.md, step 3). It changes no answer and can fail
-	// no request; it only costs queries, which is why it is opt-in.
-	authzOpts := []authz.Option{}
-	if cfg.Authz.DualRun {
-		authzOpts = append(authzOpts, authz.WithComparison(logger))
-		logger.Info("authz dual-run comparison enabled; object-level checks are evaluated and logged, never enforced")
-	}
-	az := authz.New(pool, authzOpts...)
+	// It is built before authz.Checker because the checker revokes through it:
+	// see liveRevoker below.
+	hub := ws.NewHub(logger)
+	hub.StartNATSBridge(natsClient.Conn, logger)
+	hub.StartEventRelay(natsClient.Conn, logger)
+	hub.StartRoomBridge(natsClient.Conn, logger)
+	go hub.Run()
+
+	// authz.Checker is the single source of truth for authorization decisions:
+	// handlers ask it for a capability on an object (docs/plans/00-permissions.md).
+	//
+	// The revoker is the live half of that. Deleting a grant settles every
+	// future request and settles nothing about a WebSocket subscription or an
+	// editing session that was authorized before it — so Revoke and Move drive
+	// hub.RevokeChannelSubscription and collab.Service.RevokeAccess through this
+	// seam. collabRevoker is filled in a few lines below, once the collaboration
+	// service exists; it cannot be passed here because that service needs the
+	// checker this call is constructing.
+	revoker := &liveRevoker{hub: hub}
+	az := authz.New(pool, authz.WithRevoker(revoker))
 
 	// audit must exist before auth: auth.Service records login/logout/password
 	// events through it.
@@ -215,17 +228,6 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		logger.Info("single sign-on disabled: SSO_SECRET_KEY is not set")
 	}
 
-	// WebSocket Hub with NATS bridge for multi-replica support.
-	// - NATS bridge: relays client-originated ephemeral events (typing) between replicas.
-	// - Event relay: fans application domain events (message/reaction/notification) to local clients.
-	// - Room bridge: fans collaboration updates and revocations between replicas,
-	//   so two editors on different pods see each other's keystrokes.
-	hub := ws.NewHub(logger)
-	hub.StartNATSBridge(natsClient.Conn, logger)
-	hub.StartEventRelay(natsClient.Conn, logger)
-	hub.StartRoomBridge(natsClient.Conn, logger)
-	go hub.Run()
-
 	// Collaborative editing. No configuration: it needs Postgres and, for more
 	// than one replica, the NATS connection that already exists. The service is
 	// both the HTTP handler's backend and the WebSocket room handler, which is
@@ -238,6 +240,9 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		logger,
 	)
 	collabHandler := collab.NewHandler(collabSvc)
+	// Closes the cycle: the checker revokes document sessions through the
+	// service, and the service authorizes through the checker.
+	revoker.collab.Store(collabSvc)
 
 	// Handlers
 	authHandler := auth.NewHandler(authService)
@@ -254,8 +259,14 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		presenceService,
 		// MemberChecker: a DB error must stay distinct from "not a member", or a
 		// transient blip revokes every subscription at once.
+		//
+		// CapWrite, because that is the rung channel membership maps to. A
+		// subscription is the live feed of a channel's traffic and is gated on
+		// the membership row, not on public-channel readability: asking for
+		// CapRead here would subscribe every workspace member to every public
+		// channel they never joined.
 		func(ctx context.Context, channelID, userID string) (bool, error) {
-			return az.IsChannelMember(ctx, channelID, userID)
+			return az.Can(ctx, authz.UserSubject(userID), authz.ChannelObject(channelID), authz.CapWrite)
 		},
 		// WorkspaceLister: resolved once per connection, used to route
 		// workspace-scoped events (channel.created, presence.changed).
@@ -509,6 +520,56 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	}
 
 	return appInstance, nil
+}
+
+// liveRevoker maps authz's object types onto the two things in this process
+// that hold already-authorized connections: ws.Hub for channel subscriptions
+// and collab.Service for document rooms.
+//
+// It lives in the composition root because that mapping is a wiring fact, not
+// an authorization one — internal/authz must not know that a channel is a hub
+// subscription — and because it is the only place that can see both halves.
+//
+// collab is an atomic pointer for one reason: the collaboration service
+// authorizes through the checker, and the checker revokes through the
+// collaboration service, so one of the two references has to be filled in after
+// construction. An atomic makes that late binding explicit and race-free rather
+// than relying on "nothing reads it before the server starts".
+type liveRevoker struct {
+	hub    *ws.Hub
+	collab atomic.Pointer[collab.Service]
+}
+
+func (l *liveRevoker) RevokeObjectForSubject(subject authz.SubjectRef, obj authz.ObjectRef) {
+	// A group has no connections of its own; its members' sessions are revoked
+	// when the group's own grants are, which is a Drive-era concern. Silently
+	// doing nothing here is correct, not a gap.
+	if subject.Type != authz.SubjectUser {
+		return
+	}
+	switch obj.Type {
+	case authz.TypeChannel:
+		if l.hub != nil {
+			l.hub.RevokeChannelSubscription(subject.ID, obj.ID)
+		}
+	case authz.TypeDoc:
+		if svc := l.collab.Load(); svc != nil {
+			svc.RevokeAccess(subject.ID, obj.ID)
+		}
+	}
+}
+
+func (l *liveRevoker) RevokeObjectForAll(obj authz.ObjectRef) {
+	switch obj.Type {
+	case authz.TypeChannel:
+		if l.hub != nil {
+			l.hub.RevokeChannelForAll(obj.ID)
+		}
+	case authz.TypeDoc:
+		if svc := l.collab.Load(); svc != nil {
+			svc.RevokeDocument(obj.ID)
+		}
+	}
 }
 
 // EventStreamName is the JetStream stream backing every durable domain event.

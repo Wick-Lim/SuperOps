@@ -57,7 +57,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 // authenticated caller enumerate, join and create channels in another tenant.
 func (h *Handler) requireWorkspaceMember(w http.ResponseWriter, r *http.Request) (string, bool) {
 	wsID := r.PathValue("workspace_id")
-	ok, err := h.az.IsWorkspaceMember(r.Context(), wsID, authctx.UserID(r.Context()))
+	ok, err := h.az.Can(r.Context(), authz.UserSubject(authctx.UserID(r.Context())),
+		authz.WorkspaceObject(wsID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return "", false
@@ -95,12 +96,17 @@ func (h *Handler) resolveChannel(w http.ResponseWriter, r *http.Request) (*authz
 // requireChannelMember resolves the channel and asserts the caller has a
 // membership row. Used by the read-marker and preference routes, which are
 // meaningless without one.
+//
+// CapWrite is what membership maps to on the capability ladder: a non-member of
+// a public channel holds CapRead on it, and a read marker or a mute preference
+// for somebody with no membership row is a row that cannot be written.
 func (h *Handler) requireChannelMember(w http.ResponseWriter, r *http.Request) (*authz.ChannelInfo, bool) {
 	ch, ok := h.resolveChannel(w, r)
 	if !ok {
 		return nil, false
 	}
-	member, err := h.az.IsChannelMember(r.Context(), ch.ID, authctx.UserID(r.Context()))
+	member, err := h.az.Can(r.Context(), authz.UserSubject(authctx.UserID(r.Context())),
+		authz.ChannelObject(ch.ID), authz.CapWrite)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return nil, false
@@ -115,11 +121,12 @@ func (h *Handler) requireChannelMember(w http.ResponseWriter, r *http.Request) (
 // canAdministerChannel is the gate for changing a channel or its roster: the
 // channel's own admins, or an admin of the owning workspace.
 func (h *Handler) canAdministerChannel(r *http.Request, ch *authz.ChannelInfo, userID string) (bool, error) {
-	ok, err := h.az.IsChannelAdmin(r.Context(), ch.ID, userID)
+	subject := authz.UserSubject(userID)
+	ok, err := h.az.Can(r.Context(), subject, authz.ChannelObject(ch.ID), authz.CapAdmin)
 	if err != nil || ok {
 		return ok, err
 	}
-	return h.az.IsWorkspaceAdmin(r.Context(), ch.WorkspaceID, userID)
+	return h.az.Can(r.Context(), subject, authz.WorkspaceObject(ch.WorkspaceID), authz.CapAdmin)
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +230,8 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	readable, err := h.az.CanReadChannel(r.Context(), info, authctx.UserID(r.Context()))
+	readable, err := h.az.Can(r.Context(), authz.UserSubject(authctx.UserID(r.Context())),
+		authz.ChannelObject(info.ID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -466,7 +474,8 @@ func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	readable, err := h.az.CanReadChannel(r.Context(), info, authctx.UserID(r.Context()))
+	readable, err := h.az.Can(r.Context(), authz.UserSubject(authctx.UserID(r.Context())),
+		authz.ChannelObject(info.ID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -537,7 +546,8 @@ func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A channel never grants access broader than its workspace.
-	target, err := h.az.IsWorkspaceMember(r.Context(), info.WorkspaceID, input.UserID)
+	target, err := h.az.Can(r.Context(), authz.UserSubject(input.UserID),
+		authz.WorkspaceObject(info.WorkspaceID), authz.CapRead)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -770,8 +780,15 @@ func (h *Handler) CreateDM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One pair of checks per participant. This is not the N+1 the object model
+	// exists to prevent: the list is the caller's own request body, bounded by
+	// the number of people they named, and neither question ("is this user in
+	// this workspace", "have these two blocked each other") is a readability
+	// filter over rows the server chose. The N+1 rule is about list and search
+	// endpoints, where N is the size of a page the caller does not control —
+	// those resolve keys once and call FilterReadable.
 	for _, uid := range others {
-		member, err := h.az.IsWorkspaceMember(r.Context(), wsID, uid)
+		member, err := h.az.Can(r.Context(), authz.UserSubject(uid), authz.WorkspaceObject(wsID), authz.CapRead)
 		if err != nil {
 			httputil.HandleError(w, httputil.NewInternal(err))
 			return

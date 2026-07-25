@@ -3,34 +3,36 @@ package authz
 // The object-level permission checker — docs/plans/00-permissions.md.
 //
 // This file is the general case: subject, object, ordered capability, explicit
-// grant, materialized path. The fifteen methods in authz.go are the special
-// case that currently protects the messaging product, and they are untouched by
-// design: nothing here is on a request path yet. Step 4 of the plan's migration
-// section converts handlers package by package, once the dual-run comparison in
-// compare.go has been silent.
+// grant, materialized path. Every authorization decision in the product goes
+// through Can — the membership methods it replaced were deleted in step 5 of
+// the plan's migration section, once nothing called them and the suite was
+// green with the dual-run comparison on.
 //
-// Two invariants are worth stating before the code:
+// Three invariants are worth stating before the code:
 //
-//   - Legacy tables stay AUTHORITATIVE for workspaces, channels and files until
-//     the cutover. Capability therefore computes their derived layer from
-//     workspace_members / channel_members / channels.type / files.message_id
-//     directly, not from acl_object — so it is correct for a channel created one
-//     second ago, which the materialization cannot be until a handler registers
-//     it. acl_object and acl_key hold the same answer, materialized, and the
-//     worker's drift verifier is what proves the two agree on real data before
-//     anything switches over.
+//   - The pre-ACL tables stay AUTHORITATIVE for workspaces, channels and files.
+//     Capability computes their layer from workspace_members / channel_members /
+//     channels.type / files.message_id directly, NOT from acl_object — so it is
+//     correct for a channel created one second ago, and so a missing
+//     materialization row can never widen an answer. acl_object and acl_key hold
+//     the same answer, materialized, for the list path; the worker's job
+//     reconciles and then verifies them.
 //
 //   - N+1 is the failure mode this design exists to prevent. Can answers about
 //     ONE object and costs two to three queries; a list endpoint that calls it
 //     per row is wrong. The list path is KeysFor once per request followed by
 //     FilterReadable (or a `key = ANY($keys)` join) over the whole page.
+//
+//   - A revocation is not finished when the row is deleted. Grants are what
+//     handlers enforce now, so Revoke and Move drive the Revoker over every
+//     object in the subtree that somebody may hold an open connection to.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -73,14 +75,17 @@ func (c *Checker) resolve(ctx context.Context, obj ObjectRef) (*objectState, err
 	st := &objectState{ref: obj}
 	switch obj.Type {
 	case TypeWorkspace:
-		err := c.pool.QueryRow(ctx, `SELECT id::text FROM workspaces WHERE id = $1`, obj.ID).
-			Scan(&st.workspaceID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, fmt.Errorf("resolve workspace object: %w", err)
-		}
+		// No existence probe. A workspace is its own root, so its id, its
+		// workspace id and its path are the same fact and none of them needs a
+		// query — and the two things that consume this state already answer
+		// "no" for a workspace that does not exist: WorkspaceRole finds no
+		// membership row, and acl_grant has a foreign key to acl_object, which
+		// has one to workspaces, so a grant on a deleted workspace cannot exist.
+		//
+		// This is the hottest authorization path in the product — nearly every
+		// endpoint starts with "is the caller in this workspace" — and the probe
+		// was a round-trip that could not change an answer.
+		st.workspaceID = obj.ID
 		st.path = "/" + pathSegment(obj) + "/"
 		return st, nil
 
@@ -202,6 +207,10 @@ func (c *Checker) Capability(ctx context.Context, subject SubjectRef, obj Object
 
 // Can is Capability plus a comparison. It exists so call sites read as the
 // question they are asking.
+//
+// This is the method handlers call. err != nil is a 500 and !ok is a 403/404,
+// never collapsed: a database fault that read as a denial would be an
+// authorization decision made by an outage.
 //
 // Do not call it in a loop. Filtering a page of rows is KeysFor once, then
 // FilterReadable — see the note at the top of this file.
@@ -393,12 +402,39 @@ func ancestorPaths(path string) []string {
 // results" rather than as "no filter".
 //
 // The channel arm is answered from channel_members/channels — the tables that
-// are still authoritative — and NOT from acl_key. That is deliberate: until a
-// handler registers a channel at creation time (step 4 of the plan), acl_key is
-// only as fresh as the last Rebuild, and a stale key here would WIDEN the
-// caller's key set. The acl_key arm is restricted to container types the ACL
-// layer owns outright, where the materialization is rewritten in the same
-// transaction as the grant that changed it.
+// are authoritative for channels — and NOT from acl_key. That survived step 4
+// on purpose, and the reasoning is worth stating because it is the one place
+// the cutover deliberately did not go all the way.
+//
+// A key set is a NARROWING term. Every consumer builds a filter from it, so a
+// key that should be there and is not costs somebody a search result, while a
+// key that is there and should not be is a cross-tenant read. The two failures
+// are not symmetric, and staleness produces the second one: a caller removed
+// from a private channel keeps its c- key until the materialization catches up.
+//
+// acl_key's derived half (workspaces, channels, files) is maintained by the
+// worker's hourly reconcile, not by the write that changed it — no handler
+// writes an acl_object row when a channel is created or a member joins, because
+// those rows are computed from acl_object_expected and a hand-placed one would
+// be reverted by the next reconcile. An hour of staleness on a narrowing filter
+// is not a trade worth making to save one indexed query.
+//
+// Flipping this arm needs the derived materialization to be transactional with
+// the thing it is derived from — a trigger on channels/channel_members/files,
+// or a hook on every one of the eight write paths that touch them — which is a
+// change with its own failure mode (a missed hook is a channel that is
+// invisible or unguarded depending on which arm reads it) and belongs in its
+// own commit with its own migration. Until then the acl_key arm stays
+// restricted to container types the ACL layer owns outright, where the
+// materialization is rewritten in the same transaction as the grant that
+// changed it.
+//
+// Nothing else in the cutover depends on that decision: no authorization
+// decision about a workspace, channel or file reads acl_object or acl_key at
+// all. Capability resolves those three types from the legacy tables directly
+// (see resolve and derivedCapability), so an object created one second ago is
+// authorized correctly with no row of its own — which is exactly why a missing
+// row cannot widen anything.
 func (c *Checker) KeysFor(ctx context.Context, subject SubjectRef, workspaceID string) ([]string, error) {
 	sub, ok, err := subject.normalize()
 	if err != nil {
@@ -492,9 +528,12 @@ func (c *Checker) nativeContainerKeys(ctx context.Context, workspaceID string, i
 // and it reads as correct, which is why the batch call is the one with the
 // convenient signature.
 //
-// It answers from acl_key, so it is only meaningful for object types the ACL
-// layer owns. For channels and files, ask the authoritative predicate
-// (ReadableChannelIDs, CanReadChannel) until the cutover.
+// It answers from acl_key, so it is only meaningful for the object types the
+// ACL layer owns outright — the ones whose keys are rewritten in the same
+// transaction as the grant that changed them. For a channel or a file, whose
+// materialization is reconciled hourly rather than transactionally, ask Can (one
+// object) or KeysFor (a whole workspace's worth); see the note on KeysFor for
+// why a stale key here would widen rather than narrow.
 func (c *Checker) FilterReadable(ctx context.Context, keys []string, objectType string, ids []string) ([]string, error) {
 	if err := validObjectType(objectType); err != nil {
 		return nil, err
@@ -658,6 +697,97 @@ func scanGrants(rows pgx.Rows, fill func(*Grant)) ([]Grant, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Revocation latency
+// ---------------------------------------------------------------------------
+
+// Revoker is the live half of a revocation.
+//
+// Deleting an acl_grant row and rewriting acl_key settles every FUTURE request.
+// It settles nothing about a WebSocket subscription or an editing session that
+// was authorized before the revocation and whose delivery is gated on an
+// in-memory map written at subscribe time — plan 00's "revocation latency"
+// risk. Until the cutover that gap was theoretical for grants, because no
+// handler consulted a grant; now that Can is what handlers enforce, a grant is
+// access and withdrawing one has to reach the sockets.
+//
+// It is deliberately expressed in (subject, object) terms rather than in
+// channel ids: internal/authz must not know that a channel is a hub
+// subscription and a document is a room. The composition root maps object types
+// onto ws.Hub.RevokeChannelSubscription / collab.Service.RevokeAccess.
+//
+// Both methods are best effort and are called AFTER the transaction commits.
+// The rows are already gone by then, so a hub that cannot be reached must never
+// turn a successful revocation into a failed request — and calling before the
+// commit would revoke access that a rollback then restores.
+type Revoker interface {
+	// RevokeObjectForSubject cuts one subject out of one object.
+	RevokeObjectForSubject(subject SubjectRef, obj ObjectRef)
+	// RevokeObjectForAll cuts everyone out, for a change that alters what the
+	// whole object inherits.
+	RevokeObjectForAll(obj ObjectRef)
+}
+
+// maxLiveRevocations bounds how many objects one mutation will walk. A grant on
+// a workspace-level container can reach every channel in the tenant, and a
+// revocation must not turn into an unbounded fan-out inside a request. Past the
+// cap the socket's own periodic membership recheck is what closes the gap, so
+// the failure mode is latency rather than leaked access — but it is logged,
+// because minutes of retained access is worth knowing about.
+const maxLiveRevocations = 512
+
+// liveDescendants lists the objects in a subtree that a subject can hold an
+// open connection to. It runs inside the mutation's transaction so it sees the
+// paths the mutation just wrote.
+func liveDescendants(ctx context.Context, tx pgx.Tx, prefix string) ([]ObjectRef, bool, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT object_type, object_id::text
+		  FROM acl_object
+		 WHERE path LIKE $1 || '%' AND object_type = ANY($2)
+		 ORDER BY path
+		 LIMIT $3`, prefix, liveTypes, maxLiveRevocations+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("list live descendants: %w", err)
+	}
+	defer rows.Close()
+
+	out := []ObjectRef{}
+	for rows.Next() {
+		var ref ObjectRef
+		if err := rows.Scan(&ref.Type, &ref.ID); err != nil {
+			return nil, false, fmt.Errorf("scan live descendant: %w", err)
+		}
+		out = append(out, ref)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("list live descendants: %w", err)
+	}
+	if len(out) > maxLiveRevocations {
+		return out[:maxLiveRevocations], true, nil
+	}
+	return out, false, nil
+}
+
+// revokeLive drives the Revoker over a set of objects. subject is nil for a
+// revocation that affects everybody.
+func (c *Checker) revokeLive(subject *SubjectRef, refs []ObjectRef, truncated bool, cause string) {
+	if c.revoker == nil || len(refs) == 0 {
+		return
+	}
+	if truncated {
+		slog.Default().Warn("authz: live revocation fan-out truncated; "+
+			"connections beyond the cap keep access until their periodic recheck",
+			"cause", cause, "limit", maxLiveRevocations)
+	}
+	for _, ref := range refs {
+		if subject == nil {
+			c.revoker.RevokeObjectForAll(ref)
+			continue
+		}
+		c.revoker.RevokeObjectForSubject(*subject, ref)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Mutation — every one of these rewrites acl_key in the same transaction
 // ---------------------------------------------------------------------------
 //
@@ -786,6 +916,10 @@ func (c *Checker) Grant(ctx context.Context, actor, subject SubjectRef, obj Obje
 // It removes the grant only. Capability implied by workspace or channel
 // membership is not a grant and is not revocable here — removing someone from a
 // channel is still channel.Repository's job.
+//
+// After the transaction commits it drives the Revoker over every live object in
+// the subtree, so a subscription authorized before the revocation stops
+// delivering rather than surviving until its periodic recheck.
 func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj ObjectRef) error {
 	_ = actor // revocation records no attribution today; the row is deleted, not tombstoned
 
@@ -804,7 +938,9 @@ func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj Obj
 		return fmt.Errorf("revoke from %s: invalid object id", sub)
 	}
 
-	return database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+	var live []ObjectRef
+	var truncated bool
+	if err := database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
 		st, err := lockObject(ctx, tx, ref)
 		if err != nil {
 			return err
@@ -819,8 +955,17 @@ func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj Obj
 			ref.Type, ref.ID, sub.Type, sub.ID); err != nil {
 			return fmt.Errorf("delete grant: %w", err)
 		}
-		return rewriteSubtreeKeys(ctx, tx, st.path)
-	})
+		if err := rewriteSubtreeKeys(ctx, tx, st.path); err != nil {
+			return err
+		}
+		live, truncated, err = liveDescendants(ctx, tx, st.path)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	c.revokeLive(&sub, live, truncated, "revoke "+sub.String()+" on "+ref.String())
+	return nil
 }
 
 // Move reparents an object and its whole subtree. The path rewrite is a single
@@ -833,10 +978,12 @@ func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj Obj
 // tenancy), a move into the object's own subtree (a cycle), and a move that
 // would push any descendant past MaxPathDepth.
 //
-// Note the revocation-latency gap named in the plan: a WebSocket subscription
-// authorized at subscribe time outlives the grant a move takes away. Wiring
-// ws.Hub's RevokeChannelSubscription to this is part of the cutover, not of
-// this pass.
+// A move changes what the whole subtree inherits, in both directions and for
+// every subject at once — there is no "who lost access" to compute, only "what
+// everybody inherits is now different". So it drives the Revoker for ALL rather
+// than for a subject: every live session in the moved subtree is dropped and
+// re-authorizes against the new position. That is the plan's revocation-latency
+// risk, closed.
 func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent ObjectRef) error {
 	_ = actor // the move itself is not attributed; internal/audit records the action
 
@@ -861,7 +1008,9 @@ func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent Obj
 		return fmt.Errorf("move %s: an object cannot be its own parent", ref)
 	}
 
-	return database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+	var live []ObjectRef
+	var truncated bool
+	if err := database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
 		// Lock in a stable order so two concurrent moves cannot deadlock on
 		// each other's rows.
 		first, second := ref, parentRef
@@ -913,8 +1062,17 @@ func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent Obj
 			src.path, newPath, len(src.path)+1); err != nil {
 			return fmt.Errorf("move subtree: %w", err)
 		}
-		return rewriteSubtreeKeys(ctx, tx, newPath)
-	})
+		if err := rewriteSubtreeKeys(ctx, tx, newPath); err != nil {
+			return err
+		}
+		live, truncated, err = liveDescendants(ctx, tx, newPath)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	c.revokeLive(nil, live, truncated, "move "+ref.String()+" under "+parentRef.String())
+	return nil
 }
 
 // lockObject reads an acl_object row FOR UPDATE, returning (nil, nil) when it
@@ -984,13 +1142,4 @@ func dedupeSorted(in []string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// summarize renders a bounded, single-line list for a log field. A mismatch
-// report that dumps ten thousand ids is a report nobody reads.
-func summarize(items []string, max int) string {
-	if len(items) <= max {
-		return strings.Join(items, ",")
-	}
-	return strings.Join(items[:max], ",") + fmt.Sprintf(",...(%d more)", len(items)-max)
 }

@@ -233,7 +233,8 @@ func writeLoginResult(w http.ResponseWriter, result *LoginResult) {
 // happens to be in the workspace.
 func (h *Handler) requireAdmin(w http.ResponseWriter, r *http.Request) (string, bool) {
 	workspaceID := r.PathValue("workspace_id")
-	ok, err := h.az.IsWorkspaceAdmin(r.Context(), workspaceID, authctx.UserID(r.Context()))
+	ok, err := h.az.Can(r.Context(), authz.UserSubject(authctx.UserID(r.Context())),
+		authz.WorkspaceObject(workspaceID), authz.CapAdmin)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return "", false

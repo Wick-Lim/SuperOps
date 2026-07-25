@@ -74,7 +74,7 @@ func seedWorld(t *testing.T) world {
 	      VALUES ($1::uuid,$2,'general',$1::text,'public',$3), ($4::uuid,$2,'secret',$4::text,'private',$3)`,
 		w.pub, w.ws, w.insider, w.priv)
 	// Only the insider is in the private channel; nobody has to join a public
-	// one to read it, which is exactly what ReadableChannelIDs encodes.
+	// one to read it, which is exactly what the c- key encodes.
 	exec(`INSERT INTO channel_members (channel_id, user_id, role) VALUES ($1,$2,'admin')`, w.priv, w.insider)
 
 	// The documents. They are written the way the worker's indexer writes them,
