@@ -161,6 +161,9 @@ export default function DriveFileScreen({ navigation, route }: { navigation: any
                     documentId: descriptor.collab_document_id,
                     fileId: descriptor.id,
                     name: descriptor.name,
+                    // The surface is chosen from the registry type, never from
+                    // a MIME type — the same dispatch the server makes.
+                    fileType: descriptor.file_type,
                   })
                 }
                 disabled={!descriptor.collab_document_id}

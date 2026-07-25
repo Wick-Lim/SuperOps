@@ -9,6 +9,12 @@ import { CollabProvider, type ProviderStatus } from '../lib/collab/provider'
 import { useAuthStore } from '../stores/authStore'
 import { ErrorState, LoadingState, ScreenHeader } from './internal/ui'
 import Editor from '../editor/Editor'
+import Grid from '../sheet/Grid'
+import Canvas from '../design/Canvas'
+import { SheetModel } from '../lib/sheet/model'
+import { extractSheet } from '../lib/sheet/projection'
+import { DesignModel } from '../lib/design/model'
+import { extractDesign } from '../lib/design/projection'
 import type { Projection } from '../editor/projection'
 
 /**
@@ -26,6 +32,16 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   const documentId: string | undefined = route.params?.documentId
   const fileId: string | undefined = route.params?.fileId
   const name: string = route.params?.name ?? 'Document'
+  /**
+   * Which surface to render.
+   *
+   * THE CLIENT DISPATCHES ON file_type, exactly as the server registry does.
+   * Adding a fourth editor is one entry below and one extractor — the room, the
+   * provider, the projection, the revocation handling and this screen are all
+   * shared. A screen per editor would have been three copies of everything
+   * above the surface component.
+   */
+  const fileType: string = route.params?.fileType ?? 'document'
 
   const user = useAuthStore((s) => s.user)
   const [status, setStatus] = useState<ProviderStatus>('connecting')
@@ -96,6 +112,37 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
     [fileId],
   )
 
+  // The grid and the canvas read plain snapshots of the CRDT, so they need a
+  // signal that it changed. The block editor does not — y-prosemirror binds to
+  // the document directly — which is why this subscription is here rather than
+  // in the provider.
+  const [revision, setRevision] = useState(0)
+  useEffect(() => {
+    if (fileType === 'document') return
+    const bump = () => setRevision((r) => r + 1)
+    doc.on('update', bump)
+    return () => doc.off('update', bump)
+  }, [doc, fileType])
+
+  const sheet = useMemo(() => new SheetModel(doc), [doc])
+  const design = useMemo(() => new DesignModel(doc), [doc])
+
+  // Publishing is debounced by the same reasoning as the editor's: short enough
+  // that closing a tab leaves the object searchable, long enough that typing is
+  // one projection rather than forty. The server's monotonic write makes a
+  // burst harmless regardless.
+  const projectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const scheduleProjection = useCallback(() => {
+    if (projectTimer.current) clearTimeout(projectTimer.current)
+    projectTimer.current = setTimeout(() => {
+      publish(fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq))
+    }, 2000)
+  }, [publish, fileType, sheet, design, seq])
+
+  useEffect(() => () => {
+    if (projectTimer.current) clearTimeout(projectTimer.current)
+  }, [])
+
   if (!documentId) {
     return (
       <SafeAreaView style={styles.screen}>
@@ -132,14 +179,30 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
               <Text style={styles.noticeText}>You have read access to this document.</Text>
             </View>
           )}
-          <Editor
-            doc={doc}
-            awareness={providerRef.current!.awareness}
-            editable={status === 'synced'}
-            user={{ name: identity.name, color: identity.color }}
-            onProject={publish}
-            seq={seq}
-          />
+          {fileType === 'spreadsheet' ? (
+            <Grid
+              model={sheet}
+              editable={status === 'synced'}
+              revision={revision}
+              onEdit={scheduleProjection}
+            />
+          ) : fileType === 'design' ? (
+            <Canvas
+              model={design}
+              editable={status === 'synced'}
+              revision={revision}
+              onEdit={scheduleProjection}
+            />
+          ) : (
+            <Editor
+              doc={doc}
+              awareness={providerRef.current!.awareness}
+              editable={status === 'synced'}
+              user={{ name: identity.name, color: identity.color }}
+              onProject={publish}
+              seq={seq}
+            />
+          )}
         </View>
       )}
     </SafeAreaView>

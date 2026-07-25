@@ -71,7 +71,7 @@ export type RootStackParamList = {
    * The protocol addresses rooms by collab_documents.id, and conflating the two
    * is the obvious first bug of this phase. `fileId` is carried alongside
    * because the projection is posted against the Drive object. */
-  CollabDocument: { documentId: string; fileId: string; name?: string }
+  CollabDocument: { documentId: string; fileId: string; name?: string; fileType?: string }
   /** Internal: shown while the post-login workspace lookup is in flight. */
   Bootstrap: undefined
 }
