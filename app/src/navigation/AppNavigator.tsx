@@ -23,6 +23,10 @@ import NotificationsScreen from '../screens/NotificationsScreen'
 import NewChannelScreen from '../screens/NewChannelScreen'
 import NewDMScreen from '../screens/NewDMScreen'
 import MembersScreen from '../screens/MembersScreen'
+import DriveScreen from '../screens/DriveScreen'
+import DriveFileScreen from '../screens/DriveFileScreen'
+import DriveTrashScreen from '../screens/DriveTrashScreen'
+import DriveShareScreen from '../screens/DriveShareScreen'
 import SettingsScreen from '../screens/SettingsScreen'
 import AdminScreen from '../screens/AdminScreen'
 import ChannelDetailScreen from '../screens/ChannelDetailScreen'
@@ -47,6 +51,14 @@ export type RootStackParamList = {
   Pins: { channelId: string }
   Scheduled: { channelId: string }
   Bookmarks: undefined
+  /** Drive. The browser navigates within itself by loading a folder rather than
+   * by pushing a route, so there is no folderId here: a deep stack of folders
+   * would make "back" mean "up one folder" in a way the breadcrumb already
+   * does better. */
+  Drive: undefined
+  DriveFile: { fileId: string }
+  DriveTrash: undefined
+  DriveShare: { objectType: 'folder' | 'file'; objectId: string; name?: string }
   /** Internal: shown while the post-login workspace lookup is in flight. */
   Bootstrap: undefined
 }
@@ -299,6 +311,10 @@ export default function AppNavigator() {
       <Stack.Screen name="Pins" component={PinnedMessagesScreen} />
       <Stack.Screen name="Scheduled" component={ScheduledMessagesScreen} />
       <Stack.Screen name="Bookmarks" component={BookmarksScreen} />
+      <Stack.Screen name="Drive" component={DriveScreen} />
+      <Stack.Screen name="DriveFile" component={DriveFileScreen} />
+      <Stack.Screen name="DriveTrash" component={DriveTrashScreen} />
+      <Stack.Screen name="DriveShare" component={DriveShareScreen} />
       <Stack.Screen name="Settings" component={SettingsScreen} />
       <Stack.Screen name="Admin" component={AdminScreen} />
     </>

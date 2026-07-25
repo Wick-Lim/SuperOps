@@ -330,6 +330,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
 
         {/* Saved items / admin */}
         <Section title="Your stuff">
+          <NavRow label="Drive" onPress={() => navigation.navigate('Drive')} />
           <NavRow label="Bookmarks" onPress={() => navigation.navigate('Bookmarks')} />
           {isWorkspaceAdmin ? (
             <NavRow
