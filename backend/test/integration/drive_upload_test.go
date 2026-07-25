@@ -4,12 +4,67 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
+
+	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 )
+
+// indexDriveFile runs the WORKER's indexer against one file, so the test covers
+// the real event decode, the real ACL read and the real document shape rather
+// than a second copy of them.
+func (h *harness) indexDriveFile(t *testing.T, workspaceID, fileID string) {
+	t.Helper()
+	if h.search == nil {
+		t.Fatal("indexDriveFile called with search disabled")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var (
+		name, userID string
+		folderID     *string
+		createdAt    time.Time
+	)
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT name, user_id::text, folder_id::text, created_at FROM files WHERE id = $1`,
+		fileID).Scan(&name, &userID, &folderID, &createdAt); err != nil {
+		t.Fatalf("read file fixture: %v", err)
+	}
+
+	indexer := search.NewIndexer(h.search, h.app.Authz, slog.Default())
+	event := map[string]any{
+		"id": fileID, "user_id": userID, "name": name,
+		"created_at": createdAt.UTC().Format(time.RFC3339Nano),
+	}
+	if folderID != nil {
+		event["folder_id"] = *folderID
+	}
+	data, err := json.Marshal(map[string]any{"type": "file.uploaded", "data": event})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := indexer.HandleFile(ctx, &nats.Msg{
+		Subject: "superops." + workspaceID + ".file.uploaded",
+		Data:    data,
+	}); err != nil {
+		t.Fatalf("index drive file: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer ccancel()
+		_ = h.search.DeleteAwait(cctx, search.TypeFile, fileID)
+	})
+}
 
 // uploadToDrive posts a multipart file into a Drive folder and returns the
 // status and the decoded envelope.
@@ -242,5 +297,70 @@ func TestDriveUploadRejectsAnOversizeBody(t *testing.T) {
 	decodeInto(t, resp.Data, &file)
 	if file.ID == "" {
 		t.Error("no file id returned")
+	}
+}
+
+// Search must find a Drive file, and must NOT find another tenant's.
+//
+// Two things had to be true for this to work at all and neither was:
+// search.Indexer.HandleFile existed since the search feature shipped and was
+// never bound to a durable — so uploading a file put nothing in the index —
+// and FileDoc derived its ACL as "the channel key, else the uploader key",
+// which for a Drive file is neither.
+func TestDriveFilesAreSearchableAndTenantScoped(t *testing.T) {
+	h := getHarness(t)
+	h.requireSearch(t)
+
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	root := h.driveRoot(t, admin, ws)
+
+	name := fmt.Sprintf("quarterly-forecast-%d.txt", time.Now().UnixNano())
+	code, resp := h.uploadToDrive(t, admin, ws, root.ID, name, []byte("revenue numbers"))
+	if code != http.StatusCreated {
+		t.Fatalf("upload = %d (%+v)", code, resp.Error)
+	}
+	var file driveDescriptor
+	decodeInto(t, resp.Data, &file)
+
+	// No worker runs in this suite, so the file event is delivered to the real
+	// indexer by hand. That exercises everything except bindDurable — the event
+	// decode, the ACL read and the document shape — and the durable binding
+	// itself is proven by the worker booting.
+	h.indexDriveFile(t, ws, file.ID)
+
+	// It is findable at all.
+	found := false
+	for _, id := range h.searchHits(t, admin, ws, "quarterly-forecast") {
+		if id == file.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("an uploaded Drive file is not in the index after the indexer ran")
+	}
+
+	// A member of the workspace finds it — Drive is workspace-shared, so the
+	// document's keys have to include the workspace key rather than only the
+	// uploader's.
+	member := h.newUser(t, admin, ws, "search-member")
+	memberFound := false
+	for _, id := range h.searchHits(t, member.token, ws, "quarterly-forecast") {
+		if id == file.ID {
+			memberFound = true
+		}
+	}
+	if !memberFound {
+		t.Error("a workspace member cannot find a Drive file the workspace is shared with; " +
+			"the indexed ACL disagrees with what Can() answers")
+	}
+
+	// And another tenant finds nothing. A key that fails the validator is
+	// DROPPED from the filter, and a dropped narrowing term widens the query.
+	other := h.newTenant(t, "search-outsider")
+	for _, id := range h.searchHits(t, other.token, other.workspaceID, "quarterly-forecast") {
+		if id == file.ID {
+			t.Fatal("another tenant found the file through search")
+		}
 	}
 }

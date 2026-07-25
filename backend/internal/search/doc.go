@@ -193,6 +193,11 @@ type Doc struct {
 	// field; overloading this one would make a folder id look like a channel id
 	// to every filter that already exists.
 	ChannelID string `json:"channel_id"`
+	// FolderID is the Drive folder an object lives in, empty for everything that
+	// is not in Drive. Its own field rather than an overload of ChannelID, for
+	// the reason the comment above already gives: a folder id in the channel
+	// field would look like a channel id to every filter that already exists.
+	FolderID string `json:"folder_id"`
 	// UserID is the author or owner: the message sender, the file uploader, the
 	// document creator. It backs the `from` filter.
 	UserID string `json:"user_id"`
@@ -328,24 +333,49 @@ type FileDoc struct {
 	ID          string `json:"id"`
 	WorkspaceID string `json:"workspace_id"`
 	ChannelID   string `json:"channel_id"`
-	UserID      string `json:"user_id"`
-	Name        string `json:"name"`
-	CreatedAt   int64  `json:"created_at"`
-	IsDeleted   bool   `json:"is_deleted"`
+	// FolderID is set for a Drive file. It backs the "search inside this folder"
+	// narrowing and is not an access decision.
+	FolderID string `json:"folder_id"`
+	UserID   string `json:"user_id"`
+	Name     string `json:"name"`
+	// ACL is the object's acl_key rows, verbatim.
+	//
+	// It exists because the derivation below cannot express Drive. A Drive file
+	// is readable through its folder, through the workspace grant on the Drive
+	// root, through a per-object grant, or through a channel it was shared into
+	// — and "channel key, else user key" collapses all of that to one key that
+	// is usually the wrong one. Reading the materialized rows means the index and
+	// the database answer the same question, which is the only way a search
+	// filter can be trusted as a tenancy boundary.
+	//
+	// Empty falls back to the derivation, so a message attachment indexed before
+	// acl_key existed for it still gets the answer file.Handler.canRead gives.
+	ACL       []string `json:"acl"`
+	CreatedAt int64    `json:"created_at"`
+	IsDeleted bool     `json:"is_deleted"`
 }
 
 // Doc renders a file as an indexable object. The filename is the title; the
 // body stays empty until something extracts text from the object itself.
 func (f FileDoc) Doc() Doc {
-	acl := keySet(ChannelKey(f.ChannelID))
+	acl := keySet(f.ACL...)
 	if len(acl) == 0 {
-		acl = keySet(UserKey(f.UserID))
+		// The pre-Drive derivation, kept as the fallback rather than deleted:
+		// it is exactly file.Handler.canRead, and a document whose materialized
+		// keys have not arrived yet must narrow to the uploader rather than
+		// widen to nothing. An empty ACL is a document validate rejects, which
+		// is the fail-closed end of this.
+		acl = keySet(ChannelKey(f.ChannelID))
+		if len(acl) == 0 {
+			acl = keySet(UserKey(f.UserID))
+		}
 	}
 	return Doc{
 		Type:        TypeFile,
 		ID:          f.ID,
 		WorkspaceID: f.WorkspaceID,
 		ChannelID:   f.ChannelID,
+		FolderID:    f.FolderID,
 		UserID:      f.UserID,
 		Title:       f.Name,
 		ACL:         acl,

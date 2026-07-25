@@ -321,7 +321,8 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		pool.Close()
 		return nil, fmt.Errorf("register drive kinds: %w", err)
 	}
-	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService)
+	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService,
+		drive.NewPublisher(natsClient, logger))
 	// Closes the cycle: the checker revokes document sessions through the
 	// service, and the service authorizes through the checker.
 	revoker.collab.Store(collabSvc)

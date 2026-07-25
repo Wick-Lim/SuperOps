@@ -35,10 +35,11 @@ type Handler struct {
 	storage storage.Backend
 	collab  CollabLookup
 	audit   *audit.Service
+	events  *Publisher
 }
 
 func NewHandler(pool *pgxpool.Pool, az *authz.Checker, kinds *registry.Registry,
-	store storage.Backend, collab CollabLookup, auditor *audit.Service) *Handler {
+	store storage.Backend, collab CollabLookup, auditor *audit.Service, events *Publisher) *Handler {
 	return &Handler{
 		repo:    NewRepository(pool, az, kinds),
 		authz:   az,
@@ -46,6 +47,7 @@ func NewHandler(pool *pgxpool.Pool, az *authz.Checker, kinds *registry.Registry,
 		storage: store,
 		collab:  collab,
 		audit:   auditor,
+		events:  events,
 	}
 }
 
@@ -419,6 +421,7 @@ func (h *Handler) CreateFile(w http.ResponseWriter, r *http.Request) {
 	}
 	h.record(r.Context(), workspaceID, "drive.file_created", "file", file.ID,
 		map[string]interface{}{"name": file.Name, "file_type": file.FileType, "folder_id": folderID})
+	h.events.PublishFile(r.Context(), ActionUploaded, file)
 
 	// The descriptor, not the row: the client's next action is to open it, and
 	// a create that answered with less would force an immediate second request.
@@ -569,6 +572,7 @@ func (h *Handler) RenameFile(w http.ResponseWriter, r *http.Request) {
 	}
 	h.record(r.Context(), file.WorkspaceID, "drive.file_renamed", "file", file.ID,
 		map[string]interface{}{"name": file.Name})
+	h.events.PublishFile(r.Context(), ActionUpdated, file)
 	httputil.JSON(w, http.StatusOK, file)
 }
 
@@ -602,6 +606,7 @@ func (h *Handler) MoveFile(w http.ResponseWriter, r *http.Request) {
 	}
 	h.record(r.Context(), file.WorkspaceID, "drive.file_moved", "file", file.ID,
 		map[string]interface{}{"folder_id": req.FolderID})
+	h.events.PublishFile(r.Context(), ActionUpdated, file)
 	httputil.JSON(w, http.StatusOK, file)
 }
 
@@ -628,6 +633,9 @@ func (h *Handler) TrashFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.record(r.Context(), file.WorkspaceID, "drive.file_trashed", "file", id, nil)
+	// Trashed, not purged — but it must leave the index now. A trashed file that
+	// stays searchable is the user finding what they just deleted.
+	h.events.PublishFile(r.Context(), ActionDeleted, file)
 	w.WriteHeader(http.StatusNoContent)
 }
 

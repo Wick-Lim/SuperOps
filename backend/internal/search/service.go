@@ -65,7 +65,12 @@ const (
 	taskAwaitTimeout = 10 * time.Second
 
 	// settingsTimeout bounds the whole startup reconciliation in NewService.
-	settingsTimeout = 30 * time.Second
+	// settingsTimeout bounds the whole startup reconciliation, INCLUDING the
+	// re-index Meilisearch performs when a filterable attribute is added. That
+	// re-index walks every document in the collection, so 30s was enough only
+	// while the settings never changed — the first deployment to add one would
+	// have had its API and its worker fail to boot.
+	settingsTimeout = 2 * time.Minute
 
 	// defaultLimit is the page size when a caller does not ask for one.
 	defaultLimit = 20
@@ -108,7 +113,7 @@ type Service struct {
 // Searchable order is ranking order: a hit on a title outranks a hit in a body.
 var (
 	wantSearchable = []string{"title", "content"}
-	wantFilterable = []string{"acl", "type", "channel_id", "workspace_id", "user_id", "created_at", "is_deleted"}
+	wantFilterable = []string{"acl", "type", "channel_id", "folder_id", "workspace_id", "user_id", "created_at", "is_deleted"}
 	wantSortable   = []string{"created_at"}
 )
 

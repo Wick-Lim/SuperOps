@@ -15,7 +15,7 @@ func testIndexer() *Indexer {
 	// payload alone, before anything reaches Meilisearch. A test that panics on a
 	// nil service is a test that found the handler talking to the index when it
 	// should have rejected the event.
-	return NewIndexer(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewIndexer(nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func msg(subject, data string) *nats.Msg {

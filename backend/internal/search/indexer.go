@@ -31,19 +31,38 @@ type MessageEvent struct {
 type FileEvent struct {
 	ID        string `json:"id"`
 	ChannelID string `json:"channel_id"`
+	FolderID  string `json:"folder_id"`
 	UserID    string `json:"user_id"`
 	Name      string `json:"name"`
 	CreatedAt string `json:"created_at"`
 	IsDeleted bool   `json:"is_deleted"`
 }
 
-type Indexer struct {
-	service *Service
-	logger  *slog.Logger
+// ACLSource reads an object's materialized access keys.
+//
+// The indexer asks for them rather than deriving them, because the derivation
+// cannot express Drive: a file is readable through its folder, through the
+// workspace grant on the Drive root, through a per-object grant, or through a
+// channel it was shared into. Reading acl_key means the index and the database
+// answer the same question — and a search filter that disagrees with the
+// database is not a narrowing, it is a leak or a blank page.
+//
+// nil is allowed: the indexer then falls back to FileDoc's own derivation, which
+// is exactly file.Handler.canRead. A deployment with no ACL source indexes
+// message attachments correctly and Drive files narrowly, which is the safe end.
+type ACLSource interface {
+	KeysForObject(ctx context.Context, objectType, objectID string) ([]string, error)
 }
 
-func NewIndexer(service *Service, logger *slog.Logger) *Indexer {
-	return &Indexer{service: service, logger: logger}
+type Indexer struct {
+	service *Service
+	// acl reads the materialized keys for an object. Optional; see ACLSource.
+	acl    ACLSource
+	logger *slog.Logger
+}
+
+func NewIndexer(service *Service, acl ACLSource, logger *slog.Logger) *Indexer {
+	return &Indexer{service: service, acl: acl, logger: logger}
 }
 
 // HandleMessage indexes — or unindexes — the message an event describes.
@@ -149,12 +168,25 @@ func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
 		return err
 	}
 
+	// The materialized keys, not a second derivation of them. A failure here is
+	// returned rather than swallowed: indexing a document with the WRONG key set
+	// is worse than not indexing it, because the wrong set is usually wider.
+	var acl []string
+	if idx.acl != nil {
+		acl, err = idx.acl.KeysForObject(ctx, "file", event.ID)
+		if err != nil {
+			return fmt.Errorf("read access keys for file %s: %w", event.ID, err)
+		}
+	}
+
 	doc := FileDoc{
 		ID:          event.ID,
 		WorkspaceID: workspaceID,
 		ChannelID:   event.ChannelID,
+		FolderID:    event.FolderID,
 		UserID:      event.UserID,
 		Name:        event.Name,
+		ACL:         acl,
 		CreatedAt:   createdAt.Unix(),
 	}.Doc()
 

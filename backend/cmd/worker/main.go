@@ -234,8 +234,15 @@ func run() int {
 		l.Info("search disabled by configuration")
 	}
 	if searchSvc != nil {
-		indexer := search.NewIndexer(searchSvc, l)
+		indexer := search.NewIndexer(searchSvc, az, l)
 		bind(durableSpec{durable: "indexer", filter: "superops.*.message.*", handle: indexer.HandleMessage})
+		// Files were never indexed. search.Indexer has had HandleFile since the
+		// search feature shipped and nothing ever bound it, so uploading a file
+		// put nothing in the index — the handler existed, the events existed, and
+		// the two were never introduced. Its own durable rather than a widened
+		// message filter: a poisonous file event must not stall message
+		// indexing, and the two have independent redelivery budgets.
+		bind(durableSpec{durable: "file-indexer", filter: "superops.*.file.*", handle: indexer.HandleFile})
 	}
 
 	// Push rides the notification fan-out: the same events, the same audience

@@ -1414,3 +1414,41 @@ func dedupeSorted(in []string) []string {
 	sort.Strings(out)
 	return out
 }
+
+// KeysForObject returns the access keys materialized for one object.
+//
+// It is the read side of acl_key, and it exists for the search indexer: a
+// document's ACL has to be the keys the database actually holds, not a second
+// derivation of them. A derivation that disagrees with the table is either a
+// leak (wider) or a blank page (narrower), and both look like the search being
+// broken rather than like an authorization bug.
+//
+// An object with no rows returns an empty slice, not an error. That is a real
+// state — an object whose materialization has not run — and the caller's
+// fail-closed answer is to index nothing rather than to index everything.
+func (c *Checker) KeysForObject(ctx context.Context, objectType, objectID string) ([]string, error) {
+	if err := validObjectType(objectType); err != nil {
+		return nil, err
+	}
+	id, ok := canonicalUUID(objectID)
+	if !ok {
+		return []string{}, nil
+	}
+	rows, err := c.pool.Query(ctx,
+		`SELECT key FROM acl_key WHERE object_type = $1 AND object_id = $2 ORDER BY key`,
+		objectType, id)
+	if err != nil {
+		return nil, fmt.Errorf("read access keys for %s:%s: %w", objectType, id, err)
+	}
+	defer rows.Close()
+
+	keys := []string{}
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("scan access key: %w", err)
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
