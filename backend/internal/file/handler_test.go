@@ -2,7 +2,6 @@ package file
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 )
 
@@ -77,39 +76,5 @@ func TestSniffContentTypeShortInput(t *testing.T) {
 	}
 	if got != "text/plain" {
 		t.Fatalf("sniffed %q, want text/plain", got)
-	}
-}
-
-func TestSanitizeFileName(t *testing.T) {
-	tests := map[string]string{
-		"report.pdf":               "report.pdf",
-		"../../etc/passwd":         "passwd",
-		`..\..\windows\system.ini`: "system.ini",
-		"a\r\nb.txt":               "ab.txt",
-		"":                         "file",
-		"..":                       "file",
-		"보고서.pdf":                  "보고서.pdf",
-	}
-	for in, want := range tests {
-		if got := sanitizeFileName(in); got != want {
-			t.Errorf("sanitizeFileName(%q) = %q, want %q", in, got, want)
-		}
-	}
-	if got := sanitizeFileName(strings.Repeat("a", 400)); len(got) != maxFileNameLen {
-		t.Errorf("long name not capped: len = %d", len(got))
-	}
-}
-
-func TestContentDispositionEscapes(t *testing.T) {
-	got := contentDisposition(`evil"; filename="x.html`, false)
-	if !strings.HasPrefix(got, "attachment;") {
-		t.Fatalf("disposition %q is not an attachment", got)
-	}
-	// A raw unescaped quote would let the value break out of the header.
-	if strings.Count(got, `"`)%2 != 0 {
-		t.Fatalf("unbalanced quoting in %q", got)
-	}
-	if inline := contentDisposition("a.png", true); !strings.HasPrefix(inline, "inline;") {
-		t.Fatalf("inline disposition = %q", inline)
 	}
 }

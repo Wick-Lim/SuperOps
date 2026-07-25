@@ -192,13 +192,16 @@ ALTER TABLE acl_grant
     ADD  CONSTRAINT acl_grant_subject_type_valid
          CHECK (subject_type IN ('user', 'group', 'workspace'));
 
--- Write is what a member gets: Drive is a shared drive, not a read-only one.
--- A guest gets read, because grantedCapability caps a workspace grant at what
--- the recipient's ROLE in that workspace is worth — a grant addressed to
--- "everyone here" must not promote anybody past their own role, and a guest is
--- in the workspace.
+-- ADMIN, and it is less alarming than it reads: grantedCapability caps a
+-- workspace grant at what the recipient's ROLE in that workspace is worth, so
+-- this resolves to admin for an owner or admin, write for a member and read for
+-- a guest — exactly the role ladder, with nobody promoted past their own role.
+--
+-- Granting `write` instead would flatten everyone at write, and then nobody
+-- could ever share a Drive folder outside the workspace, because `share` sits
+-- above `write` on the ladder and no path would reach it.
 INSERT INTO acl_grant (object_type, object_id, subject_type, subject_id, capability)
-SELECT 'folder', df.id, 'workspace', df.workspace_id, 'write'
+SELECT 'folder', df.id, 'workspace', df.workspace_id, 'admin'
   FROM drive_folders df
  WHERE df.is_root
     ON CONFLICT DO NOTHING;

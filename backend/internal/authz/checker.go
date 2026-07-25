@@ -50,6 +50,19 @@ var ErrNotRegistered = errors.New("object is not registered in acl_object")
 // reverted by the next Rebuild and reported as drift in the meantime.
 var ErrDerivedType = errors.New("object type's hierarchy is derived from the legacy schema")
 
+// ErrMoveCycle and ErrMoveTooDeep are Move's two structural refusals. They are
+// sentinels rather than message text because a caller has to turn them into an
+// HTTP status, and matching on a sentence is a translation that stops working
+// silently the day somebody rewords it.
+var (
+	ErrMoveCycle   = errors.New("the destination is inside the object being moved")
+	ErrMoveTooDeep = errors.New("the subtree would exceed the maximum path depth")
+
+	// ErrCrossWorkspaceMove is a move between tenants. Never silently allowed:
+	// acl_object.workspace_id is authoritative for tenancy.
+	ErrCrossWorkspaceMove = errors.New("objects cannot move between workspaces")
+)
+
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
@@ -893,9 +906,77 @@ func (c *Checker) Register(ctx context.Context, obj, parent ObjectRef) error {
 	}
 
 	return database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+		return registerIn(ctx, tx, ref, parentRef)
+	})
+}
+
+// RegisterTx is Register inside the CALLER's transaction.
+//
+// Drive needs it: creating a folder writes the drive_folders row and this in one
+// commit. An acl_object row for a folder that was rolled back would be an
+// authorization decision about something that does not exist, and a folder with
+// no acl_object row is readable by nobody — both are worse than the write
+// failing.
+func (c *Checker) RegisterTx(ctx context.Context, tx pgx.Tx, obj, parent ObjectRef) error {
+	ref, parentRef, err := normalizeRegister(obj, parent)
+	if err != nil {
+		return err
+	}
+	return registerIn(ctx, tx, ref, parentRef)
+}
+
+// normalizeRegister is the validation both entry points share. Duplicating it
+// would mean one of them eventually accepting what the other refuses.
+func normalizeRegister(obj, parent ObjectRef) (ref, parentRef ObjectRef, err error) {
+	ref, ok, err := obj.normalize()
+	if err != nil {
+		return ref, parentRef, err
+	}
+	if !ok {
+		return ref, parentRef, fmt.Errorf("register %s: invalid object id", obj)
+	}
+	if derivedTypes[ref.Type] {
+		return ref, parentRef, fmt.Errorf("register %s: %w", ref, ErrDerivedType)
+	}
+	parentRef, ok, err = parent.normalize()
+	if err != nil {
+		return ref, parentRef, err
+	}
+	if !ok {
+		return ref, parentRef, fmt.Errorf("register %s: invalid parent id", obj)
+	}
+	if parentRef == ref {
+		return ref, parentRef, fmt.Errorf("register %s: an object cannot be its own parent", ref)
+	}
+	return ref, parentRef, nil
+}
+
+func registerIn(ctx context.Context, tx pgx.Tx, ref, parentRef ObjectRef) error {
+	{
 		parentState, err := lockObject(ctx, tx, parentRef)
 		if err != nil {
 			return err
+		}
+		if parentState == nil && derivedTypes[parentRef.Type] {
+			// The parent is a workspace, channel or file whose acl_object row
+			// has not been materialized yet.
+			//
+			// That is a NORMAL state, not corruption: derived rows come from
+			// acl_object_expected via Rebuild, which runs hourly, so a workspace
+			// created five minutes ago has no row. Failing here meant the first
+			// folder anybody created in a new workspace failed — and it would
+			// have started working on its own an hour later, which is the worst
+			// possible shape for a bug report.
+			//
+			// Materializing it from the view is not a second opinion: the view
+			// IS the definition, and Rebuild would write exactly this row.
+			if err := materializeDerived(ctx, tx, parentRef); err != nil {
+				return err
+			}
+			parentState, err = lockObject(ctx, tx, parentRef)
+			if err != nil {
+				return err
+			}
 		}
 		if parentState == nil {
 			return fmt.Errorf("register %s under %s: %w", ref, parentRef, ErrNotRegistered)
@@ -916,62 +997,20 @@ func (c *Checker) Register(ctx context.Context, obj, parent ObjectRef) error {
 			return fmt.Errorf("register object: %w", err)
 		}
 		return rewriteSubtreeKeys(ctx, tx, path)
-	})
+	}
 }
 
 // Grant records an explicit (subject, object, capability). One row per
 // (object, subject): granting again replaces the capability rather than adding
 // a second opinion about which one is current.
 func (c *Checker) Grant(ctx context.Context, actor, subject SubjectRef, obj ObjectRef, capability Capability) error {
-	sub, ok, err := subject.normalize()
+	sub, ref, stored, grantedBy, err := normalizeGrant(actor, subject, obj, capability)
 	if err != nil {
 		return err
-	}
-	if !ok {
-		return fmt.Errorf("grant on %s: invalid subject id", obj)
-	}
-	ref, ok, err := obj.normalize()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("grant to %s: invalid object id", sub)
-	}
-	stored, err := capability.storable()
-	if err != nil {
-		return fmt.Errorf("grant %s on %s: %w", sub, ref, err)
-	}
-
-	// granted_by is audit, not authorization: an unparseable or absent actor
-	// records NULL rather than refusing, because losing the audit trail is
-	// worse than losing the attribution.
-	var grantedBy *string
-	if actor.Type == SubjectUser {
-		if id, ok := canonicalUUID(actor.ID); ok {
-			grantedBy = &id
-		}
 	}
 
 	if err := database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
-		st, err := lockObject(ctx, tx, ref)
-		if err != nil {
-			return err
-		}
-		if st == nil {
-			return fmt.Errorf("grant %s on %s: %w", capability, ref, ErrNotRegistered)
-		}
-
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO acl_grant (object_type, object_id, subject_type, subject_id, capability, granted_by)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (object_type, object_id, subject_type, subject_id) DO UPDATE
-			   SET capability = EXCLUDED.capability,
-			       granted_by = EXCLUDED.granted_by,
-			       updated_at = NOW()`,
-			ref.Type, ref.ID, sub.Type, sub.ID, stored, grantedBy); err != nil {
-			return fmt.Errorf("write grant: %w", err)
-		}
-		return rewriteSubtreeKeys(ctx, tx, st.path)
+		return grantIn(ctx, tx, ref, sub, capability, stored, grantedBy)
 	}); err != nil {
 		return err
 	}
@@ -979,6 +1018,108 @@ func (c *Checker) Grant(ctx context.Context, actor, subject SubjectRef, obj Obje
 	c.audit(ctx, actor, "acl.granted", ref, &sub,
 		map[string]interface{}{"capability": string(capability)})
 	return nil
+}
+
+// GrantTx is Grant inside the CALLER's transaction.
+//
+// It exists for the one grant Drive writes as part of creating something: the
+// workspace grant on a new Drive root. That grant is what makes Drive visible
+// at all, so a root committed without it would be a Drive nobody could open —
+// and the repair is a manual SQL statement, because nothing would report it.
+//
+// It does NOT write the audit entry. The audit sink is asynchronous and its
+// entry would describe a grant a rollback might discard; the caller records the
+// action it is performing, which is "created a Drive", not "granted".
+func (c *Checker) GrantTx(ctx context.Context, tx pgx.Tx, actor, subject SubjectRef, obj ObjectRef, capability Capability) error {
+	sub, ref, stored, grantedBy, err := normalizeGrant(actor, subject, obj, capability)
+	if err != nil {
+		return err
+	}
+	return grantIn(ctx, tx, ref, sub, capability, stored, grantedBy)
+}
+
+// materializeDerived inserts one derived object's acl_object row from
+// acl_object_expected, and its keys from acl_key_expected.
+//
+// It is the single-object equivalent of Rebuild, written as a filter over the
+// same views so the two cannot disagree. Nothing here computes a path.
+func materializeDerived(ctx context.Context, tx pgx.Tx, ref ObjectRef) error {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO acl_object (object_type, object_id, workspace_id, path)
+		SELECT object_type, object_id, workspace_id, path
+		  FROM acl_object_expected
+		 WHERE object_type = $1 AND object_id = $2
+		    ON CONFLICT (object_type, object_id) DO NOTHING`,
+		ref.Type, ref.ID); err != nil {
+		return fmt.Errorf("materialize %s: %w", ref, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO acl_key (object_type, object_id, key)
+		SELECT object_type, object_id, key
+		  FROM acl_key_expected
+		 WHERE object_type = $1 AND object_id = $2
+		    ON CONFLICT DO NOTHING`,
+		ref.Type, ref.ID); err != nil {
+		return fmt.Errorf("materialize keys for %s: %w", ref, err)
+	}
+	return nil
+}
+
+// normalizeGrant is the validation both entry points share. Duplicating it
+// would mean one of them eventually accepting what the other refuses.
+func normalizeGrant(actor, subject SubjectRef, obj ObjectRef, capability Capability) (
+	sub SubjectRef, ref ObjectRef, stored string, grantedBy *string, err error) {
+	sub, ok, err := subject.normalize()
+	if err != nil {
+		return sub, ref, "", nil, err
+	}
+	if !ok {
+		return sub, ref, "", nil, fmt.Errorf("grant on %s: invalid subject id", obj)
+	}
+	ref, ok, err = obj.normalize()
+	if err != nil {
+		return sub, ref, "", nil, err
+	}
+	if !ok {
+		return sub, ref, "", nil, fmt.Errorf("grant to %s: invalid object id", sub)
+	}
+	stored, err = capability.storable()
+	if err != nil {
+		return sub, ref, "", nil, fmt.Errorf("grant %s on %s: %w", sub, ref, err)
+	}
+
+	// granted_by is audit, not authorization: an unparseable or absent actor
+	// records NULL rather than refusing, because losing the audit trail is
+	// worse than losing the attribution.
+	if actor.Type == SubjectUser {
+		if id, ok := canonicalUUID(actor.ID); ok {
+			grantedBy = &id
+		}
+	}
+	return sub, ref, stored, grantedBy, nil
+}
+
+func grantIn(ctx context.Context, tx pgx.Tx, ref ObjectRef, sub SubjectRef,
+	capability Capability, stored string, grantedBy *string) error {
+	st, err := lockObject(ctx, tx, ref)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		return fmt.Errorf("grant %s on %s: %w", capability, ref, ErrNotRegistered)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO acl_grant (object_type, object_id, subject_type, subject_id, capability, granted_by)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (object_type, object_id, subject_type, subject_id) DO UPDATE
+		   SET capability = EXCLUDED.capability,
+		       granted_by = EXCLUDED.granted_by,
+		       updated_at = NOW()`,
+		ref.Type, ref.ID, sub.Type, sub.ID, stored, grantedBy); err != nil {
+		return fmt.Errorf("write grant: %w", err)
+	}
+	return rewriteSubtreeKeys(ctx, tx, st.path)
 }
 
 // Revoke removes an explicit grant. Revoking one that does not exist is not an
@@ -1073,7 +1214,7 @@ func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent Obj
 		return fmt.Errorf("move %s: %w", ref, ErrDerivedType)
 	}
 	if ref == parentRef {
-		return fmt.Errorf("move %s: an object cannot be its own parent", ref)
+		return fmt.Errorf("move %s: %w", ref, ErrMoveCycle)
 	}
 
 	var live []ObjectRef
@@ -1099,12 +1240,11 @@ func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent Obj
 		src, dst := states[ref], states[parentRef]
 
 		if src.workspaceID != dst.workspaceID {
-			return fmt.Errorf("move %s under %s: refusing to move between workspaces %s and %s",
-				ref, parentRef, src.workspaceID, dst.workspaceID)
+			return fmt.Errorf("move %s under %s: %w: %s and %s",
+				ref, parentRef, ErrCrossWorkspaceMove, src.workspaceID, dst.workspaceID)
 		}
 		if hasPrefixPath(dst.path, src.path) {
-			return fmt.Errorf("move %s under %s: the destination is inside the object being moved",
-				ref, parentRef)
+			return fmt.Errorf("move %s under %s: %w", ref, parentRef, ErrMoveCycle)
 		}
 
 		newPath := buildPath(dst.path, ref)
@@ -1119,8 +1259,8 @@ func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent Obj
 			return fmt.Errorf("measure subtree depth: %w", err)
 		}
 		if grown := deepest - pathDepth(src.path) + pathDepth(newPath); grown > MaxPathDepth {
-			return fmt.Errorf("move %s under %s: the subtree would be %d segments deep, the limit is %d",
-				ref, parentRef, grown, MaxPathDepth)
+			return fmt.Errorf("move %s under %s: %w: %d segments, the limit is %d",
+				ref, parentRef, ErrMoveTooDeep, grown, MaxPathDepth)
 		}
 
 		if _, err := tx.Exec(ctx, `

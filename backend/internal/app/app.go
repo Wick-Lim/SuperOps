@@ -25,6 +25,8 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/block"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
 	"github.com/Wick-Lim/SuperOps/backend/internal/collab"
+	"github.com/Wick-Lim/SuperOps/backend/internal/drive"
+	"github.com/Wick-Lim/SuperOps/backend/internal/drive/registry"
 	"github.com/Wick-Lim/SuperOps/backend/internal/emoji"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
@@ -304,6 +306,22 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		logger,
 	)
 	collabHandler := collab.NewHandler(collabSvc)
+
+	// The editor registry. Register is called HERE, not from init(), so an
+	// editor that is not configured in a deployment is not discoverable in it —
+	// see internal/drive/registry.
+	//
+	// The stub `document` kind is the one plan 02 §8 asks for: a
+	// collab_documents row and nothing else, no editor, no client component. It
+	// exists so every Drive endpoint answers the collab question in code rather
+	// than in a design doc, in Phase 1 where fixing it costs a day.
+	driveKinds := registry.New()
+	if err := driveKinds.Register(drive.StubDocumentKind(collabRepo)); err != nil {
+		natsClient.Close()
+		pool.Close()
+		return nil, fmt.Errorf("register drive kinds: %w", err)
+	}
+	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService)
 	// Closes the cycle: the checker revokes document sessions through the
 	// service, and the service authorizes through the checker.
 	revoker.collab.Store(collabSvc)
@@ -509,6 +527,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	}
 	channelHandler.RegisterRoutes(mux, authMw)
 	collabHandler.RegisterRoutes(mux, authMw)
+	driveHandler.RegisterRoutes(mux, authMw)
 	presenceHandler.RegisterRoutes(mux, authMw)
 	if fileHandler != nil {
 		fileHandler.RegisterRoutes(mux, authMw)

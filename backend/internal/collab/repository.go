@@ -351,3 +351,25 @@ func (r *Repository) DeleteDocument(ctx context.Context, documentID string) (boo
 	}
 	return tag.RowsAffected() > 0, nil
 }
+
+// DocumentIDForResource returns the collaborative document id for a Drive
+// object, or "" when there is none.
+//
+// Drive's open descriptor needs it and Drive must not import this package's
+// model: it asks through an interface it declares itself, so the dependency
+// runs drive -> interface <- collab. Returning a bare id rather than a
+// *Document is deliberate — the descriptor names the room to join, and handing
+// back head_seq and snapshot_seq would invite a client to reason about the log.
+func (r *Repository) DocumentIDForResource(ctx context.Context, resourceType, resourceID string) (string, error) {
+	var id string
+	err := r.pool.QueryRow(ctx,
+		`SELECT id::text FROM collab_documents WHERE resource_type = $1 AND resource_id = $2`,
+		resourceType, resourceID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("look up collaboration document: %w", err)
+	}
+	return id, nil
+}

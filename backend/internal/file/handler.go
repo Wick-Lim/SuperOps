@@ -31,8 +31,6 @@ const (
 	// small value the file part spills to a temp file and is streamed to MinIO
 	// from there.
 	multipartMemory = 1 << 20 // 1MB
-	// maxFileNameLen caps the stored display name.
-	maxFileNameLen = 255
 	// sniffLen is the number of leading bytes http.DetectContentType inspects.
 	sniffLen = 512
 )
@@ -115,36 +113,6 @@ func sniffContentType(f io.ReadSeeker) (string, error) {
 	return mediaType(http.DetectContentType(buf[:n])), nil
 }
 
-// sanitizeFileName reduces a client-supplied filename to a single safe path
-// segment of bounded length.
-func sanitizeFileName(name string) string {
-	name = filepath.Base(strings.ReplaceAll(name, `\`, "/"))
-	name = strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || r == '/' {
-			return -1
-		}
-		return r
-	}, name)
-	name = strings.TrimSpace(name)
-	if name == "" || name == "." || name == ".." {
-		return "file"
-	}
-	if len(name) > maxFileNameLen {
-		name = name[:maxFileNameLen]
-	}
-	return name
-}
-
-// contentDisposition builds an RFC 2231-encoded disposition header, so a
-// filename containing quotes or non-ASCII cannot break out of the header.
-func contentDisposition(name string, inline bool) string {
-	kind := "attachment"
-	if inline {
-		kind = "inline"
-	}
-	return mime.FormatMediaType(kind, map[string]string{"filename": sanitizeFileName(name)})
-}
-
 // --- handlers ----------------------------------------------------------------
 
 func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +163,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	name := sanitizeFileName(header.Filename)
+	name := httputil.SanitizeFileName(header.Filename)
 	fileID := uuid.NewString()
 	ext := filepath.Ext(name)
 	storageKey := fmt.Sprintf("%s/%s/%s%s", workspaceID, time.Now().Format("2006/01/02"), fileID, ext)
@@ -337,7 +305,7 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 	contentType := mediaType(f.ContentType)
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Disposition", contentDisposition(f.Name, canServeInline(contentType)))
+	w.Header().Set("Content-Disposition", httputil.ContentDisposition(f.Name, canServeInline(contentType)))
 	// Defence in depth for the types that are still rendered inline.
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; object-src 'none'; frame-ancestors 'none'; sandbox")
 	w.Header().Set("Referrer-Policy", "no-referrer")
