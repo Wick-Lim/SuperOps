@@ -22,6 +22,13 @@ export default defineConfig({
       'react-native': stub('./test/stubs/react-native.ts'),
       'expo-secure-store': stub('./test/stubs/expo-secure-store.ts'),
       '@react-native-async-storage/async-storage': stub('./test/stubs/async-storage.ts'),
+      // Throws on every native member, exactly as the real package does on web.
+      // See test/stubs/expo-notifications.ts for why it is not a silent no-op.
+      'expo-notifications': stub('./test/stubs/expo-notifications.ts'),
+      // Reached from src/lib/push.ts via navigationRef. Shipped untranspiled
+      // for Metro, so vitest (which does not transform node_modules) cannot
+      // parse it.
+      '@react-navigation/native': stub('./test/stubs/react-navigation-native.ts'),
     },
   },
   test: {

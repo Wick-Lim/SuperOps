@@ -65,6 +65,25 @@ function currentPlatform(): DevicePlatform {
 }
 
 /**
+ * Whether expo-notifications can be called at all on this platform.
+ *
+ * The package ships a web build, but most of its surface is native-only and
+ * throws `ExpoNotifications.<x> is not available on web` when touched — which
+ * is a hard crash in a React render, not a degraded feature. Platform.OS is
+ * fixed for the process lifetime, so this is a constant.
+ */
+const pushSupported = Platform.OS === 'ios' || Platform.OS === 'android'
+
+/**
+ * `useLastNotificationResponse` is a hook, so it cannot be called conditionally
+ * inside the component. Choosing the implementation once at module load keeps
+ * exactly one hook in the call order on every platform, while never reaching
+ * the native module on web.
+ */
+const useLastNotificationResponse: typeof Notifications.useLastNotificationResponse =
+  pushSupported ? Notifications.useLastNotificationResponse : () => null
+
+/**
  * iOS "provisional" authorization delivers quietly to Notification Center
  * without a prompt. It is a grant, and treating it as a denial would silently
  * disable push for anyone in that state.
@@ -99,6 +118,12 @@ let configured = false
 export function configureNotifications(): void {
   if (configured) return
   configured = true
+
+  // expo-notifications is a native module with only a partial web shim: the
+  // handler/channel APIs below have no web implementation and throw
+  // "not available on web". Push is native-only here (see registerPushToken,
+  // which reports 'unsupported' for web), so there is nothing to configure.
+  if (!pushSupported) return
 
   Notifications.setNotificationHandler({
     handleNotification: async (notification) => {
@@ -306,7 +331,7 @@ export function usePushNotifications(enabled: boolean): void {
   // their own beyond what the push carried; keeping the in-app bell in step is
   // this listener's job.
   useEffect(() => {
-    if (!enabled) return
+    if (!enabled || !pushSupported) return
     const sub = Notifications.addNotificationReceivedListener(() => {
       void syncBadge()
     })
@@ -316,9 +341,9 @@ export function usePushNotifications(enabled: boolean): void {
   // Taps. `useLastNotificationResponse` also reports the notification that
   // launched a cold-started app, which a plain listener would miss because it
   // fires before this component exists.
-  const response = Notifications.useLastNotificationResponse()
+  const response = useLastNotificationResponse()
   useEffect(() => {
-    if (!enabled || !response) return
+    if (!enabled || !pushSupported || !response) return
     // Only the default action (an actual tap) navigates; a custom action
     // button, if one is ever added, must not.
     if (response.actionIdentifier !== Notifications.DEFAULT_ACTION_IDENTIFIER) return
