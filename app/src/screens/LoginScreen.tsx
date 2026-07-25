@@ -4,6 +4,8 @@ import type { NativeStackScreenProps } from '@react-navigation/native-stack'
 import type { RootStackParamList } from '../navigation/AppNavigator'
 import { authApi } from '../api/auth'
 import { useAuthStore } from '../stores/authStore'
+import { ServerErrorCode, errorMessage, hasErrorCode } from '../api/client'
+import { MIN_TOUCH } from './internal/ui'
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Login'>
 
@@ -13,25 +15,33 @@ export default function LoginScreen({ navigation }: Props) {
   const [totpCode, setTotpCode] = useState('')
   const [requires2fa, setRequires2fa] = useState(false)
   const [loading, setLoading] = useState(false)
-  const { setTokens, setUser } = useAuthStore()
 
   const handleLogin = async () => {
     if (!email || !password) return
     if (requires2fa && !totpCode) return
     setLoading(true)
     try {
-      const res = await authApi.login({ email, password, totp_code: requires2fa ? totpCode : undefined })
-      setTokens(res.data.access_token, res.data.refresh_token)
+      const res = await authApi.login({
+        email,
+        password,
+        totp_code: requires2fa ? totpCode : undefined,
+      })
+      // setTokens must land before getMe, or the request goes out unauthenticated.
+      await useAuthStore.getState().setTokens(res.data.access_token, res.data.refresh_token)
       const me = await authApi.getMe()
-      setUser(me.data)
+      await useAuthStore.getState().setUser(me.data)
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Login failed'
-      // Backend returns a TOTP_REQUIRED error (message: "two-factor code required").
-      if (/two-factor/i.test(msg)) {
+      // Branch on the typed code. The old test was /two-factor/i against the
+      // error message, which the server never sends — the field was unreachable.
+      if (hasErrorCode(err, ServerErrorCode.TotpRequired)) {
         setRequires2fa(true)
+        setTotpCode('')
         Alert.alert('Two-factor required', 'Enter the 6-digit code from your authenticator app.')
+      } else if (hasErrorCode(err, ServerErrorCode.InvalidTotpCode)) {
+        setTotpCode('')
+        Alert.alert('Incorrect code', 'That code was not accepted. Codes expire every 30 seconds.')
       } else {
-        Alert.alert('Error', msg)
+        Alert.alert('Error', errorMessage(err, 'Login failed'))
       }
     } finally {
       setLoading(false)
@@ -45,38 +55,53 @@ export default function LoginScreen({ navigation }: Props) {
           <View style={{ width: 48, height: 48, backgroundColor: '#4f46e5', borderRadius: 12, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
             <Text style={{ color: '#fff', fontSize: 20, fontWeight: 'bold' }}>S</Text>
           </View>
-          <Text style={{ color: '#fff', fontSize: 24, fontWeight: 'bold' }}>SuperOps</Text>
+          <Text accessibilityRole="header" style={{ color: '#fff', fontSize: 24, fontWeight: 'bold' }}>SuperOps</Text>
           <Text style={{ color: '#94a3b8', marginTop: 4 }}>Sign in to your workspace</Text>
         </View>
 
         <TextInput
           value={email} onChangeText={setEmail}
-          placeholder="Email" placeholderTextColor="#64748b"
-          keyboardType="email-address" autoCapitalize="none"
-          style={{ backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155', borderRadius: 12, padding: 14, color: '#fff', fontSize: 15, marginBottom: 12 }}
+          placeholder="Email" placeholderTextColor="#94a3b8"
+          keyboardType="email-address" autoCapitalize="none" autoComplete="email"
+          accessibilityLabel="Email"
+          style={{ backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155', borderRadius: 12, padding: 14, minHeight: MIN_TOUCH, color: '#fff', fontSize: 15, marginBottom: 12 }}
         />
         <TextInput
           value={password} onChangeText={setPassword}
-          placeholder="Password" placeholderTextColor="#64748b"
-          secureTextEntry
-          style={{ backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155', borderRadius: 12, padding: 14, color: '#fff', fontSize: 15, marginBottom: requires2fa ? 12 : 20 }}
+          placeholder="Password" placeholderTextColor="#94a3b8"
+          secureTextEntry autoComplete="password"
+          accessibilityLabel="Password"
+          style={{ backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155', borderRadius: 12, padding: 14, minHeight: MIN_TOUCH, color: '#fff', fontSize: 15, marginBottom: requires2fa ? 12 : 20 }}
         />
 
         {requires2fa && (
           <TextInput
             value={totpCode} onChangeText={setTotpCode}
-            placeholder="6-digit code" placeholderTextColor="#64748b"
-            keyboardType="number-pad" maxLength={6} autoFocus
-            style={{ backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155', borderRadius: 12, padding: 14, color: '#fff', fontSize: 15, marginBottom: 20, letterSpacing: 4, textAlign: 'center' }}
+            placeholder="6-digit code" placeholderTextColor="#94a3b8"
+            keyboardType="number-pad" maxLength={6} autoFocus autoComplete="one-time-code"
+            accessibilityLabel="Two-factor authentication code"
+            accessibilityHint="Six digits from your authenticator app"
+            style={{ backgroundColor: '#0f172a', borderWidth: 1, borderColor: '#334155', borderRadius: 12, padding: 14, minHeight: MIN_TOUCH, color: '#fff', fontSize: 15, marginBottom: 20, letterSpacing: 4, textAlign: 'center' }}
           />
         )}
 
-        <Pressable onPress={handleLogin} disabled={loading}
-          style={{ backgroundColor: '#4f46e5', borderRadius: 12, padding: 14, alignItems: 'center', opacity: loading ? 0.6 : 1 }}>
+        <Pressable
+          onPress={handleLogin}
+          disabled={loading}
+          accessibilityRole="button"
+          accessibilityLabel="Sign in"
+          accessibilityState={{ disabled: loading, busy: loading }}
+          style={{ backgroundColor: '#4f46e5', borderRadius: 12, padding: 14, minHeight: MIN_TOUCH, justifyContent: 'center', alignItems: 'center', opacity: loading ? 0.6 : 1 }}
+        >
           <Text style={{ color: '#fff', fontSize: 15, fontWeight: '600' }}>{loading ? 'Signing in...' : 'Sign In'}</Text>
         </Pressable>
 
-        <Pressable onPress={() => navigation.navigate('Invite', {})} style={{ marginTop: 24, alignItems: 'center' }}>
+        <Pressable
+          onPress={() => navigation.navigate('Invite', {})}
+          accessibilityRole="button"
+          accessibilityLabel="Join a workspace with an invite"
+          style={{ marginTop: 24, minHeight: MIN_TOUCH, justifyContent: 'center', alignItems: 'center' }}
+        >
           <Text style={{ color: '#94a3b8', fontSize: 14 }}>
             Have an invite? <Text style={{ color: '#818cf8' }}>Join workspace</Text>
           </Text>

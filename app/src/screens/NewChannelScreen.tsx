@@ -5,6 +5,8 @@ import type { Channel } from '../lib/types'
 import { channelApi } from '../api/channels'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { useChannelStore } from '../stores/channelStore'
+import { errorMessage } from '../api/client'
+import { MIN_TOUCH, ScreenHeader } from './internal/ui'
 
 function slugify(name: string): string {
   return name
@@ -41,7 +43,7 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
     channelApi
       .browse(activeWorkspace.id)
       .then((res) => setBrowseable(res.data ?? []))
-      .catch((err) => setBrowseError(err instanceof Error ? err.message : 'Failed to load channels'))
+      .catch((err) => setBrowseError(errorMessage(err, 'Failed to load channels')))
       .finally(() => setBrowseLoading(false))
   }
 
@@ -70,7 +72,7 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
       addChannel(res.data)
       navigation.goBack()
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to create channel')
+      Alert.alert('Error', errorMessage(err, 'Failed to create channel'))
     } finally {
       setCreating(false)
     }
@@ -84,7 +86,7 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
       addChannel(ch)
       setBrowseable((prev) => prev.filter((c) => c.id !== ch.id))
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to join channel')
+      Alert.alert('Error', errorMessage(err, 'Failed to join channel'))
     } finally {
       setJoiningId(null)
     }
@@ -94,22 +96,7 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-      {/* Header */}
-      <View
-        style={{
-          height: 56,
-          paddingHorizontal: 16,
-          flexDirection: 'row',
-          alignItems: 'center',
-          borderBottomWidth: 1,
-          borderBottomColor: theme.border,
-        }}
-      >
-        <Pressable onPress={() => navigation.goBack()} hitSlop={8} style={{ marginRight: 12 }}>
-          <Text style={{ color: theme.accent, fontSize: 16 }}>Cancel</Text>
-        </Pressable>
-        <Text style={{ color: theme.text, fontSize: 17, fontWeight: '600', flex: 1 }}>New Channel</Text>
-      </View>
+      <ScreenHeader title="New channel" backLabel="Cancel" onBack={() => navigation.goBack()} />
 
       <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
         {/* Create form */}
@@ -118,13 +105,16 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
           value={name}
           onChangeText={setName}
           placeholder="e.g. marketing"
-          placeholderTextColor={theme.textFaint}
+          placeholderTextColor={theme.textMuted}
+          accessibilityLabel="Channel name"
+          accessibilityHint="Lowercase letters, numbers and dashes become the channel URL"
+
           autoCapitalize="none"
           autoCorrect={false}
           style={inputStyle}
         />
         {slug ? (
-          <Text style={{ color: theme.textFaint, fontSize: 12, marginTop: 6 }}>
+          <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 6 }}>
             URL: <Text style={{ color: theme.textMuted }}>#{slug}</Text>
           </Text>
         ) : null}
@@ -134,7 +124,9 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
           value={description}
           onChangeText={setDescription}
           placeholder="What's this channel about?"
-          placeholderTextColor={theme.textFaint}
+          placeholderTextColor={theme.textMuted}
+          accessibilityLabel="Channel description"
+
           multiline
           style={[inputStyle, { minHeight: 72, textAlignVertical: 'top' }]}
         />
@@ -154,13 +146,16 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
         >
           <View style={{ flex: 1, paddingRight: 12 }}>
             <Text style={{ color: theme.text, fontSize: 15, fontWeight: '500' }}>Private channel</Text>
-            <Text style={{ color: theme.textFaint, fontSize: 12, marginTop: 2 }}>
+            <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
               Only invited members can view and join
             </Text>
           </View>
           <Switch
             value={isPrivate}
             onValueChange={setIsPrivate}
+            accessibilityLabel="Private channel"
+            accessibilityHint="Only invited members can view and join"
+
             trackColor={{ false: theme.borderStrong, true: theme.primary }}
             thumbColor={theme.text}
           />
@@ -169,10 +164,15 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
         <Pressable
           onPress={handleCreate}
           disabled={creating || !name.trim()}
+          accessibilityRole="button"
+          accessibilityLabel="Create channel"
+          accessibilityState={{ disabled: creating || !name.trim(), busy: creating }}
           style={{
             backgroundColor: theme.primary,
             borderRadius: 12,
             padding: 14,
+            minHeight: MIN_TOUCH,
+            justifyContent: 'center',
             alignItems: 'center',
             marginTop: 20,
             opacity: creating || !name.trim() ? 0.5 : 1,
@@ -186,7 +186,13 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
         {/* Browse public channels */}
         <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 32, marginBottom: 4 }}>
           <Text style={[labelStyle, { flex: 1 }]}>BROWSE PUBLIC CHANNELS</Text>
-          <Pressable onPress={loadBrowse} hitSlop={8}>
+          <Pressable
+            onPress={loadBrowse}
+            accessibilityRole="button"
+            accessibilityLabel="Refresh the list of public channels"
+            hitSlop={16}
+            style={{ minHeight: 32, justifyContent: 'center' }}
+          >
             <Text style={{ color: theme.accent, fontSize: 12 }}>Refresh</Text>
           </Pressable>
         </View>
@@ -203,7 +209,7 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
             </Pressable>
           </View>
         ) : browseList.length === 0 ? (
-          <Text style={{ color: theme.textFaint, fontSize: 14, paddingVertical: 12 }}>
+          <Text style={{ color: theme.textMuted, fontSize: 14, paddingVertical: 12 }}>
             No public channels available to join.
           </Text>
         ) : (
@@ -218,13 +224,13 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
                 borderBottomColor: theme.border,
               }}
             >
-              <Text style={{ color: theme.textFaint, fontSize: 16, marginRight: 8 }}>#</Text>
+              <Text style={{ color: theme.textMuted, fontSize: 16, marginRight: 8 }}>#</Text>
               <View style={{ flex: 1 }}>
                 <Text style={{ color: theme.body, fontSize: 15, fontWeight: '500' }}>
                   {ch.name || ch.slug || 'unnamed'}
                 </Text>
                 {ch.description ? (
-                  <Text style={{ color: theme.textFaint, fontSize: 12, marginTop: 2 }} numberOfLines={1}>
+                  <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }} numberOfLines={1}>
                     {ch.description}
                   </Text>
                 ) : null}
@@ -232,9 +238,13 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
               <Pressable
                 onPress={() => handleJoin(ch)}
                 disabled={joiningId === ch.id}
+                accessibilityRole="button"
+                accessibilityLabel={`Join ${ch.name || ch.slug || 'channel'}`}
+                accessibilityState={{ disabled: joiningId === ch.id, busy: joiningId === ch.id }}
                 style={{
                   paddingHorizontal: 16,
-                  paddingVertical: 8,
+                  minHeight: MIN_TOUCH,
+                  justifyContent: 'center',
                   borderRadius: 8,
                   borderWidth: 1,
                   borderColor: theme.primary,

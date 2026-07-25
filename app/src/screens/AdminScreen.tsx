@@ -1,73 +1,78 @@
-import React, { useEffect, useState, useCallback } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import {
   View,
   Text,
-  TextInput,
   Pressable,
   SafeAreaView,
   ScrollView,
   FlatList,
   Alert,
-  ActivityIndicator,
+  RefreshControl,
 } from 'react-native'
 import { theme, avatarColor } from '../lib/theme'
-import { api } from '../api/client'
+import {
+  adminApi,
+  type AdminInvitation,
+  type AdminStats,
+  type AdminUser,
+  type AuditLogEntry,
+  type CreatedInvitation,
+} from '../api/admin'
+import { workspaceApi } from '../api/workspaces'
+import { useWorkspaceStore } from '../stores/workspaceStore'
+import { errorMessage, isApiError } from '../api/client'
+import type { Workspace, WorkspaceRole } from '../lib/types'
+import {
+  Button,
+  Chip,
+  EmptyState,
+  ErrorState,
+  Field,
+  ListFooter,
+  LoadingState,
+  MIN_TOUCH,
+  ScreenHeader,
+} from './internal/ui'
 
-// --- Shapes returned by the raw /admin/* endpoints ----------------------
+type Tab = 'stats' | 'users' | 'invitations' | 'audit'
 
-interface AdminStats {
-  total_users?: number
-  active_users?: number
-  total_workspaces?: number
-  total_channels?: number
-  total_messages?: number
-  [key: string]: number | string | undefined
-}
+const TABS: Array<{ key: Tab; label: string }> = [
+  { key: 'stats', label: 'Stats' },
+  { key: 'users', label: 'Users' },
+  { key: 'invitations', label: 'Invites' },
+  { key: 'audit', label: 'Audit' },
+]
 
-interface AdminUser {
-  id: string
-  email: string
-  username: string
-  full_name: string
-  is_active: boolean
-}
+const INVITE_ROLES: Array<Exclude<WorkspaceRole, 'owner'>> = ['admin', 'member', 'guest']
 
-interface AdminInvitation {
-  id: string
-  email: string
-  role: string
-  accepted?: boolean
-  created_at?: string
-}
-
-type Tab = 'stats' | 'users' | 'invitations'
-
-// --- Presentational helpers ---------------------------------------------
+const STAT_LABELS: Array<{ key: keyof AdminStats; label: string }> = [
+  { key: 'users', label: 'Members' },
+  { key: 'workspaces', label: 'Workspaces' },
+  { key: 'channels', label: 'Channels' },
+  { key: 'messages', label: 'Messages' },
+]
 
 function TabBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
-  const tabs: { key: Tab; label: string }[] = [
-    { key: 'stats', label: 'Stats' },
-    { key: 'users', label: 'Users' },
-    { key: 'invitations', label: 'Invitations' },
-  ]
   return (
     <View
-      style={{
-        flexDirection: 'row',
-        borderBottomWidth: 1,
-        borderBottomColor: theme.border,
-      }}
+      accessibilityRole="tablist"
+      style={{ flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: theme.border }}
     >
-      {tabs.map((t) => {
+      {TABS.map((t) => {
         const active = t.key === tab
         return (
           <Pressable
             key={t.key}
             onPress={() => setTab(t.key)}
+            accessibilityRole="tab"
+            accessibilityLabel={t.label}
+            accessibilityState={{ selected: active }}
             style={{
               flex: 1,
               paddingVertical: 12,
+              minHeight: MIN_TOUCH,
               alignItems: 'center',
+              justifyContent: 'center',
               borderBottomWidth: 2,
               borderBottomColor: active ? theme.primary : 'transparent',
             }}
@@ -88,9 +93,11 @@ function TabBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
   )
 }
 
-function StatCard({ label, value }: { label: string; value: number | string }) {
+function StatCard({ label, value }: { label: string; value: number }) {
   return (
     <View
+      accessible
+      accessibilityLabel={`${value} ${label}`}
       style={{
         flexGrow: 1,
         flexBasis: '47%',
@@ -107,282 +114,421 @@ function StatCard({ label, value }: { label: string; value: number | string }) {
   )
 }
 
-function prettyLabel(key: string): string {
-  return key
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase())
+function statusColor(status: string): string {
+  if (status === 'accepted') return theme.success
+  if (status === 'expired' || status === 'revoked') return theme.textMuted
+  return theme.warning
 }
 
-// --- Screen --------------------------------------------------------------
+function shortDate(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString()
+}
 
 export default function AdminScreen({ navigation }: { navigation: any; route: any }) {
   const [tab, setTab] = useState<Tab>('stats')
   const [forbidden, setForbidden] = useState(false)
-  const [initialLoading, setInitialLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+
+  const storeWorkspaces = useWorkspaceStore((s) => s.workspaces)
+  const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace)
+  const [workspaces, setWorkspaces] = useState<Workspace[]>(storeWorkspaces)
+  const [targetWorkspaceId, setTargetWorkspaceId] = useState<string | null>(
+    activeWorkspace?.id ?? storeWorkspaces[0]?.id ?? null,
+  )
 
   // Stats
   const [stats, setStats] = useState<AdminStats | null>(null)
+  const [statsError, setStatsError] = useState<string | null>(null)
+  const [statsLoading, setStatsLoading] = useState(true)
 
   // Users
   const [users, setUsers] = useState<AdminUser[]>([])
   const [usersLoaded, setUsersLoaded] = useState(false)
+  const [usersError, setUsersError] = useState<string | null>(null)
   const [pendingUserId, setPendingUserId] = useState<string | null>(null)
+  const [expandedUserId, setExpandedUserId] = useState<string | null>(null)
 
   // Invitations
   const [invitations, setInvitations] = useState<AdminInvitation[]>([])
   const [invitesLoaded, setInvitesLoaded] = useState(false)
+  const [invitesError, setInvitesError] = useState<string | null>(null)
   const [inviteEmail, setInviteEmail] = useState('')
-  const [inviteRole, setInviteRole] = useState<'member' | 'admin'>('member')
+  const [inviteRole, setInviteRole] = useState<Exclude<WorkspaceRole, 'owner'>>('member')
   const [creatingInvite, setCreatingInvite] = useState(false)
+  const [lastCreated, setLastCreated] = useState<CreatedInvitation | null>(null)
 
-  const handleError = useCallback((err: unknown, fallback: string) => {
-    const msg = err instanceof Error ? err.message : fallback
-    if (/403|forbidden|admin/i.test(msg)) {
+  // Audit
+  const [audit, setAudit] = useState<AuditLogEntry[]>([])
+  const [auditCursor, setAuditCursor] = useState<string | undefined>(undefined)
+  const [auditHasMore, setAuditHasMore] = useState(false)
+  const [auditLoading, setAuditLoading] = useState(false)
+  const [auditLoaded, setAuditLoaded] = useState(false)
+  const [auditError, setAuditError] = useState<string | null>(null)
+
+  /** 403 is the whole-screen answer; everything else is a per-section error. */
+  const asError = useCallback((err: unknown, fallback: string): string => {
+    if (isApiError(err) && err.status === 403) {
       setForbidden(true)
-      return
+      return 'Admin access required'
     }
-    Alert.alert('Error', msg)
+    return errorMessage(err, fallback)
   }, [])
 
-  // Stats drive the initial access check.
-  useEffect(() => {
-    let cancelled = false
-    api
-      .get<AdminStats>('/admin/stats')
-      .then((res) => {
-        if (cancelled) return
-        setStats(res.data ?? {})
-      })
-      .catch((err) => {
-        if (cancelled) return
-        handleError(err, 'Failed to load stats')
-      })
-      .finally(() => {
-        if (!cancelled) setInitialLoading(false)
-      })
-    return () => {
-      cancelled = true
+  const loadStats = useCallback(async () => {
+    setStatsLoading(true)
+    setStatsError(null)
+    try {
+      const res = await adminApi.stats()
+      setStats(res.data)
+    } catch (err) {
+      setStatsError(asError(err, 'Failed to load stats'))
+    } finally {
+      setStatsLoading(false)
     }
-  }, [handleError])
+  }, [asError])
+
+  useEffect(() => {
+    void loadStats()
+  }, [loadStats])
+
+  // The workspace picker needs the full list, not just the active one.
+  useEffect(() => {
+    if (storeWorkspaces.length > 0) return
+    workspaceApi
+      .list()
+      .then((res) => {
+        setWorkspaces(res.data ?? [])
+        setTargetWorkspaceId((cur) => cur ?? res.data?.[0]?.id ?? null)
+      })
+      .catch(() => {
+        /* the picker simply stays empty; create/role actions explain why */
+      })
+  }, [storeWorkspaces.length])
+
+  useEffect(() => {
+    if (storeWorkspaces.length > 0) setWorkspaces(storeWorkspaces)
+  }, [storeWorkspaces])
 
   const loadUsers = useCallback(async () => {
+    setUsersError(null)
     try {
-      const res = await api.get<AdminUser[]>('/admin/users')
+      const res = await adminApi.listUsers()
       setUsers(res.data ?? [])
       setUsersLoaded(true)
     } catch (err) {
-      handleError(err, 'Failed to load users')
+      setUsersError(asError(err, 'Failed to load users'))
+      setUsersLoaded(true)
     }
-  }, [handleError])
+  }, [asError])
 
   const loadInvitations = useCallback(async () => {
+    setInvitesError(null)
     try {
-      const res = await api.get<AdminInvitation[]>('/admin/invitations')
+      const res = await adminApi.listInvitations()
       setInvitations(res.data ?? [])
       setInvitesLoaded(true)
     } catch (err) {
-      handleError(err, 'Failed to load invitations')
+      setInvitesError(asError(err, 'Failed to load invitations'))
+      setInvitesLoaded(true)
     }
-  }, [handleError])
+  }, [asError])
+
+  const loadAudit = useCallback(
+    async (cursor?: string) => {
+      setAuditLoading(true)
+      setAuditError(null)
+      try {
+        const res = await adminApi.auditLogs(cursor, 30)
+        const page = res.data ?? []
+        setAudit((prev) => (cursor ? [...prev, ...page] : page))
+        setAuditCursor(res.meta?.cursor)
+        setAuditHasMore(!!res.meta?.has_more && !!res.meta?.cursor)
+        setAuditLoaded(true)
+      } catch (err) {
+        setAuditError(asError(err, 'Failed to load audit log'))
+        setAuditLoaded(true)
+      } finally {
+        setAuditLoading(false)
+      }
+    },
+    [asError],
+  )
 
   useEffect(() => {
     if (forbidden) return
-    if (tab === 'users' && !usersLoaded) loadUsers()
-    if (tab === 'invitations' && !invitesLoaded) loadInvitations()
-  }, [tab, forbidden, usersLoaded, invitesLoaded, loadUsers, loadInvitations])
+    if (tab === 'users' && !usersLoaded) void loadUsers()
+    if (tab === 'invitations' && !invitesLoaded) void loadInvitations()
+    if (tab === 'audit' && !auditLoaded) void loadAudit()
+  }, [tab, forbidden, usersLoaded, invitesLoaded, auditLoaded, loadUsers, loadInvitations, loadAudit])
 
   const toggleUserActive = async (u: AdminUser) => {
     setPendingUserId(u.id)
     try {
-      const res = await api.patch<AdminUser>(`/admin/users/${u.id}`, { is_active: !u.is_active })
-      const next = res.data
-      setUsers((prev) =>
-        prev.map((x) => (x.id === u.id ? { ...x, is_active: next?.is_active ?? !u.is_active } : x)),
-      )
+      // The response is {message}, not the user — apply the change we asked for.
+      await adminApi.updateUser(u.id, { is_active: !u.is_active })
+      setUsers((prev) => prev.map((x) => (x.id === u.id ? { ...x, is_active: !u.is_active } : x)))
     } catch (err) {
-      handleError(err, 'Failed to update user')
+      Alert.alert('Error', asError(err, 'Failed to update user'))
+    } finally {
+      setPendingUserId(null)
+    }
+  }
+
+  const setUserRole = async (u: AdminUser, role: Exclude<WorkspaceRole, 'owner'>) => {
+    if (!targetWorkspaceId) {
+      Alert.alert('Pick a workspace', 'A role only means something inside a workspace.')
+      return
+    }
+    setPendingUserId(u.id)
+    try {
+      // workspace_id is REQUIRED whenever role is set.
+      await adminApi.updateUser(u.id, { role, workspace_id: targetWorkspaceId })
+      Alert.alert('Saved', `${u.full_name || u.username} is now ${role} in this workspace.`)
+      setExpandedUserId(null)
+    } catch (err) {
+      Alert.alert('Error', asError(err, 'Failed to change role'))
     } finally {
       setPendingUserId(null)
     }
   }
 
   const createInvitation = async () => {
-    const email = inviteEmail.trim()
+    const email = inviteEmail.trim().toLowerCase()
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       Alert.alert('Validation', 'Enter a valid email address')
       return
     }
+    if (!targetWorkspaceId) {
+      Alert.alert('Pick a workspace', 'Choose which workspace this invitation is for.')
+      return
+    }
     setCreatingInvite(true)
     try {
-      const res = await api.post<AdminInvitation>('/admin/invitations', { email, role: inviteRole })
-      if (res.data) setInvitations((prev) => [res.data, ...prev])
+      const res = await adminApi.createInvitation({
+        workspace_id: targetWorkspaceId,
+        email,
+        role: inviteRole,
+      })
+      // The response is a CreatedInvitation ({id, invite_url, ...}), NOT an
+      // invitation row: unshifting it into the list used to render a row with
+      // `role === undefined` and crash the tree. Refetch instead.
+      setLastCreated(res.data)
       setInviteEmail('')
-      Alert.alert('Invitation sent', `Invited ${email} as ${inviteRole}`)
+      void loadInvitations()
     } catch (err) {
-      handleError(err, 'Failed to create invitation')
+      Alert.alert('Error', asError(err, 'Failed to create invitation'))
     } finally {
       setCreatingInvite(false)
     }
   }
 
-  // --- Header (shared) ---
-  const Header = (
-    <View
-      style={{
-        height: 56,
-        paddingHorizontal: 16,
-        flexDirection: 'row',
-        alignItems: 'center',
-        borderBottomWidth: 1,
-        borderBottomColor: theme.border,
-      }}
-    >
-      <Pressable onPress={() => navigation.goBack()} hitSlop={12} style={{ marginRight: 12 }}>
-        <Text style={{ color: theme.accent, fontSize: 16 }}>‹ Back</Text>
-      </Pressable>
-      <Text style={{ color: theme.text, fontSize: 17, fontWeight: '700', flex: 1 }}>Admin</Text>
-    </View>
-  )
+  const workspaceName = (id: string) => workspaces.find((w) => w.id === id)?.name ?? 'workspace'
 
-  // --- Loading / forbidden states ---
-  if (initialLoading) {
-    return (
-      <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-        {Header}
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-          <ActivityIndicator color={theme.accent} />
-        </View>
-      </SafeAreaView>
-    )
+  /** Drives the pull-to-refresh spinner for whichever tab is showing. */
+  const refresh = (fn: () => Promise<void>) => {
+    setRefreshing(true)
+    void fn().finally(() => setRefreshing(false))
   }
+
+  const header = (
+    <ScreenHeader title="Admin" onBack={() => navigation.goBack()} subtitle="Workspaces you administer" />
+  )
 
   if (forbidden) {
     return (
       <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-        {Header}
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 }}>
-          <Text style={{ color: theme.text, fontSize: 18, fontWeight: '700', marginBottom: 8 }}>
-            Admin access required
-          </Text>
-          <Text style={{ color: theme.textMuted, fontSize: 14, textAlign: 'center' }}>
-            You do not have permission to view the admin panel.
-          </Text>
-        </View>
+        {header}
+        <EmptyState
+          title="Admin access required"
+          body="You need to be an owner or admin of a workspace to open this panel."
+        />
       </SafeAreaView>
     )
   }
 
-  // --- Tab content ---
-  const statsEntries = stats ? Object.entries(stats).filter(([, v]) => v !== undefined && v !== null) : []
+  const workspacePicker = (
+    <View style={{ marginBottom: 12 }}>
+      <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 6 }}>Workspace</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
+        {workspaces.length === 0 ? (
+          <Text style={{ color: theme.textMuted, fontSize: 13 }}>No workspaces available.</Text>
+        ) : (
+          workspaces.map((w) => (
+            <Chip
+              key={w.id}
+              label={w.name}
+              selected={w.id === targetWorkspaceId}
+              onPress={() => setTargetWorkspaceId(w.id)}
+              accessibilityLabel={`Workspace ${w.name}`}
+            />
+          ))
+        )}
+      </ScrollView>
+    </View>
+  )
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-      {Header}
+      {header}
       <TabBar tab={tab} setTab={setTab} />
 
-      {tab === 'stats' && (
-        <ScrollView contentContainerStyle={{ padding: 16 }}>
-          {statsEntries.length === 0 ? (
-            <Text style={{ color: theme.textMuted, fontSize: 14, textAlign: 'center', marginTop: 24 }}>
-              No stats available.
-            </Text>
-          ) : (
+      {tab === 'stats' &&
+        (statsLoading ? (
+          <LoadingState label="Loading stats" />
+        ) : statsError ? (
+          <ErrorState message={statsError} onRetry={loadStats} />
+        ) : (
+          <ScrollView
+            contentContainerStyle={{ padding: 16 }}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={() => refresh(loadStats)}
+                tintColor={theme.accent}
+              />
+            }
+          >
             <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 12 }}>
-              {statsEntries.map(([key, value]) => (
-                <StatCard key={key} label={prettyLabel(key)} value={value as number | string} />
+              {STAT_LABELS.map(({ key, label }) => (
+                <StatCard key={key} label={label} value={stats?.[key] ?? 0} />
               ))}
             </View>
-          )}
-        </ScrollView>
-      )}
+          </ScrollView>
+        ))}
 
       {tab === 'users' && (
         <FlatList
           data={users}
           keyExtractor={(u) => u.id}
           contentContainerStyle={{ padding: 16 }}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={() => refresh(loadUsers)}
+              tintColor={theme.accent}
+            />
+          }
+          ListHeaderComponent={usersError ? null : workspacePicker}
           ListEmptyComponent={
-            usersLoaded ? (
-              <Text style={{ color: theme.textMuted, fontSize: 14, textAlign: 'center', marginTop: 24 }}>
-                No users found.
-              </Text>
+            usersError ? (
+              <ErrorState message={usersError} onRetry={loadUsers} />
+            ) : usersLoaded ? (
+              <EmptyState title="No users found" />
             ) : (
-              <ActivityIndicator color={theme.accent} style={{ marginTop: 24 }} />
+              <LoadingState label="Loading users" />
             )
           }
-          renderItem={({ item: u }) => (
-            <View
-              style={{
-                flexDirection: 'row',
-                alignItems: 'center',
-                backgroundColor: theme.surface,
-                borderWidth: 1,
-                borderColor: theme.border,
-                borderRadius: 12,
-                padding: 12,
-                marginBottom: 10,
-              }}
-            >
+          renderItem={({ item: u }) => {
+            const busy = pendingUserId === u.id
+            const expanded = expandedUserId === u.id
+            return (
               <View
                 style={{
-                  width: 40,
-                  height: 40,
-                  borderRadius: 20,
-                  backgroundColor: avatarColor(u.id),
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  marginRight: 12,
-                }}
-              >
-                <Text style={{ color: '#fff', fontWeight: '700' }}>
-                  {(u.full_name || u.username || '?').charAt(0).toUpperCase()}
-                </Text>
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={{ color: theme.text, fontSize: 15, fontWeight: '600' }}>
-                  {u.full_name || u.username}
-                </Text>
-                <Text style={{ color: theme.textMuted, fontSize: 12 }}>{u.email}</Text>
-                <Text
-                  style={{
-                    color: u.is_active ? theme.success : theme.textFaint,
-                    fontSize: 11,
-                    marginTop: 2,
-                  }}
-                >
-                  {u.is_active ? 'Active' : 'Deactivated'}
-                </Text>
-              </View>
-              <Pressable
-                onPress={() => toggleUserActive(u)}
-                disabled={pendingUserId === u.id}
-                style={{
+                  backgroundColor: theme.surface,
                   borderWidth: 1,
-                  borderColor: u.is_active ? theme.danger : theme.success,
-                  borderRadius: 8,
-                  paddingHorizontal: 12,
-                  paddingVertical: 8,
-                  minWidth: 96,
-                  alignItems: 'center',
-                  opacity: pendingUserId === u.id ? 0.5 : 1,
+                  borderColor: theme.border,
+                  borderRadius: 12,
+                  padding: 12,
+                  marginBottom: 10,
                 }}
               >
-                {pendingUserId === u.id ? (
-                  <ActivityIndicator color={theme.body} />
-                ) : (
-                  <Text
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <View
                     style={{
-                      color: u.is_active ? theme.danger : theme.success,
-                      fontSize: 13,
-                      fontWeight: '600',
+                      width: 40,
+                      height: 40,
+                      borderRadius: 20,
+                      backgroundColor: avatarColor(u.id),
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      marginRight: 12,
                     }}
                   >
-                    {u.is_active ? 'Deactivate' : 'Activate'}
+                    <Text style={{ color: '#fff', fontWeight: '700' }}>
+                      {(u.full_name || u.username || '?').charAt(0).toUpperCase()}
+                    </Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: theme.text, fontSize: 15, fontWeight: '600' }}>
+                      {u.full_name || u.username}
+                      {u.is_bot ? '  ·  bot' : ''}
+                    </Text>
+                    <Text style={{ color: theme.textMuted, fontSize: 12 }}>{u.email}</Text>
+                    <Text
+                      style={{
+                        color: u.is_active ? theme.success : theme.textMuted,
+                        fontSize: 11,
+                        marginTop: 2,
+                      }}
+                    >
+                      {u.is_active ? 'Active' : 'Deactivated'}
+                    </Text>
+                  </View>
+                  <Pressable
+                    onPress={() => toggleUserActive(u)}
+                    disabled={busy}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${u.is_active ? 'Deactivate' : 'Activate'} ${u.full_name || u.username}`}
+                    accessibilityState={{ disabled: busy, busy }}
+                    style={{
+                      borderWidth: 1,
+                      borderColor: u.is_active ? theme.danger : theme.success,
+                      borderRadius: 8,
+                      paddingHorizontal: 12,
+                      minHeight: MIN_TOUCH,
+                      minWidth: 100,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      opacity: busy ? 0.5 : 1,
+                    }}
+                  >
+                    <Text
+                      style={{
+                        color: u.is_active ? theme.danger : theme.success,
+                        fontSize: 13,
+                        fontWeight: '600',
+                      }}
+                    >
+                      {u.is_active ? 'Deactivate' : 'Activate'}
+                    </Text>
+                  </Pressable>
+                </View>
+
+                <Pressable
+                  onPress={() => setExpandedUserId(expanded ? null : u.id)}
+                  accessibilityRole="button"
+                  accessibilityLabel={expanded ? 'Hide role options' : `Change role for ${u.full_name || u.username}`}
+                  accessibilityState={{ expanded }}
+                  hitSlop={8}
+                  style={{ marginTop: 10, minHeight: 32, justifyContent: 'center' }}
+                >
+                  <Text style={{ color: theme.accent, fontSize: 13 }}>
+                    {expanded ? 'Hide role' : 'Change role…'}
                   </Text>
-                )}
-              </Pressable>
-            </View>
-          )}
+                </Pressable>
+
+                {expanded ? (
+                  <View style={{ marginTop: 8 }}>
+                    <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 8 }}>
+                      Role in {targetWorkspaceId ? workspaceName(targetWorkspaceId) : 'no workspace selected'}
+                    </Text>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                      {INVITE_ROLES.map((r) => (
+                        <Chip
+                          key={r}
+                          label={r}
+                          selected={false}
+                          onPress={() => setUserRole(u, r)}
+                          accessibilityLabel={`Set role ${r}`}
+                        />
+                      ))}
+                    </View>
+                  </View>
+                ) : null}
+              </View>
+            )
+          }}
         />
       )}
 
@@ -391,102 +537,93 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
           data={invitations}
           keyExtractor={(i) => i.id}
           contentContainerStyle={{ padding: 16 }}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={() => refresh(loadInvitations)}
+              tintColor={theme.accent}
+            />
+          }
           ListHeaderComponent={
-            <View
-              style={{
-                backgroundColor: theme.surface,
-                borderWidth: 1,
-                borderColor: theme.border,
-                borderRadius: 12,
-                padding: 16,
-                marginBottom: 16,
-              }}
-            >
-              <Text style={{ color: theme.text, fontSize: 15, fontWeight: '700', marginBottom: 12 }}>
-                Invite a new member
-              </Text>
-              <TextInput
-                value={inviteEmail}
-                onChangeText={setInviteEmail}
-                placeholder="email@example.com"
-                placeholderTextColor={theme.textFaint}
-                keyboardType="email-address"
-                autoCapitalize="none"
+            <View>
+              <View
                 style={{
-                  backgroundColor: theme.bg,
+                  backgroundColor: theme.surface,
                   borderWidth: 1,
-                  borderColor: theme.borderStrong,
-                  borderRadius: 10,
-                  paddingHorizontal: 12,
-                  paddingVertical: 10,
-                  color: theme.text,
-                  fontSize: 15,
-                  marginBottom: 12,
-                }}
-              />
-              <View style={{ flexDirection: 'row', marginBottom: 12 }}>
-                {(['member', 'admin'] as const).map((r) => {
-                  const active = inviteRole === r
-                  return (
-                    <Pressable
-                      key={r}
-                      onPress={() => setInviteRole(r)}
-                      style={{
-                        flex: 1,
-                        paddingVertical: 10,
-                        alignItems: 'center',
-                        borderWidth: 1,
-                        borderColor: active ? theme.primary : theme.borderStrong,
-                        backgroundColor: active ? theme.primary : 'transparent',
-                        borderRadius: 10,
-                        marginRight: r === 'member' ? 8 : 0,
-                      }}
-                    >
-                      <Text
-                        style={{
-                          color: active ? theme.primaryText : theme.body,
-                          fontWeight: '600',
-                          fontSize: 14,
-                        }}
-                      >
-                        {r === 'member' ? 'Member' : 'Admin'}
-                      </Text>
-                    </Pressable>
-                  )
-                })}
-              </View>
-              <Pressable
-                onPress={createInvitation}
-                disabled={creatingInvite}
-                style={{
-                  backgroundColor: theme.primary,
-                  borderRadius: 10,
-                  paddingVertical: 12,
-                  alignItems: 'center',
-                  opacity: creatingInvite ? 0.6 : 1,
+                  borderColor: theme.border,
+                  borderRadius: 12,
+                  padding: 16,
+                  marginBottom: 16,
                 }}
               >
-                {creatingInvite ? (
-                  <ActivityIndicator color={theme.primaryText} />
-                ) : (
-                  <Text style={{ color: theme.primaryText, fontSize: 15, fontWeight: '600' }}>
-                    Send invitation
+                <Text
+                  accessibilityRole="header"
+                  style={{ color: theme.text, fontSize: 15, fontWeight: '700', marginBottom: 12 }}
+                >
+                  Invite a new member
+                </Text>
+                {workspacePicker}
+                <Field
+                  label="Email"
+                  value={inviteEmail}
+                  onChangeText={setInviteEmail}
+                  placeholder="email@example.com"
+                  keyboardType="email-address"
+                />
+                <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 6 }}>Role</Text>
+                <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
+                  {INVITE_ROLES.map((r) => (
+                    <Chip
+                      key={r}
+                      label={r}
+                      selected={inviteRole === r}
+                      onPress={() => setInviteRole(r)}
+                      accessibilityLabel={`Invite as ${r}`}
+                    />
+                  ))}
+                </View>
+                <Button label="Send invitation" onPress={createInvitation} loading={creatingInvite} />
+              </View>
+
+              {lastCreated ? (
+                <View
+                  style={{
+                    backgroundColor: theme.surface,
+                    borderWidth: 1,
+                    borderColor: theme.primary,
+                    borderRadius: 12,
+                    padding: 16,
+                    marginBottom: 16,
+                  }}
+                >
+                  <Text style={{ color: theme.text, fontSize: 14, fontWeight: '700' }}>
+                    Invite link for {lastCreated.email}
                   </Text>
-                )}
-              </Pressable>
+                  <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 4, marginBottom: 8 }}>
+                    Shown once — the server stores only a hash. SuperOps does not send email.
+                  </Text>
+                  <Text selectable style={{ color: theme.accent, fontSize: 13, fontFamily: 'Courier' }}>
+                    {lastCreated.invite_url}
+                  </Text>
+                  <View style={{ height: 12 }} />
+                  <Button label="Dismiss" onPress={() => setLastCreated(null)} variant="ghost" />
+                </View>
+              ) : null}
             </View>
           }
           ListEmptyComponent={
-            invitesLoaded ? (
-              <Text style={{ color: theme.textMuted, fontSize: 14, textAlign: 'center' }}>
-                No invitations yet.
-              </Text>
+            invitesError ? (
+              <ErrorState message={invitesError} onRetry={loadInvitations} />
+            ) : invitesLoaded ? (
+              <EmptyState title="No invitations yet" />
             ) : (
-              <ActivityIndicator color={theme.accent} />
+              <LoadingState label="Loading invitations" />
             )
           }
           renderItem={({ item: i }) => (
             <View
+              accessible
+              accessibilityLabel={`${i.email}, ${i.role}, ${i.status}`}
               style={{
                 flexDirection: 'row',
                 alignItems: 'center',
@@ -501,17 +638,75 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
               <View style={{ flex: 1 }}>
                 <Text style={{ color: theme.text, fontSize: 15, fontWeight: '600' }}>{i.email}</Text>
                 <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
-                  {prettyLabel(i.role)}
+                  {i.role} · {workspaceName(i.workspace_id)}
+                  {i.invited_by ? ` · by ${i.invited_by}` : ''}
+                </Text>
+                <Text style={{ color: theme.textMuted, fontSize: 11, marginTop: 2 }}>
+                  expires {shortDate(i.expires_at)}
                 </Text>
               </View>
-              <Text
-                style={{
-                  color: i.accepted ? theme.success : theme.warning,
-                  fontSize: 12,
-                  fontWeight: '600',
-                }}
-              >
-                {i.accepted ? 'Accepted' : 'Pending'}
+              {/* The backend field is `status`; the screen used to read a
+                  non-existent `accepted`, so everything said "Pending". */}
+              <Text style={{ color: statusColor(i.status), fontSize: 12, fontWeight: '600' }}>
+                {i.status.charAt(0).toUpperCase() + i.status.slice(1)}
+              </Text>
+            </View>
+          )}
+        />
+      )}
+
+      {tab === 'audit' && (
+        <FlatList
+          data={audit}
+          keyExtractor={(a) => a.id}
+          contentContainerStyle={{ padding: 16 }}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={() => refresh(() => loadAudit())}
+              tintColor={theme.accent}
+            />
+          }
+          onEndReachedThreshold={0.4}
+          onEndReached={() => {
+            if (auditHasMore && !auditLoading) void loadAudit(auditCursor)
+          }}
+          ListEmptyComponent={
+            auditError ? (
+              <ErrorState message={auditError} onRetry={() => loadAudit()} />
+            ) : auditLoaded ? (
+              <EmptyState title="Nothing logged yet" />
+            ) : (
+              <LoadingState label="Loading audit log" />
+            )
+          }
+          ListFooterComponent={
+            <ListFooter
+              loading={auditLoading && audit.length > 0}
+              hasMore={auditHasMore}
+              onLoadMore={() => loadAudit(auditCursor)}
+            />
+          }
+          renderItem={({ item: a }) => (
+            <View
+              style={{
+                backgroundColor: theme.surface,
+                borderWidth: 1,
+                borderColor: theme.border,
+                borderRadius: 12,
+                padding: 12,
+                marginBottom: 10,
+              }}
+            >
+              <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }}>{a.action}</Text>
+              <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
+                {a.resource_type}
+                {a.resource_id ? ` · ${a.resource_id.slice(0, 8)}` : ''}
+                {a.workspace_id ? ` · ${workspaceName(a.workspace_id)}` : ''}
+              </Text>
+              <Text style={{ color: theme.textMuted, fontSize: 11, marginTop: 4 }}>
+                {new Date(a.created_at).toLocaleString()}
+                {a.ip_address ? ` · ${a.ip_address}` : ''}
               </Text>
             </View>
           )}

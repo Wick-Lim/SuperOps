@@ -2,137 +2,50 @@ import React, { useEffect, useState } from 'react'
 import {
   View,
   Text,
-  TextInput,
   Pressable,
   SafeAreaView,
   ScrollView,
   Alert,
   ActivityIndicator,
 } from 'react-native'
-import { theme, avatarColor } from '../lib/theme'
+import { theme, avatarColor, presenceColor } from '../lib/theme'
 import { userApi } from '../api/users'
 import { authApi } from '../api/auth'
 import { useAuthStore } from '../stores/authStore'
+import { useWorkspaceStore } from '../stores/workspaceStore'
+import { useUiStore } from '../stores/uiStore'
+import { wsManager } from '../lib/websocket'
+import { errorMessage } from '../api/client'
+import type { PresenceStatus } from '../lib/types'
+import QrCode from './internal/QrCode'
+import { useWorkspaceRole } from './internal/useWorkspaceRole'
+import { Button, Chip, Field, MIN_TOUCH, ScreenHeader, Section } from './internal/ui'
 
-// --- Small reusable presentational helpers -------------------------------
+const PRESENCE_OPTIONS: Array<{ key: PresenceStatus; label: string }> = [
+  { key: 'online', label: 'Active' },
+  { key: 'away', label: 'Away' },
+  { key: 'dnd', label: 'Do not disturb' },
+]
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <View style={{ marginBottom: 28 }}>
-      <Text
-        style={{
-          color: theme.textMuted,
-          fontSize: 11,
-          fontWeight: '700',
-          letterSpacing: 1,
-          marginBottom: 10,
-          paddingHorizontal: 4,
-        }}
-      >
-        {title.toUpperCase()}
-      </Text>
-      <View
-        style={{
-          backgroundColor: theme.surface,
-          borderWidth: 1,
-          borderColor: theme.border,
-          borderRadius: 12,
-          padding: 16,
-        }}
-      >
-        {children}
-      </View>
-    </View>
-  )
-}
-
-function Field({
-  label,
-  value,
-  onChangeText,
-  placeholder,
-  secureTextEntry,
-  autoCapitalize,
-  keyboardType,
-}: {
-  label: string
-  value: string
-  onChangeText: (t: string) => void
-  placeholder?: string
-  secureTextEntry?: boolean
-  autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters'
-  keyboardType?: 'default' | 'numeric'
-}) {
-  return (
-    <View style={{ marginBottom: 12 }}>
-      <Text style={{ color: theme.textFaint, fontSize: 12, marginBottom: 6 }}>{label}</Text>
-      <TextInput
-        value={value}
-        onChangeText={onChangeText}
-        placeholder={placeholder}
-        placeholderTextColor={theme.textFaint}
-        secureTextEntry={secureTextEntry}
-        autoCapitalize={autoCapitalize ?? 'none'}
-        keyboardType={keyboardType ?? 'default'}
-        style={{
-          backgroundColor: theme.bg,
-          borderWidth: 1,
-          borderColor: theme.borderStrong,
-          borderRadius: 10,
-          paddingHorizontal: 12,
-          paddingVertical: 10,
-          color: theme.text,
-          fontSize: 15,
-        }}
-      />
-    </View>
-  )
-}
-
-function Button({
-  label,
-  onPress,
-  loading,
-  variant,
-}: {
-  label: string
-  onPress: () => void
-  loading?: boolean
-  variant?: 'primary' | 'danger' | 'ghost'
-}) {
-  const bg =
-    variant === 'danger' ? theme.danger : variant === 'ghost' ? 'transparent' : theme.primary
-  const borderColor = variant === 'ghost' ? theme.borderStrong : bg
-  const textColor = variant === 'ghost' ? theme.body : theme.primaryText
+function NavRow({ label, detail, onPress }: { label: string; detail?: string; onPress: () => void }) {
   return (
     <Pressable
       onPress={onPress}
-      disabled={loading}
-      style={{
-        backgroundColor: bg,
-        borderWidth: 1,
-        borderColor,
-        borderRadius: 10,
-        paddingVertical: 12,
-        alignItems: 'center',
-        opacity: loading ? 0.6 : 1,
-      }}
+      accessibilityRole="button"
+      accessibilityLabel={detail ? `${label}, ${detail}` : label}
+      style={{ flexDirection: 'row', alignItems: 'center', minHeight: MIN_TOUCH, paddingVertical: 10 }}
     >
-      {loading ? (
-        <ActivityIndicator color={textColor} />
-      ) : (
-        <Text style={{ color: textColor, fontSize: 15, fontWeight: '600' }}>{label}</Text>
-      )}
+      <Text style={{ color: theme.body, fontSize: 15, flex: 1 }}>{label}</Text>
+      {detail ? <Text style={{ color: theme.textMuted, fontSize: 13, marginRight: 6 }}>{detail}</Text> : null}
+      <Text style={{ color: theme.textMuted, fontSize: 18 }}>›</Text>
     </Pressable>
   )
 }
 
-// --- Screen --------------------------------------------------------------
-
 export default function SettingsScreen({ navigation }: { navigation: any; route: any }) {
   const user = useAuthStore((s) => s.user)
-  const setUser = useAuthStore((s) => s.setUser)
-  const logout = useAuthStore((s) => s.logout)
+  const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace)
+  const presence = useUiStore((s) => s.presence)
 
   // Profile
   const [fullName, setFullName] = useState(user?.full_name ?? '')
@@ -157,6 +70,13 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
   const [backupCodes, setBackupCodes] = useState<string[] | null>(null)
   const [disableCode, setDisableCode] = useState('')
 
+  /**
+   * AdminScreen was registered in the navigator and reachable from nowhere.
+   * Show the entry only when the caller really administers this workspace —
+   * `/admin/*` answers 403 to everyone else.
+   */
+  const { isAdmin: isWorkspaceAdmin } = useWorkspaceRole()
+
   useEffect(() => {
     authApi
       .totpStatus()
@@ -172,40 +92,54 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
     setSavingProfile(true)
     try {
       const res = await userApi.updateMe({ full_name: fullName.trim() })
-      if (res.data) setUser(res.data)
+      if (res.data) await useAuthStore.getState().setUser(res.data)
       Alert.alert('Saved', 'Your profile has been updated')
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to update profile')
+      Alert.alert('Error', errorMessage(err, 'Failed to update profile'))
     } finally {
       setSavingProfile(false)
     }
   }
 
-  const saveStatus = async () => {
+  /**
+   * status_text / status_emoji round-trip through the API now, so the stored
+   * user is updated from the response instead of from what we hoped we sent.
+   */
+  const writeStatus = async (text: string, emoji: string) => {
     setSavingStatus(true)
     try {
-      await userApi.updateStatus({ status_text: statusText.trim(), status_emoji: statusEmoji.trim() })
-      if (user) setUser({ ...user, status_text: statusText.trim(), status_emoji: statusEmoji.trim() })
-      Alert.alert('Saved', 'Your status has been updated')
+      const res = await userApi.updateStatus({ status_text: text, status_emoji: emoji })
+      setStatusText(res.data.status_text)
+      setStatusEmoji(res.data.status_emoji)
+      const current = useAuthStore.getState().user
+      if (current) {
+        await useAuthStore.getState().setUser({
+          ...current,
+          status_text: res.data.status_text,
+          status_emoji: res.data.status_emoji,
+        })
+      }
+      return true
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to update status')
+      Alert.alert('Error', errorMessage(err, 'Failed to update status'))
+      return false
     } finally {
       setSavingStatus(false)
     }
   }
 
-  const clearStatus = async () => {
-    setSavingStatus(true)
-    try {
-      await userApi.updateStatus({ status_text: '', status_emoji: '' })
-      setStatusText('')
-      setStatusEmoji('')
-      if (user) setUser({ ...user, status_text: '', status_emoji: '' })
-    } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to clear status')
-    } finally {
-      setSavingStatus(false)
+  const saveStatus = async () => {
+    if (await writeStatus(statusText.trim(), statusEmoji.trim())) {
+      Alert.alert('Saved', 'Your status has been updated')
     }
+  }
+
+  const clearStatus = () => void writeStatus('', '')
+
+  const setPresenceStatus = (status: PresenceStatus) => {
+    // Presence is a realtime-only concept; there is no REST route for it.
+    wsManager.setPresence(status)
+    if (user) useUiStore.getState().setUserPresence(user.id, status)
   }
 
   const changePassword = async () => {
@@ -224,7 +158,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
       setNewPassword('')
       Alert.alert('Done', 'Your password has been changed')
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to change password')
+      Alert.alert('Error', errorMessage(err, 'Failed to change password'))
     } finally {
       setChangingPw(false)
     }
@@ -238,7 +172,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
       setSetupUrl(res.data?.otpauth_url ?? '')
       setBackupCodes(null)
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to start 2FA setup')
+      Alert.alert('Error', errorMessage(err, 'Failed to start 2FA setup'))
     } finally {
       setTotpLoading(false)
     }
@@ -258,7 +192,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
       setSetupUrl(null)
       setTotpCode('')
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Invalid code')
+      Alert.alert('Error', errorMessage(err, 'Invalid code'))
     } finally {
       setTotpLoading(false)
     }
@@ -283,7 +217,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
       setBackupCodes(null)
       Alert.alert('Done', 'Two-factor authentication has been disabled')
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to disable 2FA')
+      Alert.alert('Error', errorMessage(err, 'Failed to disable 2FA'))
     } finally {
       setTotpLoading(false)
     }
@@ -292,28 +226,15 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
   const confirmLogout = () => {
     Alert.alert('Log out', 'Are you sure you want to log out?', [
       { text: 'Cancel', style: 'cancel' },
-      { text: 'Log out', style: 'destructive', onPress: () => logout() },
+      { text: 'Log out', style: 'destructive', onPress: () => void useAuthStore.getState().logout() },
     ])
   }
 
+  const myPresence: PresenceStatus = (user ? presence[user.id] : undefined) ?? 'online'
+
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-      {/* Header */}
-      <View
-        style={{
-          height: 56,
-          paddingHorizontal: 16,
-          flexDirection: 'row',
-          alignItems: 'center',
-          borderBottomWidth: 1,
-          borderBottomColor: theme.border,
-        }}
-      >
-        <Pressable onPress={() => navigation.goBack()} hitSlop={12} style={{ marginRight: 12 }}>
-          <Text style={{ color: theme.accent, fontSize: 16 }}>‹ Back</Text>
-        </Pressable>
-        <Text style={{ color: theme.text, fontSize: 17, fontWeight: '700', flex: 1 }}>Settings</Text>
-      </View>
+      <ScreenHeader title="Settings" onBack={() => navigation.goBack()} />
 
       <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 48 }}>
         {/* Account identity */}
@@ -334,41 +255,102 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
             </Text>
           </View>
           <View style={{ flex: 1 }}>
-            <Text style={{ color: theme.text, fontSize: 18, fontWeight: '700' }}>
+            <Text accessibilityRole="header" style={{ color: theme.text, fontSize: 18, fontWeight: '700' }}>
               {user?.full_name || user?.username || 'Unknown'}
             </Text>
             <Text style={{ color: theme.textMuted, fontSize: 13 }}>{user?.email || ''}</Text>
           </View>
+          <View
+            accessible
+            accessibilityLabel={`Presence: ${myPresence}`}
+            style={{
+              width: 12,
+              height: 12,
+              borderRadius: 6,
+              backgroundColor: presenceColor[myPresence] ?? presenceColor.offline,
+            }}
+          />
         </View>
+
+        {/* Availability */}
+        <Section title="Availability">
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            {PRESENCE_OPTIONS.map((p) => (
+              <Chip
+                key={p.key}
+                label={p.label}
+                selected={myPresence === p.key}
+                onPress={() => setPresenceStatus(p.key)}
+                accessibilityLabel={`Set availability to ${p.label}`}
+              />
+            ))}
+          </View>
+        </Section>
 
         {/* Profile */}
         <Section title="Profile">
-          <Field label="Full name" value={fullName} onChangeText={setFullName} placeholder="Your name" autoCapitalize="words" />
+          <Field
+            label="Full name"
+            value={fullName}
+            onChangeText={setFullName}
+            placeholder="Your name"
+            autoCapitalize="words"
+          />
           <Button label="Save profile" onPress={saveProfile} loading={savingProfile} />
         </Section>
 
         {/* Custom status */}
         <Section title="Custom status">
-          <Field label="Emoji" value={statusEmoji} onChangeText={setStatusEmoji} placeholder=":wave:" />
-          <Field label="Status text" value={statusText} onChangeText={setStatusText} placeholder="What's happening?" autoCapitalize="sentences" />
+          <Field label="Emoji" value={statusEmoji} onChangeText={setStatusEmoji} placeholder="🎧" maxLength={8} />
+          <Field
+            label="Status text"
+            value={statusText}
+            onChangeText={setStatusText}
+            placeholder="What's happening?"
+            autoCapitalize="sentences"
+            maxLength={100}
+          />
           <Button label="Save status" onPress={saveStatus} loading={savingStatus} />
           <View style={{ height: 8 }} />
           <Button label="Clear status" onPress={clearStatus} variant="ghost" />
         </Section>
 
+        {/* Saved items / admin */}
+        <Section title="Your stuff">
+          <NavRow label="Bookmarks" onPress={() => navigation.navigate('Bookmarks')} />
+          {isWorkspaceAdmin ? (
+            <NavRow
+              label="Admin panel"
+              detail={activeWorkspace?.name}
+              onPress={() => navigation.navigate('Admin')}
+            />
+          ) : null}
+        </Section>
+
         {/* Change password */}
         <Section title="Change password">
-          <Field label="Current password" value={oldPassword} onChangeText={setOldPassword} secureTextEntry placeholder="••••••••" />
-          <Field label="New password" value={newPassword} onChangeText={setNewPassword} secureTextEntry placeholder="At least 8 characters" />
+          <Field
+            label="Current password"
+            value={oldPassword}
+            onChangeText={setOldPassword}
+            secureTextEntry
+            placeholder="••••••••"
+          />
+          <Field
+            label="New password"
+            value={newPassword}
+            onChangeText={setNewPassword}
+            secureTextEntry
+            placeholder="At least 8 characters"
+          />
           <Button label="Update password" onPress={changePassword} loading={changingPw} />
         </Section>
 
         {/* Two-factor auth */}
         <Section title="Two-factor authentication">
           {totpEnabled === null ? (
-            <ActivityIndicator color={theme.accent} />
+            <ActivityIndicator color={theme.accent} accessibilityLabel="Checking two-factor status" />
           ) : backupCodes ? (
-            // One-time backup codes display (after verify)
             <View>
               <Text style={{ color: theme.success, fontSize: 15, fontWeight: '700', marginBottom: 8 }}>
                 2FA enabled
@@ -400,7 +382,6 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
               <Button label="I saved my codes" onPress={() => setBackupCodes(null)} variant="ghost" />
             </View>
           ) : totpEnabled ? (
-            // Enabled — offer disable
             <View>
               <Text style={{ color: theme.success, fontSize: 15, fontWeight: '600', marginBottom: 4 }}>
                 Enabled
@@ -413,17 +394,26 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
                 value={disableCode}
                 onChangeText={setDisableCode}
                 placeholder="000000"
-                keyboardType="numeric"
+                keyboardType="number-pad"
+                maxLength={6}
               />
               <Button label="Disable 2FA" onPress={disableTotp} loading={totpLoading} variant="danger" />
             </View>
           ) : setupSecret !== null ? (
-            // Mid-setup — show secret + url + verify input
             <View>
-              <Text style={{ color: theme.body, fontSize: 14, marginBottom: 8 }}>
-                Scan this in your authenticator app, or add the secret manually.
+              <Text style={{ color: theme.body, fontSize: 14, marginBottom: 12 }}>
+                Scan this with your authenticator app, or add the secret manually.
               </Text>
-              <Text style={{ color: theme.textFaint, fontSize: 12, marginBottom: 4 }}>Secret</Text>
+
+              {/* The instruction used to be unfollowable: only the base32 secret
+                  and the raw otpauth URL were shown, with nothing to scan. */}
+              {setupUrl ? (
+                <View style={{ alignItems: 'center', marginBottom: 16 }}>
+                  <QrCode value={setupUrl} size={220} accessibilityLabel="Two-factor setup QR code" />
+                </View>
+              ) : null}
+
+              <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 4 }}>Secret</Text>
               <View
                 style={{
                   backgroundColor: theme.bg,
@@ -434,23 +424,12 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
                   marginBottom: 12,
                 }}
               >
-                <Text selectable style={{ color: theme.text, fontSize: 15, fontFamily: 'Courier' }}>
+                <Text
+                  selectable
+                  accessibilityLabel={`Setup secret ${setupSecret.split('').join(' ')}`}
+                  style={{ color: theme.text, fontSize: 15, fontFamily: 'Courier' }}
+                >
                   {setupSecret}
-                </Text>
-              </View>
-              <Text style={{ color: theme.textFaint, fontSize: 12, marginBottom: 4 }}>otpauth URL</Text>
-              <View
-                style={{
-                  backgroundColor: theme.bg,
-                  borderWidth: 1,
-                  borderColor: theme.borderStrong,
-                  borderRadius: 10,
-                  padding: 12,
-                  marginBottom: 12,
-                }}
-              >
-                <Text selectable style={{ color: theme.textMuted, fontSize: 12 }}>
-                  {setupUrl}
                 </Text>
               </View>
               <Field
@@ -458,25 +437,23 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
                 value={totpCode}
                 onChangeText={setTotpCode}
                 placeholder="000000"
-                keyboardType="numeric"
+                keyboardType="number-pad"
+                maxLength={6}
               />
               <Button label="Verify & enable" onPress={verifyTotp} loading={totpLoading} />
               <View style={{ height: 8 }} />
               <Button label="Cancel" onPress={cancelTotpSetup} variant="ghost" />
             </View>
           ) : (
-            // Disabled — offer setup
             <View>
               <Text style={{ color: theme.textMuted, fontSize: 13, marginBottom: 12 }}>
-                Add an extra layer of security by requiring a code from an authenticator app when you sign
-                in.
+                Add an extra layer of security by requiring a code from an authenticator app when you sign in.
               </Text>
               <Button label="Enable 2FA" onPress={startTotpSetup} loading={totpLoading} />
             </View>
           )}
         </Section>
 
-        {/* Logout */}
         <Button label="Log out" onPress={confirmLogout} variant="danger" />
       </ScrollView>
     </SafeAreaView>

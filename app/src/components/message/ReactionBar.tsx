@@ -1,14 +1,26 @@
-import React from 'react'
-import { View, Text, Pressable, Alert } from 'react-native'
+import React, { useMemo } from 'react'
+import { Alert, Image, Pressable, Text, View } from 'react-native'
 import type { Message, Reaction } from '../../lib/types'
 import { theme } from '../../lib/theme'
 import { messageApi } from '../../api/messages'
+import { errorMessage } from '../../api/client'
 import { useAuthStore } from '../../stores/authStore'
 import { useMessageStore } from '../../stores/messageStore'
+import type { CustomEmoji } from '../../api/emoji'
+import { customEmojiUrl, findCustomEmoji } from './customEmoji'
+import { touchSlop } from '../a11y'
 
 interface Props {
   message: Message
   onAddReaction?: (message: Message) => void
+  /**
+   * Overrides the default store-backed toggle. Thread replies are not in
+   * `messageStore` (the channel list excludes them server-side), so
+   * `applyReaction` would be a silent no-op for them.
+   */
+  onToggle?: (message: Message, emoji: string, mine: boolean) => void
+  /** Workspace custom emoji, so a `:name:` reaction renders as its image. */
+  customEmoji?: CustomEmoji[]
 }
 
 interface Group {
@@ -28,15 +40,20 @@ function groupReactions(reactions: Reaction[], userId: string | undefined): Grou
   return Array.from(map.values())
 }
 
-export default function ReactionBar({ message, onAddReaction }: Props) {
+const NO_EMOJI: CustomEmoji[] = []
+
+function ReactionBarBase({ message, onAddReaction, onToggle, customEmoji = NO_EMOJI }: Props) {
   const userId = useAuthStore((s) => s.user?.id)
   const reactions = message.reactions ?? []
-  const groups = groupReactions(reactions, userId)
+  const groups = useMemo(() => groupReactions(reactions, userId), [reactions, userId])
 
   const toggle = async (emoji: string, mine: boolean) => {
     if (!userId) return
+    if (onToggle) {
+      onToggle(message, emoji, mine)
+      return
+    }
     const apply = useMessageStore.getState().applyReaction
-    // Optimistic update.
     const optimistic: Reaction = {
       id: '',
       message_id: message.id,
@@ -49,9 +66,8 @@ export default function ReactionBar({ message, onAddReaction }: Props) {
       if (mine) await messageApi.unreact(message.channel_id, message.id, emoji)
       else await messageApi.react(message.channel_id, message.id, emoji)
     } catch (err) {
-      // Roll back on failure.
       apply(message.channel_id, optimistic, mine)
-      Alert.alert('Error', err instanceof Error ? err.message : 'Could not update reaction')
+      Alert.alert('Error', errorMessage(err, 'Could not update reaction'))
     }
   }
 
@@ -59,37 +75,58 @@ export default function ReactionBar({ message, onAddReaction }: Props) {
 
   return (
     <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
-      {groups.map((g) => (
-        <Pressable
-          key={g.emoji}
-          onPress={() => toggle(g.emoji, g.mine)}
-          style={{
-            flexDirection: 'row',
-            alignItems: 'center',
-            gap: 4,
-            paddingHorizontal: 8,
-            paddingVertical: 3,
-            borderRadius: 12,
-            borderWidth: 1,
-            backgroundColor: g.mine ? '#312e81' : theme.surface,
-            borderColor: g.mine ? theme.primary : theme.border,
-          }}
-        >
-          <Text style={{ fontSize: 13 }}>{g.emoji}</Text>
-          <Text style={{ color: g.mine ? theme.accent : theme.textMuted, fontSize: 12, fontWeight: '600' }}>
-            {g.count}
-          </Text>
-        </Pressable>
-      ))}
+      {groups.map((g) => {
+        const custom = findCustomEmoji(customEmoji, g.emoji)
+        return (
+          <Pressable
+            key={g.emoji}
+            onPress={() => toggle(g.emoji, g.mine)}
+            hitSlop={touchSlop(28)}
+            accessibilityRole="button"
+            accessibilityState={{ selected: g.mine }}
+            accessibilityLabel={`${g.emoji} ${g.count}`}
+            accessibilityHint={g.mine ? 'Removes your reaction' : 'Adds your reaction'}
+            style={{
+              flexDirection: 'row',
+              alignItems: 'center',
+              gap: 4,
+              paddingHorizontal: 8,
+              paddingVertical: 4,
+              borderRadius: 12,
+              borderWidth: 1,
+              backgroundColor: g.mine ? '#312e81' : theme.surface,
+              borderColor: g.mine ? theme.primary : theme.border,
+            }}
+          >
+            {custom ? (
+              <Image
+                source={{ uri: customEmojiUrl(custom) }}
+                style={{ width: 16, height: 16 }}
+                resizeMode="contain"
+              />
+            ) : (
+              <Text style={{ fontSize: 13 }}>{g.emoji}</Text>
+            )}
+            <Text style={{ color: g.mine ? theme.accent : theme.textMuted, fontSize: 12, fontWeight: '600' }}>
+              {g.count}
+            </Text>
+          </Pressable>
+        )
+      })}
 
       {onAddReaction && (
         <Pressable
           onPress={() => onAddReaction(message)}
+          hitSlop={touchSlop(28)}
+          accessibilityRole="button"
+          accessibilityLabel="Add reaction"
           style={{
+            minWidth: 32,
             paddingHorizontal: 9,
-            paddingVertical: 3,
+            paddingVertical: 4,
             borderRadius: 12,
             borderWidth: 1,
+            alignItems: 'center',
             backgroundColor: theme.surface,
             borderColor: theme.border,
           }}
@@ -100,3 +137,5 @@ export default function ReactionBar({ message, onAddReaction }: Props) {
     </View>
   )
 }
+
+export default React.memo(ReactionBarBase)
