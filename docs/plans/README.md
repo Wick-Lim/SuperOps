@@ -9,7 +9,7 @@ named, and explicit cuts.
 | [00-permissions](00-permissions.md) | Phase 0 — object-level permissions | Design. **Blocks everything.** |
 | [01-phase0-remainder](01-phase0-remainder.md) | Phase 0 — unified inbox + audit | **Implemented** (`020`, `021`) |
 | [02-drive](02-drive.md) | Phase 1 — Drive + editor registry | **Implemented** (`025`–`028`) |
-| [03-work-tracking](03-work-tracking.md) | Phase 2 — issues, boards, cycles | Plan |
+| [03-work-tracking](03-work-tracking.md) | Phase 2 — issues, boards, cycles | **Implemented** (`030`, `031`) |
 | [04-docs](04-docs.md) | Phase 3 — block editor | Plan |
 | [05-spreadsheet](05-spreadsheet.md) | Phase 4 — grid + formula engine | Plan |
 | [06-design-surface](06-design-surface.md) | Phase 5 — bounded design surface | Plan |
