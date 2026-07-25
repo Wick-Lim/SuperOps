@@ -57,6 +57,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("GET /api/v1/workspaces/{workspace_id}/drive/root", authMw(http.HandlerFunc(h.Root)))
 	mux.Handle("POST /api/v1/workspaces/{workspace_id}/drive/folders", authMw(http.HandlerFunc(h.CreateFolder)))
 	mux.Handle("POST /api/v1/workspaces/{workspace_id}/drive/files", authMw(http.HandlerFunc(h.CreateFile)))
+	mux.Handle("POST /api/v1/workspaces/{workspace_id}/drive/files/upload", authMw(http.HandlerFunc(h.UploadFile)))
+	mux.Handle("GET /api/v1/workspaces/{workspace_id}/drive/usage", authMw(http.HandlerFunc(h.Usage)))
+	mux.Handle("PUT /api/v1/workspaces/{workspace_id}/drive/quota", authMw(http.HandlerFunc(h.SetQuota)))
 
 	mux.Handle("GET /api/v1/drive/folders/{folder_id}", authMw(http.HandlerFunc(h.GetFolder)))
 	mux.Handle("GET /api/v1/drive/folders/{folder_id}/children", authMw(http.HandlerFunc(h.ListChildren)))

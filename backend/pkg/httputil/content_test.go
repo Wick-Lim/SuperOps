@@ -1,4 +1,4 @@
-package file
+package httputil
 
 import (
 	"bytes"
@@ -29,8 +29,8 @@ func TestCanServeInline(t *testing.T) {
 		{`text/html; x="image/png"`, false},
 	}
 	for _, tt := range tests {
-		if got := canServeInline(tt.ct); got != tt.want {
-			t.Errorf("canServeInline(%q) = %v, want %v", tt.ct, got, tt.want)
+		if got := CanServeInline(tt.ct); got != tt.want {
+			t.Errorf("CanServeInline(%q) = %v, want %v", tt.ct, got, tt.want)
 		}
 	}
 }
@@ -43,8 +43,8 @@ func TestMediaTypeNormalises(t *testing.T) {
 		"not a media type":          "application/octet-stream",
 	}
 	for in, want := range tests {
-		if got := mediaType(in); got != want {
-			t.Errorf("mediaType(%q) = %q, want %q", in, got, want)
+		if got := MediaType(in); got != want {
+			t.Errorf("MediaType(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -53,14 +53,14 @@ func TestSniffContentTypeIgnoresClaimedType(t *testing.T) {
 	// A .png named file whose bytes are HTML must be classified as HTML (and so
 	// downloaded, not rendered).
 	body := bytes.NewReader([]byte("<!DOCTYPE html><html><body><script>steal()</script></body></html>"))
-	got, err := sniffContentType(body)
+	got, err := SniffContentType(body)
 	if err != nil {
 		t.Fatalf("sniffContentType: %v", err)
 	}
 	if got != "text/html" {
 		t.Fatalf("sniffed %q, want text/html", got)
 	}
-	if canServeInline(got) {
+	if CanServeInline(got) {
 		t.Fatal("html must never be servable inline")
 	}
 	// The reader must be rewound so the upload streams from byte zero.
@@ -70,7 +70,7 @@ func TestSniffContentTypeIgnoresClaimedType(t *testing.T) {
 }
 
 func TestSniffContentTypeShortInput(t *testing.T) {
-	got, err := sniffContentType(bytes.NewReader([]byte("hi")))
+	got, err := SniffContentType(bytes.NewReader([]byte("hi")))
 	if err != nil {
 		t.Fatalf("sniffContentType: %v", err)
 	}

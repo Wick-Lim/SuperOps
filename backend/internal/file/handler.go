@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,8 +32,6 @@ const (
 	// small value the file part spills to a temp file and is streamed to MinIO
 	// from there.
 	multipartMemory = 1 << 20 // 1MB
-	// sniffLen is the number of leading bytes http.DetectContentType inspects.
-	sniffLen = 512
 )
 
 // Auditor records egress. *audit.Service is the implementation; the interface
@@ -69,52 +65,6 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 // token in the URL query, so anything scriptable served inline is stored XSS
 // plus token exfiltration. text/html, image/svg+xml and friends are absent on
 // purpose; everything not listed is forced to a download.
-var inlineTypes = map[string]bool{
-	"image/png":                true,
-	"image/jpeg":               true,
-	"image/gif":                true,
-	"image/webp":               true,
-	"image/bmp":                true,
-	"image/x-icon":             true,
-	"image/vnd.microsoft.icon": true,
-	"application/pdf":          true,
-	"text/plain":               true,
-	"audio/mpeg":               true,
-	"audio/wav":                true,
-	"video/mp4":                true,
-	"video/webm":               true,
-}
-
-// mediaType strips parameters and normalises case. An unparseable value is
-// treated as the octet-stream default rather than passed through.
-func mediaType(ct string) string {
-	base, _, err := mime.ParseMediaType(ct)
-	if err != nil || base == "" {
-		return "application/octet-stream"
-	}
-	return strings.ToLower(base)
-}
-
-// canServeInline reports whether a content type may be sent with
-// `Content-Disposition: inline`.
-func canServeInline(ct string) bool {
-	return inlineTypes[mediaType(ct)]
-}
-
-// sniffContentType classifies the upload server-side. The multipart part header
-// is attacker-controlled and was previously echoed straight back on download,
-// so it is discarded entirely.
-func sniffContentType(f io.ReadSeeker) (string, error) {
-	buf := make([]byte, sniffLen)
-	n, err := io.ReadFull(f, buf)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return "", fmt.Errorf("read upload head: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return "", fmt.Errorf("rewind upload: %w", err)
-	}
-	return mediaType(http.DetectContentType(buf[:n])), nil
-}
 
 // --- handlers ----------------------------------------------------------------
 
@@ -160,7 +110,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType, err := sniffContentType(file)
+	contentType, err := httputil.SniffContentType(file)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -334,10 +284,10 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 
 	// Serve the type we sniffed at upload time, never the one MinIO echoes back
 	// from the original request, and never without nosniff.
-	contentType := mediaType(f.ContentType)
+	contentType := httputil.MediaType(f.ContentType)
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Disposition", httputil.ContentDisposition(f.Name, canServeInline(contentType)))
+	w.Header().Set("Content-Disposition", httputil.ContentDisposition(f.Name, httputil.CanServeInline(contentType)))
 	// Defence in depth for the types that are still rendered inline.
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; object-src 'none'; frame-ancestors 'none'; sandbox")
 	w.Header().Set("Referrer-Policy", "no-referrer")
