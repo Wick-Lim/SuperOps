@@ -46,7 +46,7 @@ without colliding with a phase that has not started:
 | `040`–`044` | spreadsheet (plan 05) — **DELIBERATELY UNSPENT.** The spreadsheet's whole backend is a `registry.Kind`; it needs no migration, no route and no table. `040` remains the lowest free number. |
 | `045`–`049` | design surface (plan 06) — **DELIBERATELY UNSPENT**, for the same reason. Plan 06's `preview_seq` column is not built: a preview is a thumbnail, and Drive already has one. |
 | `050`–`054` | huddle (plan 07) — `050` taken (`huddles`, `huddle_participants`, `huddle_webhook_events`); `051`–`054` free. Adds ZERO arms to `acl_object_expected` and zero to `acl_key_expected`: a huddle is not an ACL object, it is exactly as accessible as its scope. |
-| `055`–`059` | email (plan 08) |
+| `055`–`059` | email (plan 08) — `055` taken (mail domains, mailboxes, conversations, messages, inbound events, ingest tokens; `files.mail_message_id`; the `idx_files_unowned` rebuild; one new arm in `acl_object_expected`). `acl_key_expected` is UNCHANGED — a conversation is a container and the container arm already inherits its grants. `056`–`059` free. |
 | `060`–`064` | workflow (plan 09) |
 
 Rules:
@@ -152,7 +152,16 @@ Plan 08's list of required edits is **incomplete in the dangerous direction**:
 the bucket sweep deletes any object whose key is absent from
 `files.storage_key`/`thumbnail_key` (`internal/file/repository.go:100-122`),
 and plan 08 stores raw RFC822 originals under a `raw_key` with no `files` row.
-As written, every archived email is swept. Plan 08 must add that arm.
+As written, every archived email is swept.
+
+**Closed** in migration `055`'s own change: `StorageKeysPresent` gained TWO arms
+(`mail_messages.raw_key` and `mail_inbound_events.raw_key` — one per table that
+can name an object key, which is the invariant), `ListOrphans` gained the
+`mail_message_id` clause, `idx_files_unowned` was rebuilt to match it, and
+`TestGCPredicatesFailIfReverted` gained a third block that runs the PRE-MAIL
+predicates against the same fixtures and asserts they get it wrong.
+`TestEveryStorageKeyColumnIsNamedInThePredicate` reads `information_schema` and
+now fails by name if a future pillar adds a key column without an arm.
 
 ### 3. Access-key encoding — the shipped format wins (high)
 

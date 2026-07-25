@@ -89,10 +89,15 @@ func (r *Repository) ListOrphans(ctx context.Context, cutoff time.Time, limit in
 		limit = 500
 	}
 	rows, err := r.pool.Query(ctx,
+		// EVERY OWNER, NAMED. A file owned by a folder, a chat message, a mail
+		// message or the trash is not an orphan. Each clause was added with the
+		// owner it names, and TestGCPredicatesFailIfReverted runs the OLDER
+		// predicates against the same fixtures to prove each one is doing work.
 		`SELECT id, storage_key, COALESCE(thumbnail_key, '') FROM files
-		  WHERE folder_id  IS NULL
-		    AND message_id IS NULL
-		    AND trashed_at IS NULL
+		  WHERE folder_id       IS NULL
+		    AND message_id      IS NULL
+		    AND mail_message_id IS NULL
+		    AND trashed_at      IS NULL
 		    AND created_at < $1
 		  ORDER BY created_at
 		  LIMIT $2`, cutoff, limit)
@@ -172,12 +177,25 @@ func (r *Repository) StorageKeysPresent(ctx context.Context, keys []string) (map
 	if len(keys) == 0 {
 		return present, nil
 	}
+	// ONE ARM PER TABLE THAT CAN NAME AN OBJECT KEY. That is the invariant this
+	// query has, and TestEveryStorageKeyColumnIsNamedInThePredicate enforces it
+	// against information_schema — because the failure mode is silent deletion
+	// of data whose owner this query has never heard of.
+	//
+	// The two mail arms are the reason: a raw RFC822 original lives in the same
+	// bucket with NO files row, so without them the sweep deletes every
+	// archived email an hour after it arrives. That is not a stale index or a
+	// broken thumbnail; it is the customer's correspondence, gone.
 	rows, err := r.pool.Query(ctx,
-		`SELECT storage_key   FROM files         WHERE storage_key   = ANY($1)
+		`SELECT storage_key   FROM files               WHERE storage_key   = ANY($1)
 		  UNION
-		 SELECT thumbnail_key FROM files         WHERE thumbnail_key = ANY($1)
+		 SELECT thumbnail_key FROM files               WHERE thumbnail_key = ANY($1)
 		  UNION
-		 SELECT storage_key   FROM file_versions WHERE storage_key   = ANY($1)`, keys)
+		 SELECT storage_key   FROM file_versions       WHERE storage_key   = ANY($1)
+		  UNION
+		 SELECT raw_key       FROM mail_messages       WHERE raw_key       = ANY($1)
+		  UNION
+		 SELECT raw_key       FROM mail_inbound_events WHERE raw_key       = ANY($1)`, keys)
 	if err != nil {
 		return nil, fmt.Errorf("check storage keys: %w", err)
 	}

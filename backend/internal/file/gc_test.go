@@ -481,6 +481,91 @@ func TestGCPredicatesFailIfReverted(t *testing.T) {
 		t.Error("the old StorageKeysPresent predicate DID find the version object, so " +
 			"TestStorageKeysPresentCoversEveryReference would pass against a revert and proves nothing")
 	}
+
+	// THE MAIL BLOCK, and it is the one with the worst consequence.
+	//
+	// A raw RFC822 original lives in the same bucket with NO files row, so the
+	// pre-mail StorageKeysPresent reports it unreferenced — and the sweep works
+	// from the bucket inwards, so "unreferenced" is proof to the sweeper that
+	// the object is garbage. Reverting that arm deletes every archived email an
+	// hour after it arrives.
+	rawKey := "revert-raw-" + uniqueSuffix()
+	must(t, f.pool.QueryRow(ctx, `
+		WITH d AS (
+			INSERT INTO mail_domains (workspace_id, domain, verify_token)
+			VALUES ($1, 'revert-' || substr(md5(random()::text), 1, 8) || '.test', 'tok')
+			RETURNING id
+		), mb AS (
+			INSERT INTO mailboxes (workspace_id, domain_id, address, prefix)
+			SELECT $1, d.id, 'revert-' || substr(md5(random()::text), 1, 8) || '@revert.test', 'REV'
+			  FROM d RETURNING id
+		), c AS (
+			INSERT INTO mail_conversations (mailbox_id, workspace_id, number)
+			SELECT mb.id, $1, 1 FROM mb RETURNING id
+		)
+		INSERT INTO mail_messages (conversation_id, direction, message_id, raw_key, sent_at)
+		SELECT c.id, 'inbound', 'mid-' || $2, $2, NOW() FROM c
+		RETURNING raw_key`, f.workspace, rawKey).Scan(&rawKey))
+
+	must(t, f.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+		     SELECT storage_key   FROM files         WHERE storage_key   = $1
+		      UNION
+		     SELECT thumbnail_key FROM files         WHERE thumbnail_key = $1
+		      UNION
+		     SELECT storage_key   FROM file_versions WHERE storage_key   = $1)`,
+		rawKey).Scan(&referenced))
+	if referenced {
+		t.Error("the pre-mail StorageKeysPresent predicate found the raw email object, so " +
+			"the arms added for it prove nothing")
+	}
+
+	// And the live query DOES find it — which is the half that matters.
+	repo := NewRepository(f.pool)
+	present, err := repo.StorageKeysPresent(ctx, []string{rawKey})
+	must(t, err)
+	if !present[rawKey] {
+		t.Fatal("StorageKeysPresent does NOT name the raw email object; the bucket sweep " +
+			"will delete every archived email an hour after it arrives")
+	}
+
+	// The mail-owner clause in ListOrphans, same shape. An attachment owned by a
+	// mail message is not an orphan, and the pre-mail predicate says it is.
+	// The UPDATE and the check are separate statements on purpose: a subquery
+	// inside RETURNING is evaluated against the snapshot from the START of the
+	// statement, so it would report the file's OLD ownership and this assertion
+	// would pass for the wrong reason.
+	_, err = f.pool.Exec(ctx, `
+		UPDATE files
+		   SET mail_message_id = (SELECT id FROM mail_messages WHERE raw_key = $2),
+		       folder_id = NULL
+		 WHERE id = $1`, driveFile, rawKey)
+	must(t, err)
+
+	var attachmentCollected bool
+	must(t, f.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM files
+		                 WHERE folder_id IS NULL AND message_id IS NULL
+		                   AND trashed_at IS NULL AND created_at < NOW() AND id = $1)`,
+		driveFile).Scan(&attachmentCollected))
+	if !attachmentCollected {
+		t.Error("the pre-mail ListOrphans predicate did NOT select the mail attachment, so " +
+			"the mail_message_id clause proves nothing")
+	}
+	orphans, err := repo.ListOrphans(ctx, time.Now().Add(time.Hour), 100)
+	must(t, err)
+	for _, o := range orphans {
+		if o.ID == driveFile {
+			t.Fatal("ListOrphans selected a file owned by a mail message; every attachment " +
+				"would be deleted an hour after it arrived")
+		}
+	}
+}
+
+// uniqueSuffix keeps fixtures from colliding across runs of the same suite
+// against a database that persists between them.
+func uniqueSuffix() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
 // EVERY COLUMN THAT HOLDS AN OBJECT KEY MUST BE NAMED IN StorageKeysPresent.
