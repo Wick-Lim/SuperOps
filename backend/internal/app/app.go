@@ -25,6 +25,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/block"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
 	"github.com/Wick-Lim/SuperOps/backend/internal/collab"
+	"github.com/Wick-Lim/SuperOps/backend/internal/comment"
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive"
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive/registry"
 	"github.com/Wick-Lim/SuperOps/backend/internal/emoji"
@@ -328,6 +329,16 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	}
 	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService,
 		drive.NewPublisher(natsClient, logger))
+
+	// The comment surface. ONE per product: plan 02 §13 cut per-file comments
+	// so that Phase 2 could build this once and Drive adopt it, and a second
+	// comment system is the failure the all-in-one thesis is written against.
+	//
+	// It is given a Titler rather than knowing what an issue or a file is —
+	// "somebody commented on 5d3f…" is a notification nobody can act on, and the
+	// alternative is this package importing every pillar.
+	commentHandler := comment.NewHandler(pool, az,
+		comment.NewNATSNotifier(natsClient), comment.NewTitler(pool), auditService)
 	// Closes the cycle: the checker revokes document sessions through the
 	// service, and the service authorizes through the checker.
 	revoker.collab.Store(collabSvc)
@@ -535,6 +546,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	channelHandler.RegisterRoutes(mux, authMw)
 	collabHandler.RegisterRoutes(mux, authMw)
 	driveHandler.RegisterRoutes(mux, authMw)
+	commentHandler.RegisterRoutes(mux, authMw)
 	// Resolving a share link is unauthenticated and its path CONTAINS the
 	// secret being guessed, so it gets a FIXED rate-limit bucket rather than
 	// the default per-path one — which would give every guess its own budget

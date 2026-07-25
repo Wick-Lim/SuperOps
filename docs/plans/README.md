@@ -8,7 +8,7 @@ named, and explicit cuts.
 |---|---|---|
 | [00-permissions](00-permissions.md) | Phase 0 — object-level permissions | Design. **Blocks everything.** |
 | [01-phase0-remainder](01-phase0-remainder.md) | Phase 0 — unified inbox + audit | **Implemented** (`020`, `021`) |
-| [02-drive](02-drive.md) | Phase 1 — Drive + editor registry | Plan |
+| [02-drive](02-drive.md) | Phase 1 — Drive + editor registry | **Implemented** (`025`–`028`) |
 | [03-work-tracking](03-work-tracking.md) | Phase 2 — issues, boards, cycles | Plan |
 | [04-docs](04-docs.md) | Phase 3 — block editor | Plan |
 | [05-spreadsheet](05-spreadsheet.md) | Phase 4 — grid + formula engine | Plan |
@@ -41,7 +41,7 @@ without colliding with a phase that has not started:
 | `016`–`019` | object permissions (plan 00) — `016` taken (`acl_object`, `acl_grant`, `acl_key`, the two expected-state views and the backfill); `017`–`019` free |
 | `020`–`024` | unified inbox + audit (plan 01) — `020` taken (`inbox_events`, `inbox_items`, `notification_prefs`, `inbox_digest_state`, backfill), `021` taken (`audit_logs` → TEXT `resource_id`, monthly partitions, `dedupe_key`, chain, `audit_chain_heads`); `022`–`024` free |
 | `025`–`029` | Drive + editor registry (plan 02) — `025` taken (`drive_folders`, `files` reshape, `file_versions`, `workspace_storage`, the `collab_documents` FK, the `workspace` grant subject, both expected-state views), `026` taken (quota: `collab_bytes_at`, `idx_files_workspace`, the `file_versions` backfill and the `bytes_used` re-derivation), `027` taken (trash: `purge_after` and its indexes), `028` taken (sharing: `drive_share_links`, the `link` grant subject, `acl_key_expected` arm 5); `029` free |
-| `030`–`034` | work tracking (plan 03) |
+| `030`–`034` | work tracking (plan 03) — `030` taken (the product-wide `comments` table, keyed to `acl_object`); `031`–`034` free. `032` is HELD for the `p-` project container key and should not be spent on anything else — see ruling 6. |
 | `035`–`039` | docs (plan 04) |
 | `040`–`044` | spreadsheet (plan 05) |
 | `045`–`049` | design surface (plan 06) |
@@ -219,6 +219,56 @@ Three consequences a pillar has to know:
    in one and not the other it is exactly the bug above. It is a named cut, not
    an oversight; the fix is a boundary expressed once, and it gets its own
    migration.
+
+---
+
+### 6. Plan 03's notification migration is a LIVE TRAP, not a dead letter (high)
+
+Ruling 1 says "delete the notification half of plan 03's migration". That is not
+merely advice about a redundant change — the change would still SUCCEED.
+
+Migration `020` deliberately left `notifications` and the `notification_type`
+enum intact (see its header), so plan 03 §3's six statements —
+`ALTER COLUMN type TYPE TEXT`, `DROP TYPE notification_type`, `ADD COLUMN
+object_type`, `ADD COLUMN object_id`, the CHECK and the index — all run without
+error against the tree as it stands today. Verified. The result is a table plan
+01 owns, silently mutated, and `005_create_notifications.down.sql` broken.
+
+Everything §3 wants already exists: `inbox_events` carries `kind`,
+`object_type`, `object_id`, `subject_type` and `subject_id` (migration `020`).
+A pillar publishes `inbox.Request` and adds zero durables, zero columns and zero
+enum values.
+
+**Landed** as migration `030` + `internal/comment`, which publishes
+`comment.mentioned` through `inbox.Publish` and touches no notification table.
+
+### 7. The comment surface is product-wide and it landed FIRST (high)
+
+Plan 02 §13 cut per-file comments explicitly: "Phase 2 builds the comment surface
+once and Drive adopts it." Four plans (02, 03, 04, 05) consume it. So it is not
+an issue feature and it does not wait for issues — it took the lowest number in
+the work-tracking block and shipped alone.
+
+**The target is an `acl_object`,** with a real composite foreign key to
+`(object_type, object_id)`. That single decision is what makes it shared:
+
+  * a comment is authorized by its TARGET and has no permission rule of its own.
+    `CapComment` is the rung the ladder already carries for exactly this — it
+    sits between read and write so somebody can discuss a thing they may not
+    change.
+  * the FK is enforced. A polymorphic pair with no constraint is the usual shape
+    and it rots; here purging a Drive file takes its comments with it, by the
+    database rather than by whoever remembers.
+  * **a new commentable type is a new `acl_object` type, not a change to
+    `internal/comment`.** Register the object and comments work.
+
+Threading is ONE level, enforced by a trigger. Deletion is soft AND blanks the
+body — the row survives to hold its replies, and "deleted" has to mean the text
+is gone or the feature is a lie the first time somebody reads the table.
+
+Mentions are `<@uuid>`, never `@name`: names are not unique, they change, and
+resolving one at read time makes a comment's meaning depend on who is called
+what today.
 
 ---
 
