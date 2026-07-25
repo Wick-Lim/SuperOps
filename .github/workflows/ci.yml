@@ -156,13 +156,26 @@ jobs:
       JWT_SECRET: ci_jwt_secret_at_least_32_characters_long
       ADMIN_EMAIL: admin@company.com
       ADMIN_PASSWORD: changeme_admin_password
-      # No object storage or Meilisearch in CI. The *_ENABLED switches are the
-      # documented way to turn them off and the only one that works: env.str
-      # treats a set-but-empty variable as unset and returns the default, so
-      # MEILI_HOST='' meant "http://localhost:7700" and the app spent every boot
-      # failing to reach a service nobody had started.
-      SEARCH_ENABLED: 'false'
-      FILES_ENABLED: 'false'
+      # Meilisearch and MinIO are REAL here, started as steps below.
+      #
+      # They used to be absent, with SEARCH_ENABLED/FILES_ENABLED set to
+      # 'false'. That did nothing: the integration harness builds its config as
+      # a literal (harness_test.go's buildConfig) and never calls LoadConfig, so
+      # it hardcodes MinIO.Enabled = true and Meili.Enabled = true and reads the
+      # endpoints straight from the environment. The switches were read by
+      # nobody in this job. What the harness actually got was the DEFAULT
+      # endpoints — localhost:7700 and localhost:19000 — pointing at nothing,
+      # and 13 tests failed while 4 skipped. The switches are kept, and true,
+      # because cmd/migrate and any future non-harness boot in this job do read
+      # them.
+      SEARCH_ENABLED: 'true'
+      FILES_ENABLED: 'true'
+      MEILI_HOST: http://localhost:7700
+      MEILI_MASTER_KEY: ci_meili_master_key_at_least_16_bytes
+      MINIO_ENDPOINT: localhost:19000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: superops
       # GitHub sets CI=true, which makes the harness fail instead of skip when
       # the infrastructure is unreachable. A suite that cannot go red is not a
       # suite.
@@ -189,6 +202,41 @@ jobs:
             -p 4222:4222 -p 8222:8222 \
             nats:2 -js -m 8222
 
+      # Meilisearch and MinIO are steps rather than service containers for the
+      # same two reasons NATS is. MinIO needs a command (`server /data`), which
+      # the services: block cannot express. Meilisearch's image carries no curl
+      # or wget, so a service-level --health-cmd has nothing to run; the runner
+      # does have curl, which is why the readiness loops live here.
+      - name: Start Meilisearch and MinIO
+        run: |
+          docker run -d --name meili -p 7700:7700 \
+            -e MEILI_MASTER_KEY=ci_meili_master_key_at_least_16_bytes \
+            -e MEILI_NO_ANALYTICS=true \
+            -e MEILI_ENV=development \
+            getmeili/meilisearch:v1.11
+          docker run -d --name minio -p 19000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+
+      - name: Wait for Meilisearch and MinIO
+        run: |
+          ready() {
+            for _ in $(seq 1 60); do
+              curl -fsS "$2" >/dev/null 2>&1 && { echo "$1 ready"; return 0; }
+              sleep 1
+            done
+            docker logs "$1" || true
+            echo "::error::$1 never became ready at $2"
+            return 1
+          }
+          # MinIO's live probe is unauthenticated; Meilisearch's /health is too.
+          ready meili http://127.0.0.1:7700/health
+          ready minio http://127.0.0.1:19000/minio/health/live
+          # The bucket is created by app.New (the minio provider defaults
+          # CreateBucket to true), so nothing mints it here — and if that
+          # default ever flips, the upload tests fail rather than skip.
+
       - name: Wait for NATS JetStream
         run: |
           for _ in $(seq 1 60); do
@@ -214,7 +262,25 @@ jobs:
         working-directory: backend
         # -race: the hub, the NATS bridge and the event relay are only reachable
         # from this suite, so without it the concurrent code is never checked.
-        run: go test -tags=integration ./test/integration/... -race -count=1 -v
+        run: |
+          set -o pipefail
+          go test -tags=integration ./test/integration/... -race -count=1 -v \
+            | tee /tmp/integration.txt
+
+      - name: Assert nothing skipped
+        # Every skip in this suite is "the infrastructure this test needs is not
+        # here". That is precisely how it went green for months over a broken
+        # config, so a skip is a failure: either the service is down or a test
+        # grew a gate it should not have. This job now runs Postgres, Redis,
+        # NATS, Meilisearch and MinIO, which is every dependency the harness
+        # knows about, so the correct number is zero.
+        run: |
+          if grep -q -- '--- SKIP' /tmp/integration.txt; then
+            echo "::error::the integration suite skipped tests; every dependency is running, so a skip means a test is gated on something it should not be"
+            grep -- '--- SKIP' /tmp/integration.txt
+            exit 1
+          fi
+          echo "0 skipped"
 
   app:
     runs-on: ubuntu-latest
@@ -233,6 +299,14 @@ jobs:
       - name: Type check
         working-directory: app
         run: npm run typecheck
+
+      # The vitest suite existed and was never run here. Every client-side
+      # correctness claim in the editor phases — CRDT convergence, the
+      # projection extractor, the "an embed node carries no title" invariant —
+      # is made in it, and a suite CI does not run is a suite that cannot fail.
+      - name: Unit tests
+        working-directory: app
+        run: npm test
 
       - name: Audit runtime dependencies
         working-directory: app
