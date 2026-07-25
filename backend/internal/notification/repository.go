@@ -19,7 +19,7 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 }
 
 // Create inserts a notification, or does nothing if that exact notification is
-// already there.
+// already there. It reports whether the row was actually inserted.
 //
 // The worker consumes the events that produce these from a durable JetStream
 // consumer, which is at-least-once: any redelivery — a nak, an AckWait expiry,
@@ -27,17 +27,23 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 // Notification ids are derived from the event rather than random (see
 // notificationID) precisely so this second pass is a no-op instead of a
 // duplicate row in someone's notification list.
-func (r *Repository) Create(ctx context.Context, n *Notification) error {
-	_, err := r.pool.Exec(ctx,
+//
+// The boolean is what extends that idempotency to push. A row is durable and
+// re-inserting it is free; a push notification is neither, and buzzing a phone
+// a second time because an ack was lost is the most visible failure this
+// pipeline has. `false` means "some earlier delivery already got here", which
+// is exactly the condition under which the push must not be sent again.
+func (r *Repository) Create(ctx context.Context, n *Notification) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
 		`INSERT INTO notifications (id, user_id, type, title, body, data)
 		 VALUES ($1, $2, $3, $4, $5, $6::jsonb)
 		 ON CONFLICT (id) DO NOTHING`,
 		n.ID, n.UserID, n.Type, n.Title, n.Body, n.Data,
 	)
 	if err != nil {
-		return fmt.Errorf("create notification: %w", err)
+		return false, fmt.Errorf("create notification: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 // ListByUser pages by the total (created_at, id) key. Ordering on created_at

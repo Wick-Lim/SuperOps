@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"unicode/utf8"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/push"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
@@ -24,6 +25,85 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("PUT /api/v1/users/me/status", authMw(http.HandlerFunc(h.UpdateStatus)))
 	mux.Handle("GET /api/v1/users/{user_id}", authMw(http.HandlerFunc(h.GetUser)))
 	mux.Handle("GET /api/v1/users/search", authMw(http.HandlerFunc(h.SearchUsers)))
+}
+
+// RegisterDeviceRoutes mounts push-token registration.
+//
+// It is separate from RegisterRoutes because app.New only calls it when
+// PUSH_ENABLED is on. Storing device tokens that nothing will ever send to is
+// collecting an identifier for no purpose, and the client treats the resulting
+// 404 as "this deployment has no push" — see app/src/lib/push.ts.
+func (h *Handler) RegisterDeviceRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
+	mux.Handle("POST /api/v1/users/me/devices", authMw(http.HandlerFunc(h.RegisterDevice)))
+	mux.Handle("DELETE /api/v1/users/me/devices/{token}", authMw(http.HandlerFunc(h.DeleteDevice)))
+}
+
+// RegisterDevice records the caller's push token.
+//
+// Registering a token that is already on file for somebody else moves it to the
+// caller (see Repository.RegisterDevice). That is required for correctness on a
+// shared handset and is not an authorization hole worth closing here: the token
+// is issued to the app instance by the OS, so whoever can present it is on the
+// device it addresses.
+func (h *Handler) RegisterDevice(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+
+	var input struct {
+		Token    string `json:"token"`
+		Platform string `json:"platform"`
+	}
+	if err := httputil.DecodeJSON(r, &input); err != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
+		return
+	}
+	if len(input.Token) > MaxDeviceTokenLen {
+		httputil.JSONError(w, http.StatusBadRequest, "INVALID_PUSH_TOKEN", "push token is too long")
+		return
+	}
+	// Rejected rather than stored: every unusable token is re-sent and
+	// re-rejected on every notification for this user until something deletes
+	// it, and nothing would, because the push service never answers
+	// DeviceNotRegistered for a value it cannot even parse.
+	if !push.IsExpoToken(input.Token) {
+		httputil.JSONError(w, http.StatusBadRequest, "INVALID_PUSH_TOKEN", "push token is not a valid Expo push token")
+		return
+	}
+
+	if err := h.repo.RegisterDevice(r.Context(), userID, input.Token, input.Platform); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	httputil.JSON(w, http.StatusCreated, map[string]string{
+		"token":    input.Token,
+		"platform": NormalizePlatform(input.Platform),
+	})
+}
+
+// DeleteDevice deregisters one of the caller's push tokens. The client calls it
+// on logout, without which the next person to sign in on that handset keeps
+// receiving the previous user's notifications until they happen to re-register.
+func (h *Handler) DeleteDevice(w http.ResponseWriter, r *http.Request) {
+	userID := authctx.UserID(r.Context())
+
+	// PathValue returns the segment already percent-decoded, which matters:
+	// an Expo token is `ExponentPushToken[...]` and the brackets reach us as
+	// %5B/%5D.
+	token := r.PathValue("token")
+	if token == "" {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "token is required")
+		return
+	}
+
+	ok, err := h.repo.DeleteDevice(r.Context(), userID, token)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if !ok {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "device token not found")
+		return
+	}
+	httputil.JSON(w, http.StatusOK, map[string]string{"message": "device deregistered"})
 }
 
 func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {

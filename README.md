@@ -21,6 +21,7 @@ A React Native (Expo) client for **iOS, Android and the web**, and a Go backend 
 - Full-text search (Meilisearch), scoped to the channels you can actually read
 - User presence (online/away/DND/offline) and typing indicators
 - Per-channel unread counts and read tracking
+- Mobile push notifications via Expo (opt-in; needs your own APNs/FCM credentials — see [Push notifications](#push-notifications))
 - User blocking, custom emoji, incoming webhooks
 
 **Administration**
@@ -192,10 +193,10 @@ SuperOps/
 │   │   ├── rbac/               # Route-level role middleware
 │   │   ├── user/ workspace/ channel/ message/
 │   │   ├── ws/ presence/       # WebSocket hub, NATS bridge/relay, presence
-│   │   ├── file/ search/ notification/ webhook/ emoji/ block/
+│   │   ├── file/ search/ notification/ push/ webhook/ emoji/ block/
 │   │   ├── admin/ audit/ ratelimit/
 │   ├── pkg/                    # authctx, crypto, database, httputil, logger, nats, redis
-│   ├── migrations/             # SQL migrations (000–011)
+│   ├── migrations/             # SQL migrations (000–012)
 │   └── test/integration/       # Build-tagged suite against real infrastructure
 ├── deploy/
 │   ├── docker/                 # Compose, Dockerfiles, nginx, TLS overlay, Prometheus
@@ -206,8 +207,9 @@ SuperOps/
 
 ## API Reference
 
-92 routes. All application endpoints are under `/api/v1`; `/health`, `/ready`
-and `/metrics` sit at the root. Response envelope:
+94 routes, two of which (device registration) exist only when `PUSH_ENABLED=true`.
+All application endpoints are under `/api/v1`; `/health`, `/ready` and
+`/metrics` sit at the root. Response envelope:
 
 ```json
 {"data": {...}, "meta": {"cursor": "...", "has_more": true}}
@@ -222,6 +224,7 @@ Request bodies reject unknown fields.
 | **Auth** | `POST /auth/login`, `/refresh`, `/logout`, `/accept-invite`, `/change-password`, `GET /auth/invite/{token}` |
 | **2FA (TOTP)** | `GET /auth/totp/status`, `POST /auth/totp/setup`, `/verify`, `/disable` |
 | **Users** | `GET /users/me`, `PATCH /users/me`, `PUT /users/me/status`, `GET /users/{id}`, `/users/search?q=` |
+| **Devices (push)** | `POST /users/me/devices`, `DELETE /users/me/devices/{token}` — registered only when `PUSH_ENABLED=true` |
 | **Workspaces** | `POST /workspaces`, `GET/PATCH/DELETE /workspaces/{id}`, `GET /workspaces/{id}/members`, `PATCH`/`DELETE .../members/{user_id}`, `POST /workspaces/{id}/transfer-ownership`, `GET /workspaces/{id}/presence` |
 | **Channels** | `POST/GET /workspaces/{id}/channels`, `/browse`, `GET/PATCH .../channels/{cid}`, `/join`, `/leave`, `/archive`, `/unarchive`, `GET/POST .../members`, `DELETE .../members/{user_id}` |
 | **Direct messages** | `POST /workspaces/{id}/channels/dm` (1:1 idempotent + group) |
@@ -288,7 +291,64 @@ defaults. Notes that bite:
   `authorization` block to `deploy/docker/prometheus.yml` or scrapes will 401.
 
 Client configuration: `EXPO_PUBLIC_API_URL` (and optionally
-`EXPO_PUBLIC_WS_URL`). See [`app/src/config.ts`](app/src/config.ts).
+`EXPO_PUBLIC_WS_URL`, `EXPO_PUBLIC_EXPO_PROJECT_ID`). See
+[`app/src/config.ts`](app/src/config.ts).
+
+## Push notifications
+
+Mobile push via [Expo's push service](https://docs.expo.dev/push-notifications/overview/),
+which fronts APNs and FCM. **Off by default** — enabling it sends the first 140
+characters of every notified message to Expo, and through Expo to Apple and
+Google, which is a decision to make deliberately.
+
+How it works: the client registers its Expo push token
+(`POST /users/me/devices`), and the worker — which already creates notification
+rows off the JetStream `message.created` / `reaction.added` /
+`channel.member_added` events — enqueues a push to that user's devices on the
+same path. Audience is identical to the in-app notification: per-channel `muted`
+and `notification_pref`, blocks and self-exclusion all apply before push is
+reached. A `DeviceNotRegistered` receipt deletes the token, so a reinstalled or
+rotated device stops being retried.
+
+Push is *not* suppressed when the recipient has a live WebSocket. The worker
+could consult the Redis presence refcount, but that counts sockets per **user**,
+not per device — a desktop tab left open would silence the phone. The
+"is the user already looking at this?" decision is made on the client instead
+(`app/src/lib/push.ts`), where being wrong costs a redundant banner rather than
+a message nobody is told about.
+
+**Turning it on is not sufficient for a notification to reach a phone.** You
+also need, on your own Expo project:
+
+1. An **APNs key** (iOS) and an **FCM service account** (Android) uploaded to the
+   project — `eas credentials`. Without them Expo accepts every batch and
+   answers `InvalidCredentials` per message, which the worker logs at `error`.
+2. `extra.eas.projectId` in [`app/app.json`](app/app.json) (or
+   `EXPO_PUBLIC_EXPO_PROJECT_ID` in the build environment), or
+   `getExpoPushTokenAsync` cannot attribute the token and registration is
+   skipped.
+3. A development build or a store build. Push tokens are not available in Expo
+   Go, and web is not supported here at all — the web client already has the
+   live WebSocket.
+
+Server-side:
+
+```bash
+PUSH_ENABLED=true         # opens POST/DELETE /users/me/devices, starts the worker dispatcher
+EXPO_ACCESS_TOKEN=...     # only if the Expo project has "enhanced push security" on
+PUSH_TIMEOUT=15s          # bounds one request to Expo
+```
+
+On Kubernetes use `push.enabled` / `push.accessToken` / `push.timeout` in Helm
+values. Note that the bundled NetworkPolicy allows the worker no egress except
+DNS and in-release services, so with `networkPolicy.enabled=true` you must add a
+443 rule via `networkPolicy.extraEgress` or the worker cannot reach Expo at all.
+
+Sending is best-effort by construction: the notification row is committed first
+and the push is queued to an in-process dispatcher that drops rather than blocks
+when full, because stalling on a third party inside a JetStream consumer
+callback would stall event acking. Redelivery does not double-buzz — the push is
+sent only when the notification row was genuinely new.
 
 ## Testing
 
@@ -350,8 +410,9 @@ that no longer exist.
 
 Things this does **not** do, so you can decide before deploying:
 
-- **No push notifications.** Notifications are database rows plus a live
-  WebSocket frame — no APNs/FCM, no email.
+- **Push notifications need an Expo project you own.** The pipeline is built and
+  off by default (`PUSH_ENABLED=false`); see [Push notifications](#push-notifications)
+  for the credentials it cannot supply for you. There is still no email delivery.
 - **No outgoing webhooks.** Incoming only; the `outgoing` type is rejected.
 - **No reconnect backfill.** `seq` makes a gap *detectable*; recovery is a REST
   refetch, not a server-side replay.

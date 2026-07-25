@@ -63,6 +63,24 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
     // Captured before clearing: the revoke call needs the token, and the route
     // (POST /api/v1/auth/logout) is unauthenticated by design.
     const refresh = get().refreshToken
+    const access = get().accessToken
+
+    // Deregister this device's push token BEFORE the session is cleared — the
+    // DELETE needs the access token. Without it, the next person to sign in on
+    // a shared handset keeps receiving this user's notifications until they
+    // happen to register the same token themselves.
+    //
+    // Imported dynamically, and failure ignored, for two reasons: `lib/push`
+    // pulls in expo-notifications, which must not become a static dependency of
+    // this store (the unit suite runs it in plain node), and a device that
+    // cannot be deregistered must not be able to block a sign-out.
+    try {
+      const { deregisterPushToken } = await import('../lib/push')
+      await deregisterPushToken(access)
+    } catch {
+      // No push module, no permission, or offline. Signing out still proceeds.
+    }
+
     set({ accessToken: null, refreshToken: null, user: null, isAuthenticated: false, persistError: null })
 
     await Promise.all([

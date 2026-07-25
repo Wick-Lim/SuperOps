@@ -281,6 +281,17 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// Protected routes
 	authHandler.RegisterProtectedRoutes(mux, authMw)
 	userHandler.RegisterRoutes(mux, authMw)
+	// Device-token registration only exists when something will send to those
+	// tokens. With PUSH_ENABLED off the routes are absent and the client's
+	// registration attempt 404s, which app/src/lib/push.ts reads as "this
+	// deployment has no push" and stops asking.
+	if cfg.Push.IsEnabled() {
+		userHandler.RegisterDeviceRoutes(mux, authMw)
+		logger.Info("push notifications enabled; device registration available",
+			"note", "delivery additionally requires APNs/FCM credentials on the Expo project")
+	} else {
+		logger.Info("push notifications disabled by configuration (PUSH_ENABLED)")
+	}
 	workspaceHandler.RegisterRoutes(mux, authMw)
 	channelHandler.RegisterRoutes(mux, authMw)
 	presenceHandler.RegisterRoutes(mux, authMw)

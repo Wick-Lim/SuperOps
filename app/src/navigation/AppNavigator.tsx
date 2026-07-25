@@ -9,6 +9,8 @@ import { useAuthStore } from '../stores/authStore'
 import { workspaceApi } from '../api/workspaces'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { errorMessage, isApiError } from '../api/client'
+import { usePushNotifications } from '../lib/push'
+import { navigationRef } from './navigationRef'
 import { API_BASE_URL } from '../config'
 import { theme } from '../lib/theme'
 import { MIN_TOUCH } from '../components/a11y'
@@ -259,6 +261,12 @@ export default function AppNavigator() {
         ? 'onboarding'
         : 'app'
 
+  // Push registration is deliberately gated on `phase === 'app'`, not on
+  // `isAuthenticated`. The permission prompt is one-shot on iOS, so asking
+  // before the user has a workspace — i.e. before they have seen the product at
+  // all — spends it on the moment people are most likely to decline.
+  usePushNotifications(phase === 'app')
+
   const initialRouteName: keyof RootStackParamList =
     phase === 'auth'
       ? 'Login'
@@ -290,7 +298,14 @@ export default function AppNavigator() {
   )
 
   return (
-    <NavigationContainer linking={linking} fallback={<BootstrapView boot={boot} onRetry={retry} />}>
+    // The ref is what lets a notification tap navigate: the response can arrive
+    // before any screen has mounted (cold start), so there is no component in
+    // scope to call useNavigation() from.
+    <NavigationContainer
+      ref={navigationRef}
+      linking={linking}
+      fallback={<BootstrapView boot={boot} onRetry={retry} />}
+    >
       <Stack.Navigator
         key={phase}
         initialRouteName={initialRouteName}

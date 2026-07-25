@@ -22,6 +22,7 @@ type Config struct {
 	Admin        AdminConfig
 	RateLimit    RateLimitConfig
 	CORS         CORSConfig
+	Push         PushConfig
 	MetricsToken string // METRICS_TOKEN — if set, GET /metrics requires this bearer token
 	LogLevel     string
 }
@@ -169,6 +170,36 @@ type MinIOConfig struct {
 // IsEnabled reports whether the file feature should be constructed.
 func (c MinIOConfig) IsEnabled() bool { return c.Enabled && c.Endpoint != "" }
 
+// PushConfig configures mobile push notifications via Expo's push service.
+//
+// Enabled defaults to FALSE, unlike files and search. Push sends the first 140
+// characters of every message to a third party (Expo, and through it Apple and
+// Google), which is a decision an operator has to make deliberately — not one
+// they discover after the fact because the default was on.
+type PushConfig struct {
+	Enabled bool
+
+	// Endpoint overrides Expo's push API. Empty means the package default; it
+	// exists so a self-hosted relay or a test double can be pointed at.
+	Endpoint string
+
+	// AccessToken is an Expo access token. Required only when the Expo project
+	// has "enhanced push security" enabled; a secret either way.
+	AccessToken string
+
+	// Timeout bounds one request to the push service.
+	Timeout time.Duration
+
+	// QueueSize and Workers size the in-process dispatcher. Zero means the
+	// push package's defaults.
+	QueueSize int
+	Workers   int
+}
+
+// IsEnabled reports whether the push pipeline should be constructed. It exists
+// for symmetry with MinIOConfig/MeiliConfig, so no caller tests the raw field.
+func (c PushConfig) IsEnabled() bool { return c.Enabled }
+
 type MeiliConfig struct {
 	Enabled   bool
 	Host      string
@@ -254,6 +285,14 @@ func LoadConfig() (*Config, error) {
 		CORS: CORSConfig{
 			AllowedOrigins: e.list("CORS_ALLOWED_ORIGINS", []string{"*"}),
 		},
+		Push: PushConfig{
+			Enabled:     e.bool("PUSH_ENABLED", false),
+			Endpoint:    e.str("EXPO_PUSH_ENDPOINT", ""),
+			AccessToken: e.str("EXPO_ACCESS_TOKEN", ""),
+			Timeout:     e.duration("PUSH_TIMEOUT", 15*time.Second),
+			QueueSize:   e.int("PUSH_QUEUE_SIZE", 0),
+			Workers:     e.int("PUSH_WORKERS", 0),
+		},
 		MetricsToken: e.str("METRICS_TOKEN", ""),
 		LogLevel:     e.str("LOG_LEVEL", "info"),
 	}
@@ -309,6 +348,26 @@ func (c *Config) validate() error {
 	}
 	if c.RateLimit.TrustedProxyHops > 0 && !c.RateLimit.TrustProxy {
 		errs = append(errs, errors.New("RATE_LIMIT_TRUSTED_PROXY_HOPS is set but RATE_LIMIT_TRUST_PROXY is false; X-Forwarded-For would be ignored"))
+	}
+
+	if c.Push.Enabled {
+		// A mistyped endpoint would otherwise be discovered as a per-batch
+		// transport failure in the worker log, long after the deploy.
+		if c.Push.Endpoint != "" {
+			u, err := url.Parse(c.Push.Endpoint)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Errorf("EXPO_PUSH_ENDPOINT must be an absolute http(s) URL (got %q)", c.Push.Endpoint))
+			}
+		}
+		if c.Push.Timeout <= 0 {
+			errs = append(errs, fmt.Errorf("PUSH_TIMEOUT must be positive (got %s)", c.Push.Timeout))
+		}
+		if c.Push.QueueSize < 0 {
+			errs = append(errs, fmt.Errorf("PUSH_QUEUE_SIZE must not be negative (got %d)", c.Push.QueueSize))
+		}
+		if c.Push.Workers < 0 {
+			errs = append(errs, fmt.Errorf("PUSH_WORKERS must not be negative (got %d)", c.Push.Workers))
+		}
 	}
 
 	return errors.Join(errs...)

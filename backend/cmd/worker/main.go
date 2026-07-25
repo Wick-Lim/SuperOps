@@ -43,10 +43,13 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/app"
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
+	"github.com/Wick-Lim/SuperOps/backend/internal/push"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
+	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/logger"
 	natspkg "github.com/Wick-Lim/SuperOps/backend/pkg/nats"
@@ -208,10 +211,27 @@ func run() int {
 		bind(durableSpec{durable: "indexer", filter: "superops.*.message.*", handle: indexer.HandleMessage})
 	}
 
-	notifSvc := notification.NewService(notification.NewRepository(pool), pool, az, natsClient, l)
+	// Push rides the notification fan-out: the same events, the same audience
+	// (muted / notification_pref / blocks are all applied before this point),
+	// one extra delivery channel for the recipients who are not looking at a
+	// screen. It lives in the worker rather than the API because the worker is
+	// where notifications are created; the API never sees the fan-out.
+	devices, pusher, pushDispatcher := buildPush(cfg, pool, l)
+
+	notifSvc := notification.NewService(notification.NewRepository(pool), pool, az, natsClient, devices, pusher, l)
 	bind(durableSpec{durable: "notifier-message", filter: "superops.*.message.created", handle: notifSvc.HandleMessage})
 	bind(durableSpec{durable: "notifier-reaction", filter: "superops.*.reaction.added", handle: notifSvc.HandleReaction})
 	bind(durableSpec{durable: "notifier-channel-invite", filter: "superops.*.channel.member_added", handle: notifSvc.HandleChannelMemberAdded})
+
+	// Unread badges. Deliberately a separate durable from notifier-message
+	// rather than another branch inside it: they have different audiences (a
+	// muted channel still accrues unread, it just does not buzz) and different
+	// triggers (a deletion moves the badge and notifies nobody), so sharing a
+	// consumer would couple one's redelivery to the other's failures. Its filter
+	// is the whole message.* family, as the indexer's is, because both a
+	// creation and a deletion move the badge.
+	unreadFanout := channel.NewUnreadFanout(channel.NewRepository(pool), natsClient, l)
+	bind(durableSpec{durable: "unread-fanout", filter: "superops.*.message.*", handle: unreadFanout.HandleMessage})
 
 	// --- periodic jobs -------------------------------------------------------
 
@@ -294,6 +314,16 @@ func run() int {
 		l.Warn("timed out waiting for in-flight event handlers")
 	}
 
+	// 2b. Only now flush the push queue. No handler is still running, so nothing
+	//     can enqueue any more, and Close drains what is already there instead of
+	//     discarding the pushes for the last events this replica processed.
+	if pushDispatcher != nil {
+		pushDispatcher.Close()
+		if n := pushDispatcher.Dropped(); n > 0 {
+			l.Warn("push: notifications dropped by a full queue during this run", "count", n)
+		}
+	}
+
 	// 3. Only now stop the job loops; a job mid-transaction gets its context
 	//    cancelled, which rolls back rather than half-commits.
 	cancel()
@@ -351,6 +381,68 @@ func waitBounded(wg *sync.WaitGroup, timeout time.Duration, forced <-chan struct
 	case <-time.After(timeout):
 		return false
 	}
+}
+
+// --- push ---------------------------------------------------------------------
+
+// buildPush constructs the push pipeline, or returns nils when PUSH_ENABLED is
+// off (the default).
+//
+// The two interface values are returned separately from the concrete dispatcher
+// on purpose. Assigning a nil *push.Dispatcher to a notification.Pusher yields a
+// non-nil interface holding a nil pointer, so the fan-out's `s.pusher == nil`
+// guard would sail straight past it and into a nil dereference on the first
+// notification. Only the enabled branch ever assigns them.
+func buildPush(
+	cfg *app.Config,
+	pool *pgxpool.Pool,
+	l *slog.Logger,
+) (notification.DeviceTokenLister, notification.Pusher, *push.Dispatcher) {
+	if !cfg.Push.IsEnabled() {
+		l.Info("push notifications disabled by configuration (PUSH_ENABLED)")
+		return nil, nil, nil
+	}
+
+	userRepo := user.NewRepository(pool)
+
+	sender := push.NewExpoSender(push.ExpoConfig{
+		Endpoint:    cfg.Push.Endpoint,
+		AccessToken: cfg.Push.AccessToken,
+		Timeout:     cfg.Push.Timeout,
+		Logger:      l,
+		// A DeviceNotRegistered receipt is the only authoritative signal that a
+		// token is dead — the app was uninstalled, or the OS rotated it. Acting
+		// on it is not housekeeping: an unremoved dead token is re-sent and
+		// re-rejected on every notification that user ever receives, and it
+		// never starts working again.
+		OnInvalidTokens: func(ctx context.Context, tokens []string) {
+			// Fresh deadline. ctx is the batch's send context and may be nearly
+			// spent by the very request that produced these receipts, which
+			// would leave the dead tokens in place until the next one.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+
+			n, err := userRepo.DeleteDeviceTokens(cleanupCtx, tokens)
+			if err != nil {
+				l.Warn("push: could not delete dead device tokens", "count", len(tokens), "error", err)
+				return
+			}
+			l.Info("push: deleted dead device tokens", "count", n)
+		},
+	})
+
+	dispatcher := push.NewDispatcher(sender, l, push.DispatcherConfig{
+		QueueSize: cfg.Push.QueueSize,
+		Workers:   cfg.Push.Workers,
+		// Comfortably above one request's own timeout: a dispatcher batch is at
+		// most push.MaxBatchSize messages, which is exactly one request.
+		SendTimeout: 2 * cfg.Push.Timeout,
+	})
+
+	l.Info("push notifications enabled", "provider", "expo",
+		"note", "delivery additionally requires APNs/FCM credentials on the Expo project")
+
+	return userRepo, dispatcher, dispatcher
 }
 
 // --- durable consumers -------------------------------------------------------

@@ -25,8 +25,26 @@ data:
   {{- if and .Values.search.enabled .Values.externalMeilisearch.host }}
   MEILI_HOST: {{ .Values.externalMeilisearch.host | quote }}
   {{- end }}
+  {{- /*
+  Push notifications. `default dict` so a values file that predates this block
+  renders instead of failing on a nil map.
+
+  PUSH_ENABLED only opens the device-registration endpoints and starts the
+  worker's dispatcher. Delivery additionally requires APNs/FCM credentials on
+  the Expo project itself, which live outside this cluster entirely.
+  */ -}}
+  {{- $push := .Values.push | default dict }}
+  PUSH_ENABLED: {{ $push.enabled | default false | toString | quote }}
+  {{- if $push.enabled }}
+  PUSH_TIMEOUT: {{ $push.timeout | default "15s" | quote }}
+  {{- if $push.endpoint }}
+  EXPO_PUSH_ENDPOINT: {{ $push.endpoint | quote }}
+  {{- end }}
+  {{- end }}
   {{- range $k, $v := .Values.backend.env }}
-  {{- if not (has $k (list "DB_SSLMODE" "MINIO_USE_SSL")) }}
+  {{- /* Keys this template emits itself; a passthrough copy would be a
+  duplicate map key in the rendered ConfigMap. Use `push.*` for these. */}}
+  {{- if not (has $k (list "DB_SSLMODE" "MINIO_USE_SSL" "PUSH_ENABLED" "PUSH_TIMEOUT" "EXPO_PUSH_ENDPOINT")) }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}
   {{- end }}

@@ -228,6 +228,69 @@ func (r *Repository) UnreadCount(ctx context.Context, channelID, userID string) 
 	return u, nil
 }
 
+// MemberUnread is one member's badge, as returned by UnreadCounts. It is the
+// per-user half of Unread, which only names the channel.
+type MemberUnread struct {
+	UserID string
+	Unread Unread
+}
+
+// UnreadCounts is UnreadCount for every member of a channel at once, minus
+// excludeUserID (pass "" to exclude nobody).
+//
+// The fan-out that publishes unread.update runs once per delivered message
+// over the whole membership, so the per-member UnreadCount would be N queries
+// — 500 round trips for a 500-member channel, per message. This is one.
+//
+// The predicate is copied from UnreadCount deliberately rather than factored
+// into a shared string: the pushed badge and the badge GET /channels computes
+// must count exactly the same rows, and the cheapest way to keep them honest is
+// that they are the same SQL. It matches idx_messages_channel_live, so each
+// member costs one index range scan from their last_read_at rather than a table
+// scan.
+func (r *Repository) UnreadCounts(ctx context.Context, channelID, excludeUserID string) ([]MemberUnread, error) {
+	// A nil parameter (rather than "") is what lets one query serve both the
+	// "exclude the author" and "exclude nobody" cases: uuid <> '' is a type
+	// error in Postgres, not an always-true comparison.
+	var exclude *string
+	if excludeUserID != "" {
+		exclude = &excludeUserID
+	}
+
+	rows, err := r.pool.Query(ctx,
+		`SELECT cm.user_id, cm.last_read_at, COUNT(m.id)
+		   FROM channel_members cm
+		   LEFT JOIN messages m
+		          ON m.channel_id = cm.channel_id
+		         AND m.parent_id IS NULL
+		         AND m.is_deleted = FALSE
+		         AND m.is_scheduled = FALSE
+		         AND m.user_id <> cm.user_id
+		         AND m.created_at > cm.last_read_at
+		  WHERE cm.channel_id = $1
+		    AND ($2::uuid IS NULL OR cm.user_id <> $2::uuid)
+		  GROUP BY cm.user_id, cm.last_read_at`,
+		channelID, exclude,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("count unread for channel members: %w", err)
+	}
+	defer rows.Close()
+
+	out := []MemberUnread{}
+	for rows.Next() {
+		mu := MemberUnread{Unread: Unread{ChannelID: channelID}}
+		if err := rows.Scan(&mu.UserID, &mu.Unread.LastReadAt, &mu.Unread.Count); err != nil {
+			return nil, fmt.Errorf("scan member unread: %w", err)
+		}
+		out = append(out, mu)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("count unread for channel members: %w", err)
+	}
+	return out, nil
+}
+
 // Update writes the mutable presentation fields. updated_at is maintained by
 // the BEFORE UPDATE trigger added in migration 009.
 func (r *Repository) Update(ctx context.Context, c *Channel) error {

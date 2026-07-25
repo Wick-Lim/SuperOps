@@ -15,6 +15,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+	"github.com/Wick-Lim/SuperOps/backend/internal/push"
 	natspkg "github.com/Wick-Lim/SuperOps/backend/pkg/nats"
 )
 
@@ -43,16 +44,47 @@ func notificationID(t Type, userID, subject string) string {
 	return uuid.NewSHA1(notificationNamespace, []byte(key)).String()
 }
 
+// DeviceTokenLister resolves the push tokens registered for a user. It is
+// satisfied by user.Repository; declared here so the notification package does
+// not depend on the user package for one query.
+type DeviceTokenLister interface {
+	PushTokensForUser(ctx context.Context, userID string) ([]string, error)
+}
+
+// Pusher accepts push messages for asynchronous delivery. Enqueue must not
+// block: it is called from inside a JetStream consumer callback whose latency
+// is the consumer's ack latency. push.Dispatcher is the implementation.
+type Pusher interface {
+	Enqueue(msgs []push.Message)
+}
+
 type Service struct {
 	repo   *Repository
 	pool   *pgxpool.Pool
 	authz  *authz.Checker
 	nats   *natspkg.Client
 	logger *slog.Logger
+
+	// devices and pusher are both nil when PUSH_ENABLED is off, which is the
+	// default. Every push path checks for that rather than the config, so
+	// "push is disabled" and "push is misconfigured" collapse to the same
+	// no-op instead of a nil dereference in the fan-out.
+	devices DeviceTokenLister
+	pusher  Pusher
 }
 
-func NewService(repo *Repository, pool *pgxpool.Pool, az *authz.Checker, nats *natspkg.Client, logger *slog.Logger) *Service {
-	return &Service{repo: repo, pool: pool, authz: az, nats: nats, logger: logger}
+// NewService builds the fan-out. devices and pusher may both be nil, which
+// disables push delivery and leaves the in-app notification path untouched.
+func NewService(
+	repo *Repository,
+	pool *pgxpool.Pool,
+	az *authz.Checker,
+	nats *natspkg.Client,
+	devices DeviceTokenLister,
+	pusher Pusher,
+	logger *slog.Logger,
+) *Service {
+	return &Service{repo: repo, pool: pool, authz: az, nats: nats, devices: devices, pusher: pusher, logger: logger}
 }
 
 type MessageEvent struct {
@@ -378,24 +410,134 @@ func (s *Service) NotifyChannelInvite(ctx context.Context, workspaceID string, e
 	})
 }
 
-// createAndPush persists a notification and pushes it to the recipient.
+// createAndPush persists a notification, relays it to any live WebSocket, and
+// enqueues it for delivery to the recipient's devices.
 //
 // A failed INSERT is returned, not logged and shrugged off: the caller is a
 // durable consumer that decides whether to ack on the strength of it. A failed
-// *push* is only logged — the row is committed, the recipient will see it on
-// their next fetch, and naking the event to retry a fire-and-forget publish
-// would be a worse trade.
+// *relay* or *push* is only logged — the row is committed, the recipient will
+// see it on their next fetch, and naking the event to retry a fire-and-forget
+// publish would be a worse trade.
 func (s *Service) createAndPush(ctx context.Context, workspaceID string, n *Notification) error {
-	if err := s.repo.Create(ctx, n); err != nil {
+	created, err := s.repo.Create(ctx, n)
+	if err != nil {
 		return fmt.Errorf("create %s notification for %s: %w", n.Type, n.UserID, err)
 	}
 	if s.nats != nil && workspaceID != "" {
 		if err := s.nats.Publish("superops."+workspaceID+".notification.created",
 			natspkg.Event{Type: "notification.new", Data: n}); err != nil {
-			s.logger.Warn("notification: push", "error", err, "user_id", n.UserID, "type", string(n.Type))
+			s.logger.Warn("notification: relay", "error", err, "user_id", n.UserID, "type", string(n.Type))
 		}
 	}
+	// Only on a genuinely new row. The realtime relay above is republished on a
+	// redelivery because a client that already has the frame ignores a duplicate
+	// id, but a duplicate push is a second buzz in the recipient's pocket for a
+	// message they have already read.
+	if created {
+		s.enqueuePush(ctx, n)
+	}
 	return nil
+}
+
+// enqueuePush addresses a committed notification to the recipient's devices.
+//
+// # On not checking whether the user is already connected
+//
+// The tempting optimisation is to skip the push when the recipient has a live
+// WebSocket. It is technically reachable from here — internal/presence keeps a
+// refcount of live connections per user in Redis (`presence-conns:{user_id}`),
+// shared across replicas, so the worker could consult it despite being a
+// different process from the hub. It is deliberately not done, for two reasons:
+//
+//   - The refcount is per *user*, not per device. A desktop web tab left open
+//     in an office would suppress the push to the phone in the user's pocket —
+//     silencing precisely the device push notifications exist for.
+//   - "Has a socket" is not "is looking at this channel". Suppression is a
+//     presentation decision, and the only process with the facts (is the app
+//     foregrounded? is this channel on screen?) is the client. It makes that
+//     decision in app/src/lib/push.ts's notification handler, where being wrong
+//     costs a redundant banner rather than a message the user never learns about.
+//
+// # On who gets a push
+//
+// Exactly the audience that gets the notification row, and no separate gate.
+// Muted channels, notification_pref, blocks and self-exclusion are all decided
+// by the fan-out before this is reached, so there is no second audience query
+// here that could drift away from the first one.
+//
+// There is deliberately no per-user "push off" preference either. The schema
+// had one — user_preferences.notifications_push — but migration 009 dropped
+// that table as dead schema and nothing has read it since. The opt-outs that
+// exist and work are per-channel mute, the OS notification permission, and
+// deregistering the device (DELETE /users/me/devices/{token}), which is what
+// the client does on logout.
+func (s *Service) enqueuePush(ctx context.Context, n *Notification) {
+	if s.pusher == nil || s.devices == nil {
+		return
+	}
+
+	tokens, err := s.devices.PushTokensForUser(ctx, n.UserID)
+	if err != nil {
+		s.logger.Warn("notification: list device tokens", "error", err, "user_id", n.UserID)
+		return
+	}
+	if len(tokens) == 0 {
+		return
+	}
+
+	msgs := make([]push.Message, 0, len(tokens))
+	data := s.pushData(n)
+	badge := s.badgeFor(ctx, n.UserID)
+	for _, token := range tokens {
+		msgs = append(msgs, push.Message{
+			Token: token,
+			Title: n.Title,
+			Body:  n.Body,
+			Data:  data,
+			Badge: badge,
+		})
+	}
+	s.pusher.Enqueue(msgs)
+}
+
+// pushData is the payload the client receives on tap. It is the notification's
+// own data (channel_id, message_id) plus enough to identify the notification
+// itself, so the app can mark it read and route without a round trip.
+func (s *Service) pushData(n *Notification) map[string]string {
+	data := map[string]string{
+		"notification_id": n.ID,
+		"type":            string(n.Type),
+	}
+	var stored map[string]string
+	if err := json.Unmarshal([]byte(n.Data), &stored); err != nil {
+		// Non-fatal: the notification still arrives, it just cannot deep-link.
+		s.logger.Warn("notification: push payload is not an object", "error", err, "notification_id", n.ID)
+		return data
+	}
+	for k, v := range stored {
+		// The two synthesised keys win; a channel_id from the row is what we
+		// want, a "type" from it would shadow the notification type.
+		if _, taken := data[k]; !taken {
+			data[k] = v
+		}
+	}
+	return data
+}
+
+// badgeFor resolves the app-icon badge: the recipient's total unread
+// notification count, not a per-message increment. Setting it server-side is
+// what keeps the badge right while the app is not running at all — the client
+// can only correct it once it launches.
+//
+// A failure yields nil, which leaves the existing badge alone rather than
+// clearing it to zero.
+func (s *Service) badgeFor(ctx context.Context, userID string) *int {
+	count, err := s.repo.UnreadCount(ctx, userID)
+	if err != nil {
+		s.logger.Warn("notification: unread count for badge", "error", err, "user_id", userID)
+		return nil
+	}
+	return &count
 }
 
 // newFanout resolves the author exclusion, the block list and the channel

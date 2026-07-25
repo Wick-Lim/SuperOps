@@ -523,9 +523,14 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publish(r.Context(), ch.WorkspaceID, evtMessageDeleted, eventKey(evtMessageDeleted, msgID), map[string]string{
+	// parent_id travels with the event so consumers can tell a timeline message
+	// from a thread reply. The unread fan-out uses it to skip the reply case
+	// entirely: replies are not counted by any unread query, so recomputing the
+	// badge for every member of the channel would publish N unchanged counts.
+	h.publish(r.Context(), ch.WorkspaceID, evtMessageDeleted, eventKey(evtMessageDeleted, msgID), map[string]any{
 		"id":         msgID,
 		"channel_id": ch.ID,
+		"parent_id":  msg.ParentID,
 	})
 
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "deleted"})
