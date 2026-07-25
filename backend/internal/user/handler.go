@@ -2,10 +2,13 @@ package user
 
 import (
 	"net/http"
+	"unicode/utf8"
 
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
+
+const searchLimit = 20
 
 type Handler struct {
 	repo *Repository
@@ -33,11 +36,18 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body")
 		return
 	}
-	_, err := h.repo.Pool().Exec(r.Context(),
-		`UPDATE users SET status_text = $2, status_emoji = $3 WHERE id = $1`,
-		userID, input.StatusText, input.StatusEmoji,
-	)
-	if err != nil {
+	// Migration 009 constrains both columns; without this an over-long status
+	// would be a CHECK violation rendered as a 500.
+	if utf8.RuneCountInString(input.StatusText) > MaxStatusTextLen {
+		httputil.JSONError(w, http.StatusBadRequest, "STATUS_TOO_LONG", "status_text is too long")
+		return
+	}
+	if utf8.RuneCountInString(input.StatusEmoji) > MaxStatusEmojiLen {
+		httputil.JSONError(w, http.StatusBadRequest, "STATUS_TOO_LONG", "status_emoji is too long")
+		return
+	}
+
+	if err := h.repo.UpdateStatus(r.Context(), userID, input.StatusText, input.StatusEmoji); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
@@ -55,6 +65,12 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
 	}
+
+	// The client calls this on load and on reconnect, which makes it the
+	// natural liveness heartbeat. The write is throttled inside the repository
+	// and best-effort: a failure here must not fail the read.
+	_ = h.repo.TouchLastActive(r.Context(), userID)
+
 	httputil.JSON(w, http.StatusOK, u)
 }
 
@@ -73,7 +89,11 @@ func (h *Handler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	u, err := h.repo.GetByID(r.Context(), userID)
-	if err != nil || u == nil {
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if u == nil {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "user not found")
 		return
 	}
@@ -99,8 +119,24 @@ func (h *Handler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 	httputil.JSON(w, http.StatusOK, u)
 }
 
+// GetUser resolves another user's public profile. It used to be a global
+// lookup by id, which turned any leaked uuid into a directory entry across
+// tenant boundaries; a shared workspace is now required. A stranger gets 404,
+// not 403, so the endpoint cannot be used to test id existence.
 func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
+	callerID := authctx.UserID(r.Context())
 	id := r.PathValue("user_id")
+
+	shared, err := h.repo.SharesWorkspace(r.Context(), callerID, id)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if !shared {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "user not found")
+		return
+	}
+
 	u, err := h.repo.GetByID(r.Context(), id)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
@@ -121,7 +157,7 @@ func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	users, err := h.repo.SearchExcludingBlocked(r.Context(), callerID, q, 20)
+	users, err := h.repo.SearchInSharedWorkspaces(r.Context(), callerID, q, searchLimit)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

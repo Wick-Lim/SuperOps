@@ -1,0 +1,9 @@
+.DS_Store
+.git/
+.gitignore
+*.swp
+*.tmp
+*.orig
+*.bak
+# NOTE: do not ignore charts/*.tgz — that is where `helm dependency build`
+# puts the subcharts, and ignoring them makes the chart unresolvable.

@@ -1,21 +1,67 @@
+{{- /*
+Schema migrations.
+
+This used to be a `pre-install` hook. Helm runs pre-install hooks BEFORE the
+release manifests — including the bundled postgresql subchart — so on a fresh
+install the Job had no database to connect to, burned its backoffLimit and
+failed the install. It only ever worked against a pre-existing external DB.
+
+post-install + pre-upgrade is the correct pair: the database exists by the time
+the hook runs on a fresh install, and on an upgrade it runs before the new image
+is rolled out. The initContainer waits for Postgres to accept TCP connections
+rather than relying on hook ordering alone.
+*/ -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: {{ include "superops.fullname" . }}-migrate
   labels:
     {{- include "superops.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
   annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook": post-install,pre-upgrade
     "helm.sh/hook-weight": "-5"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 3600
   template:
+    metadata:
+      labels:
+        {{- include "superops.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
     spec:
       restartPolicy: OnFailure
+      serviceAccountName: {{ include "superops.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.37
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              host="{{ include "superops.postgresqlHost" . }}"
+              port="{{ include "superops.postgresqlPort" . }}"
+              i=0
+              until nc -z "$host" "$port"; do
+                i=$((i+1))
+                [ "$i" -lt 120 ] || { echo "timed out waiting for $host:$port"; exit 1; }
+                echo "waiting for $host:$port ..."
+                sleep 5
+              done
       containers:
         - name: migrate
-          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
           command: ["/app/migrate", "-direction", "up"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           env:
             - name: MIGRATIONS_PATH
               value: "file:///app/migrations"
@@ -24,3 +70,10 @@ spec:
                 name: {{ include "superops.fullname" . }}-config
             - secretRef:
                 name: {{ include "superops.fullname" . }}-secret
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

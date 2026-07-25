@@ -1,0 +1,52 @@
+# Build context exclusions. Both Dockerfiles use the repository root as their
+# context (deploy/docker/docker-compose.yml build.context: ../../), so this file
+# governs `docker compose build`, `make docker-build` and the CI image builds.
+#
+# The critical entry is app/node_modules: Dockerfile.frontend runs `npm ci`
+# inside the image and then `COPY app/ ./`. Without the exclusion that COPY
+# overwrites the freshly installed linux/musl node_modules with the host's
+# (darwin-arm64 on a developer laptop), which breaks `expo export`.
+
+# VCS
+.git
+.gitignore
+.github
+
+# Node / Expo
+app/node_modules
+app/.expo
+app/dist
+app/web-build
+app/.metro-health-check*
+**/npm-debug.log*
+
+# Go build output
+backend/bin
+backend/vendor
+backend/tmp
+**/*.test
+**/*.out
+coverage
+
+# Local environment / secrets — never bake these into an image
+**/.env
+**/.env.local
+**/.env.*.local
+deploy/docker/secrets
+backups
+
+# Editors / OS
+.vscode
+.idea
+**/.DS_Store
+**/Thumbs.db
+**/*.swp
+
+# Docs and deploy material that no image needs.
+# NOTE: deploy/docker/nginx-frontend.conf IS copied by Dockerfile.frontend, so
+# deploy/ must not be excluded wholesale.
+README.md
+LICENSE
+docs
+deploy/k8s
+scripts

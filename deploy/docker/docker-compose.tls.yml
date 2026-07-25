@@ -1,0 +1,23 @@
+# TLS overlay — terminates HTTPS in the frontend nginx container.
+#
+#   mkdir -p deploy/docker/certs
+#   cp fullchain.pem privkey.pem deploy/docker/certs/
+#   cd deploy/docker
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# :80 then 308-redirects to :443 (except the ACME http-01 path). The routing
+# table itself is the shared /etc/nginx/snippets/app-locations.conf baked into
+# the image, so HTTP and HTTPS cannot drift apart.
+
+services:
+  frontend:
+    ports: !override
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    volumes:
+      - ./nginx-frontend-tls.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+      - certbot_webroot:/var/www/certbot
+
+volumes:
+  certbot_webroot:

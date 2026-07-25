@@ -11,10 +11,60 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
+
+// Caller-fault errors. Handlers map exactly these onto 4xx responses; anything
+// else coming out of the service is an internal fault and is masked.
+var (
+	// ErrInvalidCredentials is the single answer to an unknown email, a wrong
+	// password and a deactivated account alike, so that login cannot be used
+	// to enumerate accounts or probe account state.
+	ErrInvalidCredentials = errors.New("invalid credentials")
+	ErrInvalidTOTPCode    = errors.New("invalid two-factor code")
+
+	ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
+
+	ErrInviteInvalid       = errors.New("invite is invalid or has already been used")
+	ErrInviteExpired       = errors.New("invite has expired")
+	ErrInviteWrongAccount  = errors.New("this invite belongs to a different account")
+	ErrUsernameTaken       = errors.New("username already taken")
+	ErrSignupFieldsMissing = errors.New("username and password are required")
+
+	ErrPasswordTooShort = fmt.Errorf("password must be at least %d characters", minPasswordLen)
+	ErrPasswordTooLong  = fmt.Errorf("password must be at most %d bytes", maxPasswordBytes)
+	ErrCurrentPassword  = errors.New("current password is incorrect")
+
+	// ErrReauthRequired is returned by operations that a stolen access token
+	// alone must not be able to perform.
+	ErrReauthRequired = errors.New("current password or a valid two-factor code is required")
+)
+
+const (
+	minPasswordLen = 8
+	// bcrypt hashes only the first 72 bytes and silently discards the rest, so
+	// accepting a longer password would mean accepting one whose tail is
+	// meaningless. Reject it instead of pretending it counted.
+	maxPasswordBytes = 72
+)
+
+// dummyPasswordHash is a real bcrypt cost-12 hash of a value nobody knows. It
+// is compared against when the submitted email has no account, so that a login
+// attempt costs the same whether or not the account exists.
+const dummyPasswordHash = "$2a$12$u8m7xAI0Pp1kW0ZJq.n4ee1EMs4Qv.Wg6VkqBf2iiFNhQ/u9oYOoi"
+
+func validatePassword(pw string) error {
+	if len(pw) < minPasswordLen {
+		return ErrPasswordTooShort
+	}
+	if len(pw) > maxPasswordBytes {
+		return ErrPasswordTooLong
+	}
+	return nil
+}
 
 func extractIP(remoteAddr string) string {
 	host, _, err := net.SplitHostPort(remoteAddr)
@@ -33,6 +83,7 @@ type Service struct {
 	pool       *pgxpool.Pool
 	jwtMgr     *JWTManager
 	refreshTTL time.Duration
+	auditSvc   *audit.Service
 }
 
 type TokenPair struct {
@@ -41,14 +92,24 @@ type TokenPair struct {
 	ExpiresIn    int    `json:"expires_in"`
 }
 
-func NewService(repo *Repository, userRepo *user.Repository, pool *pgxpool.Pool, jwtMgr *JWTManager, refreshTTL time.Duration) *Service {
+func NewService(repo *Repository, userRepo *user.Repository, pool *pgxpool.Pool, jwtMgr *JWTManager, refreshTTL time.Duration, auditSvc *audit.Service) *Service {
 	return &Service{
 		repo:       repo,
 		userRepo:   userRepo,
 		pool:       pool,
 		jwtMgr:     jwtMgr,
 		refreshTTL: refreshTTL,
+		auditSvc:   auditSvc,
 	}
+}
+
+// record writes an audit entry if auditing is configured. Failures are logged
+// by the audit service, never propagated: the audited action already happened.
+func (s *Service) record(ctx context.Context, e audit.Entry) {
+	if s.auditSvc == nil {
+		return
+	}
+	s.auditSvc.Try(ctx, e)
 }
 
 type LoginInput struct {
@@ -58,35 +119,95 @@ type LoginInput struct {
 }
 
 func (s *Service) Login(ctx context.Context, input LoginInput, userAgent, ipAddress string) (*TokenPair, error) {
+	ip := extractIP(ipAddress)
+
 	u, err := s.userRepo.GetByEmail(ctx, input.Email)
 	if err != nil {
-		return nil, err
-	}
-	if u == nil {
-		return nil, fmt.Errorf("invalid credentials")
-	}
-	if !u.IsActive {
-		return nil, fmt.Errorf("account is deactivated")
+		return nil, fmt.Errorf("look up user: %w", err)
 	}
 
-	if !crypto.CheckPassword(input.Password, u.PasswordHash) {
-		return nil, fmt.Errorf("invalid credentials")
+	// Always pay for exactly one bcrypt comparison, and answer with the same
+	// error in every failure case: an unknown email, a wrong password and a
+	// deactivated account must be indistinguishable in both body and timing.
+	hash := dummyPasswordHash
+	if u != nil && u.PasswordHash != "" {
+		hash = u.PasswordHash
+	}
+	passwordOK := crypto.CheckPassword(input.Password, hash)
+
+	if u == nil || !u.IsActive || u.PasswordHash == "" || !passwordOK {
+		actor := ""
+		if u != nil {
+			actor = u.ID
+		}
+		s.record(ctx, audit.Entry{
+			ActorID:      actor,
+			Action:       audit.ActionLoginFailed,
+			ResourceType: "user",
+			ResourceID:   actor,
+			IPAddress:    ip,
+			Metadata:     map[string]interface{}{"email": input.Email, "reason": loginFailureReason(u, passwordOK)},
+		})
+		return nil, ErrInvalidCredentials
 	}
 
-	// Second factor, if enabled.
+	// Second factor, if enabled. A failure to read the 2FA state must fail
+	// closed: silently treating a transient DB fault as "2FA is off" would
+	// downgrade every protected account to password-only.
 	var secret string
 	var totpEnabled bool
-	s.pool.QueryRow(ctx, `SELECT COALESCE(totp_secret,''), totp_enabled FROM users WHERE id = $1`, u.ID).Scan(&secret, &totpEnabled)
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(totp_secret,''), totp_enabled FROM users WHERE id = $1`, u.ID,
+	).Scan(&secret, &totpEnabled); err != nil {
+		return nil, fmt.Errorf("load totp state: %w", err)
+	}
 	if totpEnabled {
 		if input.TOTPCode == "" {
 			return nil, ErrTOTPRequired
 		}
 		if !s.verifyTOTPOrBackup(ctx, u.ID, secret, input.TOTPCode) {
-			return nil, fmt.Errorf("invalid 2fa code")
+			s.record(ctx, audit.Entry{
+				ActorID:      u.ID,
+				Action:       audit.ActionLoginFailed,
+				ResourceType: "user",
+				ResourceID:   u.ID,
+				IPAddress:    ip,
+				Metadata:     map[string]interface{}{"email": input.Email, "reason": "invalid_totp"},
+			})
+			return nil, ErrInvalidTOTPCode
 		}
 	}
 
-	return s.issueTokens(ctx, u.ID, userAgent, ipAddress)
+	tokens, err := s.issueTokens(ctx, u.ID, userAgent, ipAddress)
+	if err != nil {
+		return nil, err
+	}
+	s.record(ctx, audit.Entry{
+		ActorID:      u.ID,
+		Action:       audit.ActionLogin,
+		ResourceType: "user",
+		ResourceID:   u.ID,
+		IPAddress:    ip,
+		Metadata:     map[string]interface{}{"totp": totpEnabled},
+	})
+	return tokens, nil
+}
+
+// loginFailureReason classifies a failed login for the audit trail only. It is
+// never surfaced to the client.
+func loginFailureReason(u *user.User, passwordOK bool) string {
+	switch {
+	case u == nil:
+		return "unknown_email"
+	case !u.IsActive:
+		return "account_deactivated"
+	case u.PasswordHash == "":
+		return "no_password_set"
+	case !passwordOK:
+		return "bad_password"
+	default:
+		return "unknown"
+	}
 }
 
 func (s *Service) RefreshTokens(ctx context.Context, refreshToken, userAgent, ipAddress string) (*TokenPair, error) {
@@ -95,11 +216,31 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken, userAgent, ip
 		return nil, err
 	}
 	if session == nil {
-		return nil, fmt.Errorf("invalid refresh token")
+		return nil, ErrInvalidRefreshToken
 	}
 	if time.Now().After(session.ExpiresAt) {
-		s.repo.DeleteSession(ctx, session.ID)
-		return nil, fmt.Errorf("refresh token expired")
+		if err := s.repo.DeleteSession(ctx, session.ID); err != nil {
+			return nil, err
+		}
+		return nil, ErrInvalidRefreshToken
+	}
+
+	// Deactivation has to cut the refresh chain now, not whenever the session
+	// happens to expire — otherwise a disabled account keeps minting access
+	// tokens for the full refresh TTL.
+	var isActive bool
+	err = s.pool.QueryRow(ctx, `SELECT is_active FROM users WHERE id = $1`, session.UserID).Scan(&isActive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrInvalidRefreshToken
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load user for refresh: %w", err)
+	}
+	if !isActive {
+		if err := s.repo.DeleteUserSessions(ctx, session.UserID); err != nil {
+			return nil, err
+		}
+		return nil, ErrInvalidRefreshToken
 	}
 
 	if err := s.repo.DeleteSession(ctx, session.ID); err != nil {
@@ -109,7 +250,7 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken, userAgent, ip
 	return s.issueTokens(ctx, session.UserID, userAgent, ipAddress)
 }
 
-func (s *Service) Logout(ctx context.Context, refreshToken string) error {
+func (s *Service) Logout(ctx context.Context, refreshToken, ipAddress string) error {
 	session, err := s.repo.GetSessionByToken(ctx, refreshToken)
 	if err != nil {
 		return err
@@ -117,52 +258,106 @@ func (s *Service) Logout(ctx context.Context, refreshToken string) error {
 	if session == nil {
 		return nil
 	}
-	return s.repo.DeleteSession(ctx, session.ID)
+	if err := s.repo.DeleteSession(ctx, session.ID); err != nil {
+		return err
+	}
+	s.record(ctx, audit.Entry{
+		ActorID:      session.UserID,
+		Action:       audit.ActionLogout,
+		ResourceType: "user",
+		ResourceID:   session.UserID,
+		IPAddress:    extractIP(ipAddress),
+	})
+	return nil
 }
 
-// AcceptInvite validates an invite token, creates a user, adds to workspace, and returns tokens.
-func (s *Service) AcceptInvite(ctx context.Context, token, username, password, fullName, userAgent, ipAddress string) (*TokenPair, error) {
-	// Validate invite token
+// AcceptInviteInput carries everything the accept-invite endpoint knows.
+type AcceptInviteInput struct {
+	Token    string
+	Username string
+	Password string
+	FullName string
+	// BearerToken is the caller's access token when the accept request came
+	// from an already-signed-in client; empty for an anonymous accept.
+	BearerToken string
+	UserAgent   string
+	IPAddress   string
+}
+
+// AcceptInvite consumes an invite token and returns a session for the invitee.
+//
+// Two shapes: if no account exists for the invited address the invite is a
+// signup and the account is created; if one does exist the invite is a join
+// into a second workspace, which requires proof that the caller *is* that
+// account (their access token or their password) — an invite mailed to an
+// address must never hand a stranger a session for it.
+func (s *Service) AcceptInvite(ctx context.Context, in AcceptInviteInput) (*TokenPair, error) {
 	var inviteID, email, workspaceID, role, status string
 	var expiresAt time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, workspace_id, role, status, expires_at FROM invitations WHERE token = $1`,
-		token,
+		`SELECT id, email, workspace_id, role, status, expires_at FROM invitations WHERE token_hash = $1`,
+		crypto.HashToken(in.Token),
 	).Scan(&inviteID, &email, &workspaceID, &role, &status, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrInviteInvalid
+	}
 	if err != nil {
-		return nil, fmt.Errorf("invalid invite token")
+		return nil, fmt.Errorf("load invitation: %w", err)
 	}
 	if status != "pending" {
-		return nil, fmt.Errorf("invite already used")
+		return nil, ErrInviteInvalid
 	}
 	if time.Now().After(expiresAt) {
-		s.pool.Exec(ctx, `UPDATE invitations SET status = 'expired' WHERE id = $1`, inviteID)
-		return nil, fmt.Errorf("invite expired")
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE invitations SET status = 'expired' WHERE id = $1 AND status = 'pending'`, inviteID); err != nil {
+			return nil, fmt.Errorf("expire invitation: %w", err)
+		}
+		return nil, ErrInviteExpired
 	}
 
-	// Check username availability
-	existing, _ := s.userRepo.GetByUsername(ctx, username)
-	if existing != nil {
-		return nil, fmt.Errorf("username already taken")
-	}
-
-	// Create user
-	hash, err := crypto.HashPassword(password)
+	existing, err := s.userRepo.GetByEmail(ctx, email)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("look up invited user: %w", err)
 	}
 
-	userID := uuid.NewString()
+	var userID, newUserHash string
+	if existing != nil {
+		if err := s.authorizeInvitee(existing, in); err != nil {
+			return nil, err
+		}
+		userID = existing.ID
+	} else {
+		if in.Username == "" || in.Password == "" {
+			return nil, ErrSignupFieldsMissing
+		}
+		if err := validatePassword(in.Password); err != nil {
+			return nil, err
+		}
+		taken, err := s.userRepo.GetByUsername(ctx, in.Username)
+		if err != nil {
+			return nil, fmt.Errorf("check username: %w", err)
+		}
+		if taken != nil {
+			return nil, ErrUsernameTaken
+		}
+		if newUserHash, err = crypto.HashPassword(in.Password); err != nil {
+			return nil, err
+		}
+		userID = uuid.NewString()
+	}
 
-	// Create the account, add it to the workspace + #general, and consume the
-	// invite atomically: a partial failure must never leave an orphaned user.
+	// Create the account (when it is a signup), add it to the workspace +
+	// #general, and consume the invite atomically: a partial failure must
+	// never leave an orphaned user or a burned invite.
 	err = database.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO users (id, email, username, full_name, password_hash, is_active)
-			 VALUES ($1, $2, $3, $4, $5, true)`,
-			userID, email, username, fullName, hash,
-		); err != nil {
-			return fmt.Errorf("create user: %w", err)
+		if existing == nil {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO users (id, email, username, full_name, password_hash, is_active)
+				 VALUES ($1, $2, $3, $4, $5, true)`,
+				userID, email, in.Username, in.FullName, newUserHash,
+			); err != nil {
+				return fmt.Errorf("create user: %w", err)
+			}
 		}
 
 		if _, err := tx.Exec(ctx,
@@ -190,7 +385,7 @@ func (s *Service) AcceptInvite(ctx context.Context, token, username, password, f
 			return fmt.Errorf("consume invite: %w", err)
 		}
 		if tag.RowsAffected() == 0 {
-			return errors.New("invite already used")
+			return ErrInviteInvalid
 		}
 		return nil
 	})
@@ -198,22 +393,60 @@ func (s *Service) AcceptInvite(ctx context.Context, token, username, password, f
 		return nil, err
 	}
 
-	return s.issueTokens(ctx, userID, userAgent, ipAddress)
+	s.record(ctx, audit.Entry{
+		WorkspaceID:  workspaceID,
+		ActorID:      userID,
+		Action:       audit.ActionInviteAccepted,
+		ResourceType: "invitation",
+		ResourceID:   inviteID,
+		IPAddress:    extractIP(in.IPAddress),
+		Metadata:     map[string]interface{}{"email": email, "role": role, "new_account": existing == nil},
+	})
+
+	return s.issueTokens(ctx, userID, in.UserAgent, in.IPAddress)
+}
+
+// authorizeInvitee proves that the caller accepting an invite addressed to an
+// existing account actually controls that account.
+func (s *Service) authorizeInvitee(u *user.User, in AcceptInviteInput) error {
+	if !u.IsActive {
+		return ErrInvalidCredentials
+	}
+	var wrongAccount bool
+	if in.BearerToken != "" {
+		if claims, err := s.jwtMgr.Validate(in.BearerToken); err == nil {
+			if claims.UserID == u.ID {
+				return nil
+			}
+			wrongAccount = true
+		}
+	}
+	if in.Password != "" && u.PasswordHash != "" && crypto.CheckPassword(in.Password, u.PasswordHash) {
+		return nil
+	}
+	if wrongAccount {
+		return ErrInviteWrongAccount
+	}
+	return ErrReauthRequired
 }
 
 // ChangePassword updates a user's password after verifying the current one,
 // then revokes all of the user's sessions so other devices must re-authenticate.
-func (s *Service) ChangePassword(ctx context.Context, userID, oldPassword, newPassword string) error {
-	u, err := s.userRepo.GetByID(ctx, userID)
-	if err != nil {
+func (s *Service) ChangePassword(ctx context.Context, userID, oldPassword, newPassword, ipAddress string) error {
+	if err := validatePassword(newPassword); err != nil {
 		return err
 	}
+
+	u, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("load user: %w", err)
+	}
 	if u == nil {
-		return errors.New("user not found")
+		return ErrInvalidCredentials
 	}
 	// Users created without a password (none currently) may set one freely.
 	if u.PasswordHash != "" && !crypto.CheckPassword(oldPassword, u.PasswordHash) {
-		return errors.New("current password is incorrect")
+		return ErrCurrentPassword
 	}
 
 	hash, err := crypto.HashPassword(newPassword)
@@ -221,11 +454,21 @@ func (s *Service) ChangePassword(ctx context.Context, userID, oldPassword, newPa
 		return err
 	}
 	if _, err := s.pool.Exec(ctx,
-		`UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1`, userID, hash); err != nil {
+		`UPDATE users SET password_hash = $2 WHERE id = $1`, userID, hash); err != nil {
 		return fmt.Errorf("update password: %w", err)
 	}
 
-	_ = s.repo.DeleteUserSessions(ctx, userID)
+	if err := s.repo.DeleteUserSessions(ctx, userID); err != nil {
+		return err
+	}
+
+	s.record(ctx, audit.Entry{
+		ActorID:      userID,
+		Action:       audit.ActionPasswordChanged,
+		ResourceType: "user",
+		ResourceID:   userID,
+		IPAddress:    extractIP(ipAddress),
+	})
 	return nil
 }
 
@@ -245,17 +488,20 @@ func (s *Service) GetInviteInfo(ctx context.Context, token string) (*InviteInfo,
 		 FROM invitations i
 		 JOIN workspaces w ON i.workspace_id = w.id
 		 JOIN users u ON i.invited_by = u.id
-		 WHERE i.token = $1`,
-		token,
+		 WHERE i.token_hash = $1`,
+		crypto.HashToken(token),
 	).Scan(&info.Email, &info.WorkspaceName, &info.Role, &info.InviterName, &status, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrInviteInvalid
+	}
 	if err != nil {
-		return nil, fmt.Errorf("invite not found")
+		return nil, fmt.Errorf("load invitation: %w", err)
 	}
 	if status != "pending" {
-		return nil, fmt.Errorf("invite already used")
+		return nil, ErrInviteInvalid
 	}
 	if time.Now().After(expiresAt) {
-		return nil, fmt.Errorf("invite expired")
+		return nil, ErrInviteExpired
 	}
 	return &info, nil
 }
@@ -272,12 +518,13 @@ func (s *Service) issueTokens(ctx context.Context, userID, userAgent, ipAddress 
 	}
 
 	session := &Session{
-		ID:           uuid.NewString(),
-		UserID:       userID,
-		RefreshToken: refreshToken,
-		UserAgent:    userAgent,
-		IPAddress:    extractIP(ipAddress),
-		ExpiresAt:    time.Now().Add(s.refreshTTL),
+		ID:     uuid.NewString(),
+		UserID: userID,
+		// Only the hash is persisted; the plaintext leaves in the response.
+		RefreshTokenHash: crypto.HashToken(refreshToken),
+		UserAgent:        userAgent,
+		IPAddress:        extractIP(ipAddress),
+		ExpiresAt:        time.Now().Add(s.refreshTTL),
 	}
 
 	if err := s.repo.CreateSession(ctx, session); err != nil {

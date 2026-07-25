@@ -1,23 +1,40 @@
+# golangci-lint v2 configuration.
+# The linter version is pinned in .github/workflows/ci.yml
+# (golangci-lint-action with an explicit `version:`) — keep the two in sync.
+version: "2"
+
 run:
   timeout: 5m
 
 linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused.
+  # `gosimple` was folded into staticcheck and removed in v2 — do not re-add it.
+  default: standard
   enable:
-    - errcheck
-    - govet
-    - staticcheck
-    - unused
-    - gosimple
-    - ineffassign
     - misspell
-    - gofmt
-    - goimports
-
-linters-settings:
-  goimports:
-    local-prefixes: github.com/Wick-Lim/SuperOps/backend
+  exclusions:
+    # Restores the upstream default exclusions that v1's
+    # `issues.exclude-use-default: false` switched off — notably the errcheck
+    # exemption for `defer f.Close()` and friends.
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # Test helpers legitimately ignore errors on best-effort cleanup.
+      - path: _test\.go
+        linters:
+          - errcheck
 
 issues:
-  exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/Wick-Lim/SuperOps/backend

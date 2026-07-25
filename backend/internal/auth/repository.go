@@ -7,16 +7,21 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
 )
 
+// Session mirrors a row of the sessions table. Only the SHA-256 of the refresh
+// token is ever persisted or read back; the plaintext exists solely in the
+// login/refresh response body.
 type Session struct {
-	ID           string
-	UserID       string
-	RefreshToken string
-	UserAgent    string
-	IPAddress    string
-	ExpiresAt    time.Time
-	CreatedAt    time.Time
+	ID               string
+	UserID           string
+	RefreshTokenHash string
+	UserAgent        string
+	IPAddress        string
+	ExpiresAt        time.Time
+	CreatedAt        time.Time
 }
 
 type Repository struct {
@@ -29,9 +34,9 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 
 func (r *Repository) CreateSession(ctx context.Context, s *Session) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO sessions (id, user_id, refresh_token, user_agent, ip_address, expires_at)
+		`INSERT INTO sessions (id, user_id, refresh_token_hash, user_agent, ip_address, expires_at)
 		 VALUES ($1, $2, $3, $4, $5::inet, $6)`,
-		s.ID, s.UserID, s.RefreshToken, s.UserAgent, s.IPAddress, s.ExpiresAt,
+		s.ID, s.UserID, s.RefreshTokenHash, s.UserAgent, s.IPAddress, s.ExpiresAt,
 	)
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
@@ -39,13 +44,15 @@ func (r *Repository) CreateSession(ctx context.Context, s *Session) error {
 	return nil
 }
 
+// GetSessionByToken looks a session up by the plaintext refresh token; the
+// hashing happens here so no caller is tempted to query the column directly.
 func (r *Repository) GetSessionByToken(ctx context.Context, refreshToken string) (*Session, error) {
 	s := &Session{}
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, user_id, refresh_token, user_agent, COALESCE(host(ip_address),''), expires_at, created_at
-		 FROM sessions WHERE refresh_token = $1`,
-		refreshToken,
-	).Scan(&s.ID, &s.UserID, &s.RefreshToken, &s.UserAgent, &s.IPAddress, &s.ExpiresAt, &s.CreatedAt)
+		`SELECT id, user_id, refresh_token_hash, user_agent, COALESCE(host(ip_address),''), expires_at, created_at
+		 FROM sessions WHERE refresh_token_hash = $1`,
+		crypto.HashToken(refreshToken),
+	).Scan(&s.ID, &s.UserID, &s.RefreshTokenHash, &s.UserAgent, &s.IPAddress, &s.ExpiresAt, &s.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -71,6 +78,8 @@ func (r *Repository) DeleteUserSessions(ctx context.Context, userID string) erro
 	return nil
 }
 
+// CleanExpiredSessions drops sessions past their expiry. The background worker
+// runs this on a timer.
 func (r *Repository) CleanExpiredSessions(ctx context.Context) (int64, error) {
 	tag, err := r.pool.Exec(ctx, `DELETE FROM sessions WHERE expires_at < NOW()`)
 	if err != nil {

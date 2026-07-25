@@ -2,12 +2,20 @@ global:
   domain: "superops.example.com"
   storageClass: ""
 
+# --- Application images -------------------------------------------------------
 backend:
   image:
     repository: ghcr.io/wick-lim/superops-backend
-    tag: "latest"
+    # Empty means .Chart.AppVersion. Never use "latest" with
+    # pullPolicy: IfNotPresent — nodes cache it forever and never see a new push.
+    tag: ""
     pullPolicy: IfNotPresent
   replicas: 2
+  # WebSockets are hijacked connections: http.Server.Shutdown does not wait for
+  # them, and the server takes 30s to drain. Give the pod room plus a preStop
+  # pause so the endpoint is removed from Services before SIGTERM lands.
+  terminationGracePeriodSeconds: 60
+  preStopSleepSeconds: 10
   resources:
     requests:
       cpu: "250m"
@@ -20,19 +28,48 @@ backend:
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilization: 70
+    # CPU is a weak signal for a WebSocket server; connection count would be
+    # better, but that needs a custom metrics adapter.
+  pdb:
+    enabled: true
+    minAvailable: 1
+  # Keeps the two replicas off a single node, without which a minAvailable: 1
+  # PDB cannot actually protect availability during a node drain.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: backend
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
   env:
     LOG_LEVEL: "info"
     # Transport security — set to "require" (Postgres) / "true" (MinIO) once TLS
     # certs are provisioned for in-cluster traffic.
     DB_SSLMODE: "disable"
     MINIO_USE_SSL: "false"
-    # Rate limiting (the app sits behind the nginx ingress, which sets X-Forwarded-For).
+    # The app sits behind the nginx ingress controller, which appends exactly
+    # one hop to X-Forwarded-For.
     RATE_LIMIT_TRUST_PROXY: "true"
-    # CORS — restrict to your web origin(s) in production, comma-separated.
-    CORS_ALLOWED_ORIGINS: "*"
+    RATE_LIMIT_TRUSTED_PROXY_HOPS: "1"
+    RATE_LIMIT_ENABLED: "true"
+    RATE_LIMIT_API_PER_MIN: "600"
+    RATE_LIMIT_AUTH_PER_MIN: "10"
+    # CORS — the bundled web client is same-origin, so list only the origins
+    # that genuinely need cross-origin access. "*" is the unsafe default.
+    CORS_ALLOWED_ORIGINS: "https://superops.example.com"
+    SERVER_READ_TIMEOUT: "15s"
+    SERVER_WRITE_TIMEOUT: "15s"
+    SERVER_IDLE_TIMEOUT: "60s"
+  # Extra env keys merged into the ConfigMap verbatim.
+  extraEnv: {}
 
 worker:
   replicas: 1
+  terminationGracePeriodSeconds: 60
   resources:
     requests:
       cpu: "100m"
@@ -40,11 +77,19 @@ worker:
     limits:
       cpu: "500m"
       memory: "256Mi"
+  pdb:
+    # A single-replica PDB with minAvailable: 1 blocks node drains outright, so
+    # this stays off until the worker is actually scaled out.
+    enabled: false
+    minAvailable: 1
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 frontend:
   image:
     repository: ghcr.io/wick-lim/superops-frontend
-    tag: "latest"
+    tag: ""
     pullPolicy: IfNotPresent
   replicas: 2
   resources:
@@ -54,69 +99,187 @@ frontend:
     limits:
       cpu: "200m"
       memory: "128Mi"
+  pdb:
+    enabled: true
+    minAvailable: 1
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: frontend
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
+# --- Security -----------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # Nothing in this app talks to the Kubernetes API.
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# nginx:1.27-alpine starts as root to bind :80 and drops to the nginx user for
+# workers, and it writes to /var/cache/nginx and /var/run, so it cannot use the
+# hardened context above. Those paths are backed by emptyDirs instead.
+frontendPodSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+frontendSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+    add: ["CHOWN", "SETGID", "SETUID", "NET_BIND_SERVICE"]
+
+networkPolicy:
+  # Off by default: an incomplete policy fails closed and takes the app down.
+  # Review the egress rules against your CNI and DNS setup, then enable.
+  enabled: false
+  # Extra egress rules (e.g. an external SMTP relay or object store).
+  extraEgress: []
+
+# --- Ingress ------------------------------------------------------------------
 ingress:
   enabled: true
   className: nginx
   annotations:
+    # WebSocket connections are long-lived; the controller default is 60s.
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/websocket-services: "superops-backend"
+    # NOTE: `nginx.ingress.kubernetes.io/websocket-services` was removed — it is
+    # not an ingress-nginx annotation (it belonged to the old kubernetes/contrib
+    # controller) and did nothing.
   tls:
     enabled: true
     secretName: superops-tls
+    # Set to a cert-manager (Cluster)Issuer name to have the certificate
+    # provisioned automatically; otherwise create secretName out-of-band, or the
+    # ingress serves the controller's self-signed default certificate.
+    clusterIssuer: ""
+    issuer: ""
 
+# --- Application configuration ------------------------------------------------
 jwt:
-  secret: ""  # Must be set
+  secret: ""  # REQUIRED, >= 32 bytes
 
+admin:
+  # REQUIRED. LoadConfig treats a missing ADMIN_EMAIL/ADMIN_PASSWORD as fatal
+  # (backend/internal/app/config.go), and all three binaries call it — so
+  # without these the pre-upgrade migrate Job dies and the install aborts.
+  # They seed the first administrator account on first boot.
+  email: "admin@example.com"
+  username: "admin"
+  password: ""  # REQUIRED
+
+metrics:
+  # When set, GET /metrics requires this bearer token. /metrics is not routed
+  # through the ingress either way.
+  token: ""
+
+# --- Dependencies -------------------------------------------------------------
 postgresql:
   enabled: true
-  architecture: replication  # HA: primary + read replicas
+  # standalone, NOT replication.
+  #
+  # The app opens a single DSN (DBConfig.DSN) with no read/write split, so a
+  # read replica is never queried, and Bitnami's `replication` architecture is
+  # async streaming with manual promotion — it is not automatic failover. It
+  # also renames the Service to <release>-postgresql-primary, which the
+  # ConfigMap does not point at. Advertising HA the app cannot use is worse than
+  # not having it: for real HA, run an operator-managed cluster (CloudNativePG,
+  # Crunchy) or a managed service and set postgresql.enabled=false plus
+  # externalDatabase.* / DATABASE_URL below.
+  architecture: standalone
   auth:
     database: superops
     username: superops
-    password: ""  # Must be set
+    password: ""  # REQUIRED
   primary:
     persistence:
       size: 10Gi
-  readReplicas:
-    replicaCount: 1
-    persistence:
-      size: 10Gi
+
+externalDatabase:
+  host: ""
+  port: 5432
+  # Full DSN override, passed to the app as DATABASE_URL. Use this for a pooler
+  # (pgbouncer) or target_session_attrs=read-write against a managed cluster.
+  # Takes precedence over every other DB_* setting.
+  url: ""
 
 redis:
   enabled: true
-  architecture: replication  # HA: master + replicas + sentinel
+  # standalone, NOT replication+sentinel.
+  #
+  # pkg/redis uses redis.NewClient with a fixed Addr, not NewFailoverClient with
+  # MasterName/SentinelAddrs, so the app cannot follow a Sentinel failover under
+  # any addressing scheme; enabling Sentinel only breaks the Service name the
+  # ConfigMap resolves. Use a managed Redis (or add failover support to
+  # pkg/redis) before claiming HA here.
+  architecture: standalone
   auth:
     enabled: true
-    password: ""  # Must be set
-  sentinel:
-    enabled: true
-    masterSet: superops-master
+    password: ""  # REQUIRED
   master:
     persistence:
       size: 2Gi
-  replica:
-    replicaCount: 2
-    persistence:
-      size: 2Gi
+
+externalRedis:
+  host: ""
 
 nats:
   enabled: true
-  jetstream:
-    enabled: true
-  cluster:
-    enabled: true
-    replicas: 3
+  # The nats chart pinned in Chart.yaml (~1.2) reads these under `config`.
+  # The old top-level nats.jetstream / nats.cluster keys were silently ignored,
+  # so JetStream was OFF and cmd/worker degraded to fire-and-forget core NATS.
+  config:
+    jetstream:
+      enabled: true
+      fileStore:
+        enabled: true
+        pvc:
+          size: 10Gi
+    cluster:
+      enabled: true
+      replicas: 3
+
+externalNats:
+  host: ""
 
 minio:
   enabled: true
   auth:
     rootUser: minioadmin
-    rootPassword: ""  # Must be set
+    rootPassword: ""  # REQUIRED
   persistence:
     size: 20Gi
 
-meilisearch:
-  enabled: true
-  masterKey: ""  # Must be set
+externalMinio:
+  host: ""
+
+# Meilisearch is NOT a chart dependency (see Chart.yaml), so nothing here
+# deploys it. Point externalMeilisearch.host at an existing instance to enable
+# search, otherwise search stays disabled — which is what actually happened
+# before, silently, while values advertised meilisearch.enabled: true.
+search:
+  enabled: false
+
+externalMeilisearch:
+  host: ""       # e.g. http://meilisearch.search.svc.cluster.local:7700
+  masterKey: ""

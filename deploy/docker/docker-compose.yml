@@ -1,21 +1,45 @@
+# SuperOps single-host deployment.
+#
+# Infrastructure ports are bound to 127.0.0.1 on purpose: only the frontend
+# proxy (:8080) is meant to be reachable from off-host. Publish anything else
+# only behind a firewall you control.
+#
+# Secrets come from .env (see .env.example; scripts/setup.sh generates real
+# random values). .env is also the interpolation source for the ${...} below.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# NATS now requires authentication (see the nats service command); the URL is
+# built here so the credentials have a single source of truth.
+x-nats-url: &nats-url "nats://${NATS_USER:-superops}:${NATS_PASSWORD:-changeme_nats_password}@nats:4222"
+
 services:
   # --- Application ---
   backend:
     build:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.backend
+    # Loopback only — the frontend proxy is the public entry point. Binding
+    # 0.0.0.0 here let clients skip nginx entirely and forge X-Forwarded-For
+    # against RATE_LIMIT_TRUST_PROXY.
     ports:
-      - "8081:8080"
+      - "127.0.0.1:8081:8080"
     env_file: .env
+    environment:
+      NATS_URL: *nats-url
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       nats:
-        condition: service_started
+        condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     healthcheck:
@@ -24,6 +48,12 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+    logging: *default-logging
     restart: unless-stopped
 
   # Web client (React Native Web static export served by nginx).
@@ -32,10 +62,16 @@ services:
       context: ../../
       dockerfile: deploy/docker/Dockerfile.frontend
     ports:
-      - "8080:80"
+      - "${FRONTEND_BIND:-0.0.0.0}:8080:80"
     depends_on:
       backend:
         condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128m
+    logging: *default-logging
     restart: unless-stopped
 
   worker:
@@ -45,15 +81,37 @@ services:
     entrypoint: ["/app/worker"]
     command: []
     env_file: .env
+    environment:
+      NATS_URL: *nats-url
+      # Distinguishes worker connections in pg_stat_activity.
+      DB_APPLICATION_NAME: superops-worker
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       nats:
-        condition: service_started
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    healthcheck:
+      # cmd/worker serves /health on WORKER_HEALTH_PORT (8081 by default) and
+      # answers 503 once a job loop stops ticking. Nothing depends on the
+      # worker's health condition, so this reports rather than gates — but
+      # `docker compose ps` now distinguishes "running" from "still working".
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${WORKER_HEALTH_PORT:-8081}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The worker retries the JetStream stream for ~20s before the listener
+      # starts, and the scheduled-messages loop needs a first tick after that.
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+    logging: *default-logging
     restart: unless-stopped
 
   migrate:
@@ -65,9 +123,11 @@ services:
     env_file: .env
     environment:
       MIGRATIONS_PATH: "file:///app/migrations"
+      NATS_URL: *nats-url
     depends_on:
       postgres:
         condition: service_healthy
+    logging: *default-logging
     restart: "no"
 
   # --- Infrastructure ---
@@ -80,12 +140,18 @@ services:
       POSTGRES_USER: superops
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_db_password}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U superops"]
+      test: ["CMD-SHELL", "pg_isready -U superops -d superops"]
       interval: 5s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+    logging: *default-logging
     restart: unless-stopped
 
   redis:
@@ -94,24 +160,56 @@ services:
       - redis_data:/data
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme_redis_password}
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme_redis_password}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+    logging: *default-logging
     restart: unless-stopped
 
   nats:
     image: nats:2-alpine
-    command: ["-js", "-m", "8222"]
+    # -sd puts the JetStream file store on a volume; without it durable stream
+    # data lives in the container layer and dies with the container.
+    # --user/--pass turn on client authentication (there was none at all).
+    command:
+      - "-js"
+      - "-sd"
+      - "/data"
+      - "-m"
+      - "8222"
+      - "--user"
+      - "${NATS_USER:-superops}"
+      - "--pass"
+      - "${NATS_PASSWORD:-changeme_nats_password}"
+    volumes:
+      - nats_data:/data
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "127.0.0.1:4222:4222"
+      # Monitoring endpoint — unauthenticated, never expose it publicly.
+      - "127.0.0.1:8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+    logging: *default-logging
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     volumes:
       - minio_data:/data
     environment:
@@ -119,8 +217,23 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-changeme_minio_password}
     command: server /data --console-address ":9001"
     ports:
-      - "19000:9000"
-      - "19001:9001"
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    healthcheck:
+      # `mc ready local` is what MinIO documents for current images; curl is the
+      # fallback for older ones. The backend waits on this, so it must not
+      # depend on a tool that may be absent.
+      test: ["CMD-SHELL", "mc ready local || curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging: *default-logging
     restart: unless-stopped
 
   meilisearch:
@@ -129,33 +242,137 @@ services:
       - meili_data:/meili_data
     environment:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-changeme_meili_master_key}
+      MEILI_ENV: production
     ports:
-      - "7700:7700"
+      - "127.0.0.1:7700:7700"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:7700/health || wget -q --spider http://localhost:7700/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging: *default-logging
     restart: unless-stopped
 
-  # --- Monitoring (optional) ---
+  # --- Tools (one-shot, never started by `up`) ---
+  # Demo data (idempotent) in the admin's workspace. Same binary the README
+  # runs as `go run ./cmd/seed`, for hosts with no Go toolchain:
+  #   docker compose --profile tools run --rm seed
+  seed:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.backend
+    profiles: ["tools"]
+    entrypoint: ["/app/seed"]
+    command: []
+    env_file: .env
+    environment:
+      NATS_URL: *nats-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # It publishes message.created, so search and notifications see the demo
+      # messages; without NATS those events are lost.
+      nats:
+        condition: service_healthy
+    # No depends_on migrate: the dev override disables that service, and a
+    # dependency in an inactive profile is an error rather than a no-op. Run
+    # seed against an already-migrated stack (it fails loudly otherwise).
+    logging: *default-logging
+    restart: "no"
+
+  # Rebuilds the Meilisearch index from Postgres — the only recovery path after
+  # a Meilisearch data loss or a retention purge, since the index is otherwise
+  # only ever written incrementally by the worker:
+  #   docker compose --profile tools run --rm reindex -batch 500
+  #   docker compose --profile tools run --rm reindex -workspace <uuid> -dry-run
+  reindex:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.backend
+    profiles: ["tools"]
+    entrypoint: ["/app/reindex"]
+    command: []
+    env_file: .env
+    environment:
+      NATS_URL: *nats-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+    logging: *default-logging
+    restart: "no"
+
+  # Used by scripts/backup.sh and scripts/restore.sh to mirror the MinIO bucket,
+  # which holds the file bytes that the Postgres dump only references.
+  #   docker compose --profile tools run --rm mc "mc ls superops"
+  mc:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    profiles: ["tools"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mc --version"]
+    environment:
+      MC_HOST_superops: "http://${MINIO_ACCESS_KEY:-minioadmin}:${MINIO_SECRET_KEY:-changeme_minio_password}@minio:9000"
+    volumes:
+      - ${BACKUP_DIR:-./backups}:/backup
+    logging: *default-logging
+
+  # --- Monitoring (optional: docker compose --profile monitoring up -d) ---
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.13.1
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-alerts.yml:/etc/prometheus/prometheus-alerts.yml:ro
       - prometheus_data:/prometheus
+    secrets:
+      # METRICS_TOKEN, so scraping keeps working once /metrics is authenticated.
+      - metrics_token
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     profiles: ["monitoring"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging: *default-logging
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.1.1
     volumes:
       - grafana_data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-changeme_grafana_password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     profiles: ["monitoring"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+    logging: *default-logging
     restart: unless-stopped
+
+secrets:
+  metrics_token:
+    # Generated by scripts/setup.sh; only the monitoring profile consumes it.
+    file: ./secrets/metrics_token
 
 volumes:
   postgres_data:
   redis_data:
+  nats_data:
   minio_data:
   meili_data:
   prometheus_data:

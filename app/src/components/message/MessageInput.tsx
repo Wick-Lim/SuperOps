@@ -1,85 +1,160 @@
-import React, { useRef, useState } from 'react'
-import { View, TextInput, Pressable, Text, Alert, ActivityIndicator } from 'react-native'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  ActivityIndicator,
+  Alert,
+  NativeSyntheticEvent,
+  Platform,
+  Pressable,
+  Text,
+  TextInput,
+  TextInputKeyPressEventData,
+  View,
+} from 'react-native'
 import * as DocumentPicker from 'expo-document-picker'
 import { theme } from '../../lib/theme'
-import { fileApi } from '../../api/files'
+import { fileApi, type PickedFile, type UploadedFile } from '../../api/files'
+import { errorMessage } from '../../api/client'
 import { wsManager } from '../../lib/websocket'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
+import { MIN_TOUCH, touchSlop } from '../a11y'
 
-interface PendingFile {
-  id: string
-  name: string
+/** A file the user picked but that has not been sent to the server yet. */
+interface StagedFile {
+  key: string
+  file: PickedFile
 }
 
 interface Props {
-  onSend: (content: string, fileIds?: string[]) => void
-  channelName: string
+  /** Called with the already-uploaded files, so the caller can render them optimistically. */
+  onSend: (content: string, files?: UploadedFile[]) => void
   channelId: string
+  channelName?: string
+  placeholder?: string
+  autoFocus?: boolean
 }
 
-export default function MessageInput({ onSend, channelName, channelId }: Props) {
+let stagedSeq = 0
+
+export default function MessageInput({
+  onSend,
+  channelId,
+  channelName,
+  placeholder,
+  autoFocus,
+}: Props) {
   const [content, setContent] = useState('')
-  const [pending, setPending] = useState<PendingFile[]>([])
-  const [uploading, setUploading] = useState(false)
+  const [staged, setStaged] = useState<StagedFile[]>([])
+  const [sending, setSending] = useState(false)
   const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace)
   const lastTypingRef = useRef(0)
+  const typingActiveRef = useRef(false)
+
+  const stopTyping = useCallback(() => {
+    if (!typingActiveRef.current) return
+    typingActiveRef.current = false
+    lastTypingRef.current = 0
+    wsManager.sendTypingStop(channelId)
+  }, [channelId])
+
+  // Leaving a channel mid-sentence left the indicator up for everyone else
+  // until the 4s TTL expired on each of their clients.
+  useEffect(() => stopTyping, [stopTyping])
 
   const handleChange = (text: string) => {
     setContent(text)
-    // Throttle typing notifications to ~once per 2s.
+    if (!text.trim()) {
+      stopTyping()
+      return
+    }
     const now = Date.now()
     if (now - lastTypingRef.current > 2000) {
       lastTypingRef.current = now
+      typingActiveRef.current = true
       wsManager.sendTyping(channelId)
     }
   }
 
-  const handleSend = () => {
-    const trimmed = content.trim()
-    const fileIds = pending.map((p) => p.id)
-    if (!trimmed && fileIds.length === 0) return
-    onSend(trimmed, fileIds.length ? fileIds : undefined)
-    setContent('')
-    setPending([])
-  }
-
   const handleAttach = async () => {
-    if (!activeWorkspace) {
-      Alert.alert('Error', 'No active workspace')
-      return
-    }
     try {
       const result = await DocumentPicker.getDocumentAsync({})
       if (result.canceled || !result.assets || result.assets.length === 0) return
       const asset = result.assets[0]
-      setUploading(true)
-      const res = await fileApi.upload(activeWorkspace.id, {
-        uri: asset.uri,
-        name: asset.name,
-        mimeType: asset.mimeType,
-      })
-      setPending((prev) => [...prev, { id: res.data.id, name: res.data.name || asset.name }])
+      // Deliberately NOT uploaded here. Uploading on pick orphaned the blob
+      // server-side whenever the composer was abandoned.
+      setStaged((prev) => [
+        ...prev,
+        {
+          key: `staged-${++stagedSeq}`,
+          file: { uri: asset.uri, name: asset.name, mimeType: asset.mimeType },
+        },
+      ])
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Upload failed')
-    } finally {
-      setUploading(false)
+      Alert.alert('Error', errorMessage(err, 'Could not open the file picker'))
     }
   }
 
-  const removePending = (id: string) => {
-    setPending((prev) => prev.filter((p) => p.id !== id))
-    fileApi.remove(id).catch(() => {})
+  const removeStaged = (key: string) => {
+    setStaged((prev) => prev.filter((s) => s.key !== key))
   }
 
-  const canSend = !!content.trim() || pending.length > 0
+  const handleSend = async () => {
+    if (sending) return
+    const trimmed = content.trim()
+    if (!trimmed && staged.length === 0) return
+    if (staged.length > 0 && !activeWorkspace) {
+      Alert.alert('Error', 'No active workspace')
+      return
+    }
+
+    setSending(true)
+    const uploaded: UploadedFile[] = []
+    try {
+      for (const s of staged) {
+        const res = await fileApi.upload(activeWorkspace!.id, s.file)
+        uploaded.push(res.data)
+      }
+    } catch (err) {
+      // Roll the partial upload back so a retry does not leak the blobs that
+      // did land.
+      uploaded.forEach((f) => {
+        fileApi.remove(f.id).catch(() => {})
+      })
+      setSending(false)
+      Alert.alert('Error', errorMessage(err, 'Upload failed'))
+      return
+    }
+
+    setSending(false)
+    stopTyping()
+    setContent('')
+    setStaged([])
+    onSend(trimmed, uploaded.length ? uploaded : undefined)
+  }
+
+  /**
+   * Web/hardware-keyboard shortcut only.
+   *
+   * `onSubmitEditing` on a multiline TextInput does not fire on Android — Enter
+   * inserts a newline — so it was never a dependable send path and is gone. The
+   * Send button is the contract on every platform; this just restores
+   * Enter-to-send where the key event is real and cancellable.
+   */
+  const handleKeyPress = (e: NativeSyntheticEvent<TextInputKeyPressEventData>) => {
+    const ne = e.nativeEvent as TextInputKeyPressEventData & { shiftKey?: boolean }
+    if (ne.key !== 'Enter' || ne.shiftKey) return
+    ;(e as unknown as { preventDefault?: () => void }).preventDefault?.()
+    void handleSend()
+  }
+
+  const canSend = (!!content.trim() || staged.length > 0) && !sending
 
   return (
     <View style={{ borderTopWidth: 1, borderTopColor: theme.border, backgroundColor: theme.bg }}>
-      {pending.length > 0 && (
+      {staged.length > 0 && (
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingHorizontal: 12, paddingTop: 8 }}>
-          {pending.map((p) => (
+          {staged.map((s) => (
             <View
-              key={p.id}
+              key={s.key}
               style={{
                 flexDirection: 'row',
                 alignItems: 'center',
@@ -96,10 +171,16 @@ export default function MessageInput({ onSend, channelName, channelId }: Props) 
             >
               <Text style={{ fontSize: 13 }}>📎</Text>
               <Text style={{ color: theme.body, fontSize: 12 }} numberOfLines={1}>
-                {p.name}
+                {s.file.name}
               </Text>
-              <Pressable onPress={() => removePending(p.id)} hitSlop={8} style={{ paddingHorizontal: 4 }}>
-                <Text style={{ color: theme.textFaint, fontSize: 14 }}>✕</Text>
+              <Pressable
+                onPress={() => removeStaged(s.key)}
+                hitSlop={touchSlop(20)}
+                accessibilityRole="button"
+                accessibilityLabel={`Remove attachment ${s.file.name}`}
+                style={{ paddingHorizontal: 4 }}
+              >
+                <Text style={{ color: theme.textMuted, fontSize: 14 }}>✕</Text>
               </Pressable>
             </View>
           ))}
@@ -109,29 +190,36 @@ export default function MessageInput({ onSend, channelName, channelId }: Props) 
       <View style={{ flexDirection: 'row', alignItems: 'flex-end', paddingHorizontal: 12, paddingVertical: 8, gap: 8 }}>
         <Pressable
           onPress={handleAttach}
-          disabled={uploading}
+          disabled={sending}
+          accessibilityRole="button"
+          accessibilityLabel="Attach a file"
+          accessibilityState={{ disabled: sending }}
           style={{
-            width: 40,
-            height: 40,
+            width: MIN_TOUCH,
+            height: MIN_TOUCH,
             borderRadius: 12,
             alignItems: 'center',
             justifyContent: 'center',
             backgroundColor: theme.surface,
             borderWidth: 1,
             borderColor: theme.borderStrong,
+            opacity: sending ? 0.5 : 1,
           }}
         >
-          {uploading ? <ActivityIndicator size="small" color={theme.textMuted} /> : <Text style={{ fontSize: 18 }}>📎</Text>}
+          <Text style={{ fontSize: 18 }}>📎</Text>
         </Pressable>
 
         <TextInput
           value={content}
           onChangeText={handleChange}
-          placeholder={`Message #${channelName}`}
-          placeholderTextColor={theme.textDim}
+          onBlur={stopTyping}
+          autoFocus={autoFocus}
+          placeholder={placeholder ?? `Message #${channelName || 'channel'}`}
+          placeholderTextColor={theme.textMuted}
+          accessibilityLabel={placeholder ?? `Message ${channelName || 'channel'}`}
           multiline
-          onSubmitEditing={handleSend}
-          blurOnSubmit={false}
+          submitBehavior="newline"
+          onKeyPress={Platform.OS === 'web' ? handleKeyPress : undefined}
           style={{
             flex: 1,
             backgroundColor: theme.surface,
@@ -142,6 +230,7 @@ export default function MessageInput({ onSend, channelName, channelId }: Props) 
             paddingVertical: 10,
             color: theme.text,
             fontSize: 15,
+            minHeight: MIN_TOUCH,
             maxHeight: 120,
           }}
         />
@@ -149,16 +238,24 @@ export default function MessageInput({ onSend, channelName, channelId }: Props) 
         <Pressable
           onPress={handleSend}
           disabled={!canSend}
+          accessibilityRole="button"
+          accessibilityLabel={sending ? 'Sending' : 'Send message'}
+          accessibilityState={{ disabled: !canSend, busy: sending }}
           style={{
             backgroundColor: canSend ? theme.primary : theme.surfaceAlt,
             borderRadius: 12,
             paddingHorizontal: 16,
-            paddingVertical: 10,
-            alignSelf: 'stretch',
+            minWidth: 72,
+            minHeight: MIN_TOUCH,
+            alignItems: 'center',
             justifyContent: 'center',
           }}
         >
-          <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>Send</Text>
+          {sending ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>Send</Text>
+          )}
         </Pressable>
       </View>
     </View>

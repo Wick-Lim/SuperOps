@@ -2,6 +2,7 @@ package emoji
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -34,21 +35,12 @@ func (r *Repository) ListByWorkspace(ctx context.Context, workspaceID string) ([
 		}
 		emojis = append(emojis, e)
 	}
-	return emojis, nil
+	return emojis, rows.Err()
 }
 
-func (r *Repository) ExistsByName(ctx context.Context, workspaceID, name string) (bool, error) {
-	var ok bool
-	err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM custom_emojis WHERE workspace_id = $1 AND name = $2)`,
-		workspaceID, name,
-	).Scan(&ok)
-	if err != nil {
-		return false, fmt.Errorf("check emoji exists: %w", err)
-	}
-	return ok, nil
-}
-
+// Create inserts an emoji. A unique-constraint violation is returned to the
+// caller unwrapped enough for errors.As(*pgconn.PgError) to see it, so the
+// handler can answer 409 instead of 500.
 func (r *Repository) Create(ctx context.Context, e *Emoji) error {
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO custom_emojis (id, workspace_id, name, image_url, created_by)
@@ -68,7 +60,7 @@ func (r *Repository) GetByID(ctx context.Context, id string) (*Emoji, error) {
 		`SELECT id, workspace_id, name, image_url, created_by, created_at
 		 FROM custom_emojis WHERE id = $1`, id,
 	).Scan(&e.ID, &e.WorkspaceID, &e.Name, &e.ImageURL, &e.CreatedBy, &e.CreatedAt)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -77,36 +69,11 @@ func (r *Repository) GetByID(ctx context.Context, id string) (*Emoji, error) {
 	return e, nil
 }
 
-func (r *Repository) Delete(ctx context.Context, id string) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM custom_emojis WHERE id = $1`, id)
+// Delete reports whether a row was actually removed.
+func (r *Repository) Delete(ctx context.Context, id string) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM custom_emojis WHERE id = $1`, id)
 	if err != nil {
-		return fmt.Errorf("delete emoji: %w", err)
+		return false, fmt.Errorf("delete emoji: %w", err)
 	}
-	return nil
-}
-
-// IsWorkspaceMember reports whether the user belongs to the workspace.
-func (r *Repository) IsWorkspaceMember(ctx context.Context, workspaceID, userID string) (bool, error) {
-	var ok bool
-	err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)`,
-		workspaceID, userID,
-	).Scan(&ok)
-	if err != nil {
-		return false, fmt.Errorf("check workspace member: %w", err)
-	}
-	return ok, nil
-}
-
-// IsWorkspaceAdmin reports whether the user is an owner/admin of the workspace.
-func (r *Repository) IsWorkspaceAdmin(ctx context.Context, workspaceID, userID string) (bool, error) {
-	var ok bool
-	err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 AND role IN ('owner','admin'))`,
-		workspaceID, userID,
-	).Scan(&ok)
-	if err != nil {
-		return false, fmt.Errorf("check workspace admin: %w", err)
-	}
-	return ok, nil
+	return tag.RowsAffected() > 0, nil
 }

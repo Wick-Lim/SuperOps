@@ -1,12 +1,50 @@
+{{- /* A PDB whose minAvailable equals the replica count blocks node drains
+       forever, so each one is gated on actually having more than one replica. */ -}}
+{{- $backendReplicas := ternary (int .Values.backend.autoscaling.minReplicas) (int .Values.backend.replicas) .Values.backend.autoscaling.enabled -}}
+{{- if and .Values.backend.pdb.enabled (gt $backendReplicas 1) }}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: {{ include "superops.fullname" . }}-backend
   labels:
     {{- include "superops.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
 spec:
-  minAvailable: 1
+  minAvailable: {{ .Values.backend.pdb.minAvailable }}
   selector:
     matchLabels:
       {{- include "superops.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: backend
+{{- end }}
+{{- if and .Values.frontend.pdb.enabled (gt (int .Values.frontend.replicas) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "superops.fullname" . }}-frontend
+  labels:
+    {{- include "superops.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  minAvailable: {{ .Values.frontend.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "superops.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: frontend
+{{- end }}
+{{- if and .Values.worker.pdb.enabled (gt (int .Values.worker.replicas) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "superops.fullname" . }}-worker
+  labels:
+    {{- include "superops.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  minAvailable: {{ .Values.worker.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "superops.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+{{- end }}

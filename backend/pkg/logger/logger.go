@@ -26,9 +26,19 @@ func New(level string) *slog.Logger {
 		AddSource: lvl == slog.LevelDebug,
 	})
 
-	return slog.New(handler)
+	l := slog.New(handler)
+
+	// Install as the process default. Without this, every slog.Default() call
+	// — including FromContext's fallback and any library that logs through
+	// slog — writes plain text to stderr at Info level, bypassing this
+	// handler's format and level entirely.
+	slog.SetDefault(l)
+
+	return l
 }
 
+// FromContext returns the request-scoped logger stored by WithContext, or the
+// process default (configured by New) when the context carries none.
 func FromContext(ctx context.Context) *slog.Logger {
 	if l, ok := ctx.Value(ctxKey{}).(*slog.Logger); ok {
 		return l

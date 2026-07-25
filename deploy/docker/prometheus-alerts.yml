@@ -1,0 +1,77 @@
+# Alert rules for the metrics the backend actually exports
+# (see backend/internal/app/metrics.go). No Alertmanager is bundled, so these
+# evaluate and show up under Prometheus → Alerts; point Prometheus at an
+# alertmanager to route them.
+groups:
+  - name: superops-availability
+    rules:
+      - alert: SuperOpsBackendDown
+        expr: up{job="superops-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SuperOps backend scrape target is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }}. If /metrics is protected, check that METRICS_TOKEN matches deploy/docker/secrets/metrics_token."
+
+      - alert: SuperOpsHighErrorRate
+        expr: |
+          sum(rate(superops_http_requests_total{status="5xx"}[5m]))
+            /
+          clamp_min(sum(rate(superops_http_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than 5% of HTTP responses are 5xx"
+          description: "5xx ratio has been above 5% for 10 minutes."
+
+      - alert: SuperOpsHighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(superops_http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 request latency above 1s"
+
+  - name: superops-resources
+    rules:
+      - alert: SuperOpsDBPoolSaturated
+        expr: |
+          superops_db_pool_conns{state="acquired"}
+            / clamp_min(superops_db_pool_max_conns, 1) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Postgres pool over 90% acquired"
+          description: "Raise DB_MAX_CONNS or find the query holding connections."
+
+      - alert: SuperOpsDBPoolStarvation
+        expr: rate(superops_db_pool_acquires_total{result="empty"}[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Requests are waiting for a free Postgres connection"
+
+      - alert: SuperOpsGoroutineLeak
+        expr: go_goroutines > 5000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Goroutine count above 5000"
+          description: "Sustained growth usually means WebSocket pumps are not being reaped."
+
+      - alert: SuperOpsRestarted
+        expr: superops_uptime_seconds < 300
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "Backend process restarted in the last 5 minutes"

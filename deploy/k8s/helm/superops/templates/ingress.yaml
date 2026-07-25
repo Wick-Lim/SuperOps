@@ -6,7 +6,14 @@ metadata:
   labels:
     {{- include "superops.labels" . | nindent 4 }}
   annotations:
-    {{- toYaml .Values.ingress.annotations | nindent 4 }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.clusterIssuer }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.clusterIssuer | quote }}
+    {{- else if and .Values.ingress.tls.enabled .Values.ingress.tls.issuer }}
+    cert-manager.io/issuer: {{ .Values.ingress.tls.issuer | quote }}
+    {{- end }}
 spec:
   ingressClassName: {{ .Values.ingress.className }}
   {{- if .Values.ingress.tls.enabled }}
@@ -19,6 +26,8 @@ spec:
     - host: {{ .Values.global.domain }}
       http:
         paths:
+          # WebSockets ride this rule; the proxy-read/send-timeout annotations
+          # are what keep them alive past the controller's 60s default.
           - path: /api
             pathType: Prefix
             backend:
@@ -33,6 +42,7 @@ spec:
                 name: {{ include "superops.fullname" . }}-backend
                 port:
                   number: 8080
+          # /ready and /metrics are deliberately not routed from outside.
           - path: /
             pathType: Prefix
             backend:

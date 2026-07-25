@@ -7,6 +7,17 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+// tokenIssuer is stamped into every token we mint and required on every token
+// we accept, so a token signed by another system sharing the secret is refused.
+const tokenIssuer = "superops"
+
+// Claims is the access-token payload.
+//
+// UserID is deliberately tagged `json:"sub"` and therefore shadows the
+// embedded RegisteredClaims.Subject: encoding/json resolves the duplicate
+// "sub" key at the shallower depth, so UserID is the only field that is ever
+// written to or read from the wire and RegisteredClaims.Subject stays empty on
+// both sides. Read the subject as Claims.UserID, never as Claims.Subject.
 type Claims struct {
 	UserID      string `json:"sub"`
 	WorkspaceID string `json:"workspace_id,omitempty"`
@@ -33,7 +44,7 @@ func (m *JWTManager) Generate(userID string) (string, error) {
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(now.Add(m.accessTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
-			Issuer:    "superops",
+			Issuer:    tokenIssuer,
 		},
 	}
 
@@ -54,7 +65,7 @@ func (m *JWTManager) GenerateWithWorkspace(userID, workspaceID, role string) (st
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(now.Add(m.accessTTL)),
 			IssuedAt:  jwt.NewNumericDate(now),
-			Issuer:    "superops",
+			Issuer:    tokenIssuer,
 		},
 	}
 
@@ -72,7 +83,11 @@ func (m *JWTManager) Validate(tokenStr string) (*Claims, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return m.secret, nil
-	})
+	},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		// We stamp the issuer on mint, so we must also require it on accept.
+		jwt.WithIssuer(tokenIssuer),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("parse token: %w", err)
 	}

@@ -1,6 +1,17 @@
 import { create } from 'zustand'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import type { User } from '../lib/types'
+import { getSecureItem, setSecureItem, deleteSecureItem } from '../lib/secureStorage'
+import { authApi } from '../api/auth'
+
+// expo-secure-store keys must match [A-Za-z0-9._-]+.
+const ACCESS_KEY = 'superops.access_token'
+const REFRESH_KEY = 'superops.refresh_token'
+// The cached profile is not a credential and can exceed the keystore's value
+// limit, so it stays in AsyncStorage.
+const USER_KEY = 'superops-user'
+// Pre-keystore location of the token pair; read once, then migrated and erased.
+const LEGACY_AUTH_KEY = 'superops-auth'
 
 interface AuthState {
   accessToken: string | null
@@ -8,39 +19,106 @@ interface AuthState {
   user: User | null
   isAuthenticated: boolean
   hydrated: boolean
-  setTokens: (access: string, refresh: string) => void
-  setUser: (user: User) => void
-  logout: () => void
+  /** Last persistence failure, if any — a silent one logs the user out next launch. */
+  persistError: string | null
+
+  setTokens: (access: string, refresh: string) => Promise<void>
+  setUser: (user: User) => Promise<void>
+  /** Clears the local session and best-effort revokes the server refresh token. */
+  logout: () => Promise<void>
   hydrate: () => Promise<void>
 }
 
-export const useAuthStore = create<AuthState>()((set) => ({
+export const useAuthStore = create<AuthState>()((set, get) => ({
   accessToken: null,
   refreshToken: null,
   user: null,
   isAuthenticated: false,
   hydrated: false,
-  setTokens: (access, refresh) => {
+  persistError: null,
+
+  // Awaited, not fire-and-forget: a failed write used to be invisible and
+  // silently signed the user out on the next cold start.
+  setTokens: async (access, refresh) => {
     set({ accessToken: access, refreshToken: refresh, isAuthenticated: true })
-    AsyncStorage.setItem('superops-auth', JSON.stringify({ accessToken: access, refreshToken: refresh }))
+    try {
+      await setSecureItem(ACCESS_KEY, access)
+      await setSecureItem(REFRESH_KEY, refresh)
+      if (get().persistError) set({ persistError: null })
+    } catch (err) {
+      set({ persistError: err instanceof Error ? err.message : 'Could not save your session securely.' })
+    }
   },
-  setUser: (user) => {
+
+  setUser: async (user) => {
     set({ user })
-    AsyncStorage.setItem('superops-user', JSON.stringify(user))
+    try {
+      await AsyncStorage.setItem(USER_KEY, JSON.stringify(user))
+    } catch {
+      // The profile is a cache; losing it only costs one extra /users/me call.
+    }
   },
-  logout: () => {
-    set({ accessToken: null, refreshToken: null, user: null, isAuthenticated: false })
-    AsyncStorage.removeItem('superops-auth')
-    AsyncStorage.removeItem('superops-user')
+
+  logout: async () => {
+    // Captured before clearing: the revoke call needs the token, and the route
+    // (POST /api/v1/auth/logout) is unauthenticated by design.
+    const refresh = get().refreshToken
+    set({ accessToken: null, refreshToken: null, user: null, isAuthenticated: false, persistError: null })
+
+    await Promise.all([
+      deleteSecureItem(ACCESS_KEY),
+      deleteSecureItem(REFRESH_KEY),
+      AsyncStorage.removeItem(USER_KEY).catch(() => {}),
+      AsyncStorage.removeItem(LEGACY_AUTH_KEY).catch(() => {}),
+    ])
+
+    if (refresh) {
+      // Best effort: without this the refresh-token row survives every
+      // user-initiated logout until it expires naturally.
+      try {
+        await authApi.logout(refresh)
+      } catch {
+        // An offline logout is still a logout locally.
+      }
+    }
   },
+
   hydrate: async () => {
     try {
-      const authStr = await AsyncStorage.getItem('superops-auth')
-      const userStr = await AsyncStorage.getItem('superops-user')
-      const auth = authStr ? JSON.parse(authStr) : null
-      const user = userStr ? JSON.parse(userStr) : null
-      if (auth?.accessToken) {
-        set({ accessToken: auth.accessToken, refreshToken: auth.refreshToken, user, isAuthenticated: true, hydrated: true })
+      let access = await getSecureItem(ACCESS_KEY)
+      let refresh = await getSecureItem(REFRESH_KEY)
+
+      // Migrate a pre-keystore session instead of forcing a re-login.
+      if (!access) {
+        const legacy = await AsyncStorage.getItem(LEGACY_AUTH_KEY)
+        if (legacy) {
+          try {
+            const parsed = JSON.parse(legacy) as { accessToken?: string; refreshToken?: string }
+            if (parsed?.accessToken) {
+              access = parsed.accessToken
+              refresh = parsed.refreshToken ?? null
+              await setSecureItem(ACCESS_KEY, access)
+              if (refresh) await setSecureItem(REFRESH_KEY, refresh)
+            }
+          } catch {
+            // Unparsable legacy blob — treat as signed out.
+          }
+          await AsyncStorage.removeItem(LEGACY_AUTH_KEY).catch(() => {})
+        }
+      }
+
+      let user: User | null = null
+      const userStr = await AsyncStorage.getItem(USER_KEY)
+      if (userStr) {
+        try {
+          user = JSON.parse(userStr) as User
+        } catch {
+          user = null
+        }
+      }
+
+      if (access) {
+        set({ accessToken: access, refreshToken: refresh, user, isAuthenticated: true, hydrated: true })
       } else {
         set({ hydrated: true })
       }

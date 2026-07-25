@@ -8,6 +8,8 @@ import { useAuthStore } from '../stores/authStore'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { useChannelStore } from '../stores/channelStore'
 import { useUserStore } from '../stores/userStore'
+import { errorMessage } from '../api/client'
+import { MIN_TOUCH, ScreenHeader } from './internal/ui'
 
 function initial(u: PublicUser): string {
   return (u.full_name || u.username || '?').trim().charAt(0).toUpperCase() || '?'
@@ -46,7 +48,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
           setSearchError(null)
           setResults((res.data ?? []).filter((u) => u.id !== me?.id))
         })
-        .catch((err) => setSearchError(err instanceof Error ? err.message : 'Search failed'))
+        .catch((err) => setSearchError(errorMessage(err, 'Search failed')))
         .finally(() => setSearching(false))
     }, 300)
     return () => {
@@ -80,7 +82,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
       setActiveChannel(res.data)
       navigation.navigate('Workspace', { workspaceId: activeWorkspace.id })
     } catch (err) {
-      Alert.alert('Error', err instanceof Error ? err.message : 'Failed to start conversation')
+      Alert.alert('Error', errorMessage(err, 'Failed to start conversation'))
     } finally {
       setStarting(false)
     }
@@ -88,33 +90,32 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-      {/* Header */}
-      <View
-        style={{
-          height: 56,
-          paddingHorizontal: 16,
-          flexDirection: 'row',
-          alignItems: 'center',
-          borderBottomWidth: 1,
-          borderBottomColor: theme.border,
-        }}
-      >
-        <Pressable onPress={() => navigation.goBack()} hitSlop={8} style={{ marginRight: 12 }}>
-          <Text style={{ color: theme.accent, fontSize: 16 }}>Cancel</Text>
-        </Pressable>
-        <Text style={{ color: theme.text, fontSize: 17, fontWeight: '600', flex: 1 }}>New Message</Text>
-        <Pressable onPress={handleStart} disabled={selected.length === 0 || starting} hitSlop={8}>
-          <Text
-            style={{
-              color: selected.length === 0 || starting ? theme.textFaint : theme.accent,
-              fontSize: 15,
-              fontWeight: '600',
-            }}
+      <ScreenHeader
+        title="New message"
+        backLabel="Cancel"
+        onBack={() => navigation.goBack()}
+        right={
+          <Pressable
+            onPress={handleStart}
+            disabled={selected.length === 0 || starting}
+            accessibilityRole="button"
+            accessibilityLabel="Start conversation"
+            accessibilityState={{ disabled: selected.length === 0 || starting, busy: starting }}
+            hitSlop={8}
+            style={{ minHeight: MIN_TOUCH, minWidth: MIN_TOUCH, alignItems: 'center', justifyContent: 'center' }}
           >
-            {starting ? '...' : 'Start'}
-          </Text>
-        </Pressable>
-      </View>
+            <Text
+              style={{
+                color: selected.length === 0 || starting ? theme.textMuted : theme.accent,
+                fontSize: 15,
+                fontWeight: '600',
+              }}
+            >
+              {starting ? '…' : 'Start'}
+            </Text>
+          </Pressable>
+        }
+      />
 
       {/* Selected chips */}
       {selected.length > 0 ? (
@@ -131,6 +132,9 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
             <Pressable
               key={u.id}
               onPress={() => removeSelected(u.id)}
+              accessibilityRole="button"
+              accessibilityLabel={`Remove ${u.full_name || u.username} from this conversation`}
+              hitSlop={8}
               style={{
                 flexDirection: 'row',
                 alignItems: 'center',
@@ -157,7 +161,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
               <Text style={{ color: theme.body, fontSize: 13, fontWeight: '500' }}>
                 {u.full_name || u.username}
               </Text>
-              <Text style={{ color: theme.textFaint, fontSize: 14, marginLeft: 6 }}>×</Text>
+              <Text style={{ color: theme.textMuted, fontSize: 14, marginLeft: 6 }}>×</Text>
             </Pressable>
           ))}
         </View>
@@ -169,7 +173,9 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
           value={query}
           onChangeText={setQuery}
           placeholder="Search people by name or username"
-          placeholderTextColor={theme.textFaint}
+          placeholderTextColor={theme.textMuted}
+          accessibilityLabel="Search people by name or username"
+
           autoCapitalize="none"
           autoCorrect={false}
           style={{
@@ -200,11 +206,11 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
           keyboardShouldPersistTaps="handled"
           ListEmptyComponent={
             query.trim() ? (
-              <Text style={{ color: theme.textFaint, fontSize: 14, textAlign: 'center', paddingTop: 32 }}>
+              <Text style={{ color: theme.textMuted, fontSize: 14, textAlign: 'center', paddingTop: 32 }}>
                 No people found.
               </Text>
             ) : (
-              <Text style={{ color: theme.textFaint, fontSize: 14, textAlign: 'center', paddingTop: 32 }}>
+              <Text style={{ color: theme.textMuted, fontSize: 14, textAlign: 'center', paddingTop: 32 }}>
                 Search for people to start a conversation.
               </Text>
             )
@@ -214,11 +220,15 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
             return (
               <Pressable
                 onPress={() => toggle(u)}
+                accessibilityRole="checkbox"
+                accessibilityLabel={`${u.full_name || u.username}, @${u.username}${u.is_bot ? ', bot' : ''}`}
+                accessibilityState={{ checked: sel }}
                 style={{
                   flexDirection: 'row',
                   alignItems: 'center',
                   paddingHorizontal: 16,
                   paddingVertical: 12,
+                  minHeight: MIN_TOUCH,
                   borderBottomWidth: 1,
                   borderBottomColor: theme.border,
                 }}
@@ -240,7 +250,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
                   <Text style={{ color: theme.body, fontSize: 15, fontWeight: '500' }}>
                     {u.full_name || u.username}
                   </Text>
-                  <Text style={{ color: theme.textFaint, fontSize: 12, marginTop: 1 }}>
+                  <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 1 }}>
                     @{u.username}
                     {u.is_bot ? '  ·  bot' : ''}
                   </Text>
