@@ -3,6 +3,8 @@ package search
 import (
 	"strings"
 	"testing"
+
+	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 )
 
 func TestAccessKeyConstruction(t *testing.T) {
@@ -50,6 +52,56 @@ func TestValidKey(t *testing.T) {
 		if validKey(k) {
 			t.Errorf("validKey(%q) = true, want false", k)
 		}
+	}
+}
+
+// TestAuthzKeysPassValidation is the contract between internal/authz and this
+// package, asserted from the accepting side.
+//
+// acl_key stores exactly what validKey accepts. It has to: the Meilisearch
+// filter is built by string concatenation, and a key that fails validation is
+// DROPPED — a dropped narrowing term widens the query, and a widened tenancy
+// filter is a cross-tenant leak. An earlier draft of docs/plans/00-permissions.md
+// specified a different encoding and five plans assumed a reconciliation that
+// did not exist; this test is what makes the next such drift a build failure
+// instead of an incident.
+func TestAuthzKeysPassValidation(t *testing.T) {
+	keys := map[string]string{
+		"workspace": authz.WorkspaceKey(wsA),
+		"channel":   authz.ContainerKey(authz.ChannelObject(chA)),
+		"folder":    authz.ContainerKey(authz.ObjectRef{Type: authz.TypeFolder, ID: chA}),
+		"user":      authz.UserSubject(usr).Key(),
+		"group":     authz.GroupSubject(usr).Key(),
+	}
+	for name, key := range keys {
+		if key == "" {
+			t.Errorf("authz produced no %s key at all", name)
+			continue
+		}
+		if !validKey(key) {
+			t.Errorf("validKey(%q) = false for the authz %s key; a key search rejects is a key that vanishes from the filter", key, name)
+		}
+	}
+
+	// And the constructors on this side produce the same strings, so neither
+	// package can quietly redefine the encoding for the other.
+	if got, want := FolderKey(chA), authz.ContainerKey(authz.ObjectRef{Type: authz.TypeFolder, ID: chA}); got != want {
+		t.Errorf("FolderKey = %q, authz folder key = %q", got, want)
+	}
+	if got, want := ChannelKey(chA), authz.ContainerKey(authz.ChannelObject(chA)); got != want {
+		t.Errorf("ChannelKey = %q, authz channel key = %q", got, want)
+	}
+	if got, want := UserKey(usr), authz.UserSubject(usr).Key(); got != want {
+		t.Errorf("UserKey = %q, authz user key = %q", got, want)
+	}
+}
+
+func TestFolderKeyIsAccepted(t *testing.T) {
+	// f- is added ahead of Drive on purpose: nothing emits a folder key yet, and
+	// a pillar that needed one later would have to widen a closed, security-
+	// critical validator under deadline.
+	if !validKey("f-" + chA) {
+		t.Error("validKey rejected a folder key")
 	}
 }
 

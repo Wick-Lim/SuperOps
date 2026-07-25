@@ -119,18 +119,34 @@ const (
 	// the prefix namespace is decided in one place rather than by whoever adds
 	// groups first.
 	keyGroup = "g-"
+	// keyFolder grants to everyone who may read a Drive folder, and is the
+	// bounded encoding every editor will index against: a folder shared with 50
+	// people puts ONE key on each document inside it, and the caller holds one
+	// key per folder they can read rather than one per object.
+	//
+	// Nothing emits a folder key yet — folders do not exist until Drive
+	// (ROADMAP phase 1). The prefix is added ahead of them on purpose: this set
+	// is closed and validated on both write and query, so a pillar that needed
+	// it later would have to widen the validator under deadline, and a key that
+	// fails validation is DROPPED — which widens the filter it was supposed to
+	// narrow. internal/authz already stores f- keys in acl_key for the same
+	// reason.
+	keyFolder = "f-"
 )
 
-// keyPrefixes is the closed set of prefixes validKey accepts.
-var keyPrefixes = []string{keyWorkspace, keyChannel, keyUser, keyGroup}
+// keyPrefixes is the closed set of prefixes validKey accepts. It must stay in
+// sync with acl_key's CHECK constraint (migrations/016) — the two are the write
+// and read ends of one contract.
+var keyPrefixes = []string{keyWorkspace, keyChannel, keyUser, keyGroup, keyFolder}
 
-// WorkspaceKey, ChannelKey, UserKey and GroupKey build access keys. Each
-// returns "" when the id is not a uuid, and callers must drop empty keys — an
-// unvalidated id must never reach a filter expression or a stored ACL.
+// WorkspaceKey, ChannelKey, UserKey, GroupKey and FolderKey build access keys.
+// Each returns "" when the id is not a uuid, and callers must drop empty keys —
+// an unvalidated id must never reach a filter expression or a stored ACL.
 func WorkspaceKey(id string) string { return objectKey(keyWorkspace, id) }
 func ChannelKey(id string) string   { return objectKey(keyChannel, id) }
 func UserKey(id string) string      { return objectKey(keyUser, id) }
 func GroupKey(id string) string     { return objectKey(keyGroup, id) }
+func FolderKey(id string) string    { return objectKey(keyFolder, id) }
 
 func objectKey(prefix, id string) string {
 	canonical, ok := canonicalUUID(id)

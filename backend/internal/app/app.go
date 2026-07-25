@@ -54,6 +54,12 @@ type App struct {
 	Hub    *ws.Hub
 	Server *http.Server
 
+	// Authz is exported so a test can read the dual-run comparison counters
+	// (authz.Checker.ComparisonStats) and so an operational tool can run the
+	// object-permission backfill against a live pool. Handlers never reach it
+	// through here; they are given the checker directly.
+	Authz *authz.Checker
+
 	// draining flips as soon as shutdown starts so /ready fails before the
 	// listener stops accepting: a load balancer needs a failing readiness probe
 	// to stop routing to this replica, and it only learns that by polling.
@@ -117,7 +123,17 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 
 	// authz.Checker is the single source of truth for membership/role decisions.
 	// Every handler that used to hand-write an EXISTS query now shares it.
-	az := authz.New(pool)
+	//
+	// AUTHZ_DUAL_RUN additionally evaluates the object-level checker alongside
+	// each membership method and logs where the two disagree
+	// (docs/plans/00-permissions.md, step 3). It changes no answer and can fail
+	// no request; it only costs queries, which is why it is opt-in.
+	authzOpts := []authz.Option{}
+	if cfg.Authz.DualRun {
+		authzOpts = append(authzOpts, authz.WithComparison(logger))
+		logger.Info("authz dual-run comparison enabled; object-level checks are evaluated and logged, never enforced")
+	}
+	az := authz.New(pool, authzOpts...)
 
 	// audit must exist before auth: auth.Service records login/logout/password
 	// events through it.
@@ -323,6 +339,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		Redis:  redisClient,
 		NATS:   natsClient,
 		Hub:    hub,
+		Authz:  az,
 	}
 
 	// Router

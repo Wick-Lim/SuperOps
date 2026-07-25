@@ -4,8 +4,10 @@
 would otherwise invent its own answer, and reconciling nine of those later is
 strictly worse than designing one now.
 
-Status: design. Not started — deliberately excluded from the current parallel
-batch because it touches every handler.
+Status: **steps 1–3 landed** (`migrations/016`, `internal/authz`, the worker's
+`acl_drift` job, `AUTHZ_DUAL_RUN`). Steps 4 and 5 — the per-package cutover and
+the deletion of the old methods — are not started, and every handler that calls
+`IsChannelMember` today still calls it and behaves identically.
 
 ---
 
@@ -126,7 +128,7 @@ filter needs a translation layer that can only introduce bugs.
 | `c-<channel>` | everyone who may read the channel | shipped |
 | `u-<user>` | exactly one user — an explicit share, or an owner-only object | shipped |
 | `g-<group>` | a group | reserved, unused |
-| `f-<folder>` | everyone who may read a folder | **to add** |
+| `f-<folder>` | everyone who may read a folder | added, unused until Drive |
 
 > An earlier draft of this plan specified `'ws:<id>:member'` / `'chan:<id>'` and
 > deferred the format to "the wiring pass". That was wrong: the validator is a
@@ -197,12 +199,14 @@ The dangerous part. Multi-tenancy in this repo was broken once and the
 integration suite exists because of it; this refactor must not be how it breaks
 again.
 
-1. Add the tables. Nothing reads them.
-2. Backfill: every workspace, channel and file becomes an `acl_object` with a
-   path; memberships become `acl_key` rows. No behaviour change.
-3. Dual-run: new code paths call `Capability`, old ones keep their current
-   method. Add a comparison mode that logs when the two disagree, and run it
-   under the integration suite.
+1. ~~Add the tables.~~ `migrations/016`. Nothing reads them.
+2. ~~Backfill.~~ `acl_object_expected` / `acl_key_expected` are the one
+   definition of the derived state; the migration's backfill, `Checker.Rebuild`
+   and the drift verifier all answer from them, so no two of them can disagree.
+   Re-runnable. No behaviour change.
+3. ~~Dual-run.~~ `AUTHZ_DUAL_RUN`, on in the integration suite. Each compared
+   method also evaluates `Capability` and logs subject, object, both answers and
+   the required capability. It changes no answer and can fail no request.
 4. Cut over per package, smallest first, only once the comparison is silent.
 5. Delete the old methods last.
 

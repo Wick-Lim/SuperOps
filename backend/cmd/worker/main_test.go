@@ -180,3 +180,23 @@ func TestUnionDeduplicatesAndKeepsOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestAdvisoryLockKeysAreDistinct: every singleton job takes a session-scoped
+// advisory lock so exactly one replica runs it per tick. Two jobs sharing a key
+// does not fail — it silently means one of them never runs on a multi-replica
+// deployment, and the only symptom is work that quietly stops happening.
+func TestAdvisoryLockKeysAreDistinct(t *testing.T) {
+	keys := map[string]int64{
+		jobSessionCleanup: lockSessionCleanup,
+		jobRetention:      lockRetention,
+		jobObjectGC:       lockObjectGC,
+		jobACLDrift:       lockACLDrift,
+	}
+	seen := map[int64]string{}
+	for name, key := range keys {
+		if other, dup := seen[key]; dup {
+			t.Errorf("jobs %q and %q share advisory lock key %#x; one of them will never run", name, other, key)
+		}
+		seen[key] = name
+	}
+}

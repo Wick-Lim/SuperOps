@@ -38,7 +38,7 @@ without colliding with a phase that has not started:
 | `013` | free — unused, mail needed none |
 | `014` | SSO (`internal/sso`) |
 | `015` | collaboration layer (`internal/collab`) |
-| `016`–`019` | object permissions (plan 00) |
+| `016`–`019` | object permissions (plan 00) — `016` taken (`acl_object`, `acl_grant`, `acl_key`, the two expected-state views and the backfill); `017`–`019` free |
 | `020`–`024` | unified inbox + audit (plan 01) |
 | `025`–`029` | Drive + editor registry (plan 02) |
 | `030`–`034` | work tracking (plan 03) |

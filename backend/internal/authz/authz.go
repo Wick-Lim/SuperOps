@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,11 +45,54 @@ const (
 
 // Checker answers authorization questions against Postgres. It holds no
 // per-request state and is safe for concurrent use.
+//
+// Two layers live on it. The fifteen methods below are the membership special
+// case every handler calls today; checker.go adds the general object-level
+// model (Capability, Can, KeysFor, Grant, Revoke, Move). The two are wired
+// together only by compare.go's dual-run mode, which is off unless a deployment
+// asks for it.
 type Checker struct {
 	pool *pgxpool.Pool
+
+	// cmp is nil unless dual-run comparison is enabled. A nil pointer is the
+	// disabled state so the hot path is a single nil check.
+	cmp *comparison
 }
 
-func New(pool *pgxpool.Pool) *Checker { return &Checker{pool: pool} }
+// Option configures a Checker. Variadic so every existing New(pool) call site
+// keeps compiling and keeps behaving identically.
+type Option func(*Checker)
+
+// WithComparison enables dual-run comparison against the object-level checker.
+// See compare.go: it changes no answer and can fail no request, and it costs
+// two to three extra queries per authorization check — which is why it is off
+// by default and on in the integration suite.
+func WithComparison(logger *slog.Logger) Option {
+	return func(c *Checker) {
+		if logger == nil {
+			logger = slog.Default()
+		}
+		c.cmp = &comparison{logger: logger}
+	}
+}
+
+// WithComparisonSink registers a callback for every mismatch, in addition to
+// the log. Tests assert on disagreements through it rather than by parsing log
+// output. It implies WithComparison, so the two are never half-configured.
+func WithComparisonSink(logger *slog.Logger, sink func(Mismatch)) Option {
+	return func(c *Checker) {
+		WithComparison(logger)(c)
+		c.cmp.sink = sink
+	}
+}
+
+func New(pool *pgxpool.Pool, opts ...Option) *Checker {
+	c := &Checker{pool: pool}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
 
 // ---------------------------------------------------------------------------
 // Workspace
@@ -75,6 +119,17 @@ func (c *Checker) WorkspaceRole(ctx context.Context, workspaceID, userID string)
 }
 
 func (c *Checker) IsWorkspaceMember(ctx context.Context, workspaceID, userID string) (bool, error) {
+	ok, err := c.isWorkspaceMember(ctx, workspaceID, userID)
+	if err == nil {
+		c.compare(ctx, "IsWorkspaceMember", UserSubject(userID), WorkspaceObject(workspaceID), ok, CapRead)
+	}
+	return ok, err
+}
+
+// isWorkspaceMember is the answer without the dual-run comparison. Internal
+// callers use it so one authorization decision produces at most one comparison
+// report rather than one per nested membership query.
+func (c *Checker) isWorkspaceMember(ctx context.Context, workspaceID, userID string) (bool, error) {
 	role, err := c.WorkspaceRole(ctx, workspaceID, userID)
 	return role != "", err
 }
@@ -86,9 +141,15 @@ func (c *Checker) IsWorkspaceAdmin(ctx context.Context, workspaceID, userID stri
 	if err != nil {
 		return false, err
 	}
-	return role == RoleOwner || role == RoleAdmin, nil
+	ok := role == RoleOwner || role == RoleAdmin
+	c.compare(ctx, "IsWorkspaceAdmin", UserSubject(userID), WorkspaceObject(workspaceID), ok, CapAdmin)
+	return ok, nil
 }
 
+// IsWorkspaceOwner has no object-level equivalent and is deliberately not
+// compared: the capability ladder is ordered, owner and admin both map to
+// CapAdmin, and there is no rung between them. Sole ownership stays a role
+// check.
 func (c *Checker) IsWorkspaceOwner(ctx context.Context, workspaceID, userID string) (bool, error) {
 	role, err := c.WorkspaceRole(ctx, workspaceID, userID)
 	if err != nil {
@@ -195,6 +256,18 @@ func (c *Checker) ChannelRole(ctx context.Context, channelID, userID string) (st
 }
 
 func (c *Checker) IsChannelMember(ctx context.Context, channelID, userID string) (bool, error) {
+	ok, err := c.isChannelMember(ctx, channelID, userID)
+	if err == nil {
+		// Channel membership maps to CapWrite, not CapRead: a member may post,
+		// while a non-member of a PUBLIC channel may only read it. Comparing
+		// against CapRead would call every public channel a match and prove
+		// nothing.
+		c.compare(ctx, "IsChannelMember", UserSubject(userID), ChannelObject(channelID), ok, CapWrite)
+	}
+	return ok, err
+}
+
+func (c *Checker) isChannelMember(ctx context.Context, channelID, userID string) (bool, error) {
 	role, err := c.ChannelRole(ctx, channelID, userID)
 	return role != "", err
 }
@@ -204,7 +277,9 @@ func (c *Checker) IsChannelAdmin(ctx context.Context, channelID, userID string) 
 	if err != nil {
 		return false, err
 	}
-	return role == ChannelRoleAdmin, nil
+	ok := role == ChannelRoleAdmin
+	c.compare(ctx, "IsChannelAdmin", UserSubject(userID), ChannelObject(channelID), ok, CapAdmin)
+	return ok, nil
 }
 
 // CanReadChannel reports whether the caller may read a channel's contents:
@@ -215,14 +290,22 @@ func (c *Checker) CanReadChannel(ctx context.Context, ch *ChannelInfo, userID st
 	if ch == nil {
 		return false, nil
 	}
-	member, err := c.IsChannelMember(ctx, ch.ID, userID)
+	ok, err := c.canReadChannel(ctx, ch, userID)
+	if err == nil {
+		c.compare(ctx, "CanReadChannel", UserSubject(userID), ChannelObject(ch.ID), ok, CapRead)
+	}
+	return ok, err
+}
+
+func (c *Checker) canReadChannel(ctx context.Context, ch *ChannelInfo, userID string) (bool, error) {
+	member, err := c.isChannelMember(ctx, ch.ID, userID)
 	if err != nil || member {
 		return member, err
 	}
 	if ch.Type != "public" {
 		return false, nil
 	}
-	return c.IsWorkspaceMember(ctx, ch.WorkspaceID, userID)
+	return c.isWorkspaceMember(ctx, ch.WorkspaceID, userID)
 }
 
 // MessageChannel resolves the channel a message belongs to. Authorization for
@@ -251,7 +334,18 @@ func (c *Checker) MessageChannel(ctx context.Context, messageID string) (*Channe
 // non-member gets an empty slice, which must be rendered as "no results"
 // rather than "no filter".
 func (c *Checker) ReadableChannelIDs(ctx context.Context, workspaceID, userID string) ([]string, error) {
-	member, err := c.IsWorkspaceMember(ctx, workspaceID, userID)
+	ids, err := c.readableChannelIDs(ctx, workspaceID, userID)
+	if err == nil {
+		// The most valuable of the comparisons: this list is what the search
+		// filter is built from, and a difference between it and KeysFor is
+		// exactly the class of bug that widens a tenancy filter.
+		c.compareSets(ctx, "ReadableChannelIDs", UserSubject(userID), WorkspaceObject(workspaceID), ids)
+	}
+	return ids, err
+}
+
+func (c *Checker) readableChannelIDs(ctx context.Context, workspaceID, userID string) ([]string, error) {
+	member, err := c.isWorkspaceMember(ctx, workspaceID, userID)
 	if err != nil {
 		return nil, err
 	}

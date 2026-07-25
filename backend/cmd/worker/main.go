@@ -62,6 +62,7 @@ const (
 	jobScheduledSend  = "scheduled_messages"
 	jobRetention      = "retention"
 	jobObjectGC       = "object_gc"
+	jobACLDrift       = "acl_drift"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -73,6 +74,8 @@ const (
 	retentionStartDelay    = 2 * time.Minute
 	objectGCInterval       = time.Hour
 	objectGCStartDelay     = 5 * time.Minute
+	aclDriftInterval       = time.Hour
+	aclDriftStartDelay     = 3 * time.Minute
 )
 
 // Advisory-lock keys. Distinct 64-bit constants; any other application taking
@@ -81,7 +84,13 @@ const (
 	lockSessionCleanup int64 = 0x50_0001
 	lockRetention      int64 = 0x50_0002
 	lockObjectGC       int64 = 0x50_0003
+	lockACLDrift       int64 = 0x50_0004
 )
+
+// aclDriftSamples bounds how many concrete disagreements one drift report
+// names. Enough to debug from a log line, not enough to fill a disk when a
+// backfill has genuinely not been run.
+const aclDriftSamples = 20
 
 const (
 	// consumerMaxDeliver bounds redelivery. Without it a permanently poisonous
@@ -279,6 +288,10 @@ func run() int {
 
 	start(jobRetention, retentionStartDelay, retentionInterval, func(c context.Context) error {
 		return runRetention(c, pool, searchSvc, l)
+	})
+
+	start(jobACLDrift, aclDriftStartDelay, aclDriftInterval, func(c context.Context) error {
+		return runACLDrift(c, pool, az, l)
 	})
 
 	if storage := openStorage(cfg, l); storage != nil {
@@ -1082,6 +1095,62 @@ func union(a, b []string) []string {
 		out = append(out, s)
 	}
 	return out
+}
+
+// --- acl drift ------------------------------------------------------------------
+
+// runACLDrift recomputes the object-permission materialization and reports
+// where it disagrees with its definition. See docs/plans/00-permissions.md and
+// internal/authz/rebuild.go.
+//
+// It REPORTS and never repairs, and that is the whole design of the job. A
+// repair would make the symptom go away on the next tick and take the evidence
+// with it — and the evidence is the point, because acl_key is denormalized
+// AUTHORIZATION state. A missing key is somebody unable to see something they
+// should; an extra key is somebody seeing something they should not. Neither is
+// a stale cache, and neither should be silently fixed by a background job that
+// nobody is watching.
+//
+// The drift is surfaced twice: as an ERROR log with named examples, and as this
+// function's return value, which runLoop records in /health's last_error for
+// the job. It does not fail the readiness probe — restarting the worker repairs
+// nothing here — but it is impossible to miss in either place.
+//
+// Expect it to be noisy until the cutover: nothing registers an object at
+// creation time yet, so every workspace, channel and file created since the
+// last Rebuild is reported as missing_object. That is the verifier working, not
+// the verifier failing.
+func runACLDrift(ctx context.Context, pool *pgxpool.Pool, az *authz.Checker, l *slog.Logger) error {
+	var report authz.DriftReport
+
+	ran, err := withSingletonLock(ctx, pool, lockACLDrift, func(ctx context.Context) error {
+		var err error
+		report, err = az.Verify(ctx, aclDriftSamples)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("verify acl materialization: %w", err)
+	}
+	if !ran {
+		l.Debug("acl drift check skipped: another replica holds the lock")
+		return nil
+	}
+	if report.Clean() {
+		l.Debug("acl drift check clean")
+		return nil
+	}
+
+	l.Error("acl materialization has drifted",
+		"missing_keys", report.MissingKeys,
+		"extra_keys", report.ExtraKeys,
+		"missing_objects", report.MissingObjects,
+		"misplaced_objects", report.MisplacedObjects,
+		"extra_objects", report.ExtraObjects)
+	for _, s := range report.Samples {
+		l.Error("acl drift sample",
+			"kind", s.Kind, "object_type", s.ObjectType, "object_id", s.ObjectID, "detail", s.Detail)
+	}
+	return errors.New(report.String())
 }
 
 // --- orphaned object GC --------------------------------------------------------
