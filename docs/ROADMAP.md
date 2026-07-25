@@ -153,6 +153,69 @@ file lives has no bearing on how hard it is to render and edit its contents.
 
 ---
 
+## 3c. Deployment-dependent capabilities are a category, not one-offs
+
+Mail sending exposed a pattern, and TURN is the second instance of it: some
+capabilities have **no single correct implementation, because the right answer
+is a property of the deployment rather than of the product.**
+
+- **Mail.** Almost every cloud provider blocks outbound port 25 (AWS, GCP,
+  Azure, DigitalOcean, most VPS), so a cloud deployment physically cannot
+  deliver mail itself and must relay. On-premises it can, and avoids routing
+  company mail through a third party.
+- **TURN.** Roughly 15–20% of WebRTC connections cannot go peer-to-peer —
+  symmetric NAT, restrictive corporate firewalls — and simply fail without a
+  relay. Running one needs a public IP, UDP/TCP 3478, TLS 5349, a wide relay
+  port range and real bandwidth, since all relayed media flows through it. That
+  is reasonable on-prem and often unwanted in a cloud deployment.
+
+The same shape already applies to storage (MinIO vs S3 vs GCS), search
+(Meilisearch vs Elastic vs Postgres FTS), push (Expo vs direct APNs/FCM), and
+will apply to SSO providers and the workflow execution backend.
+
+**Principle: one interface per capability, transport chosen by config,
+validated at startup, with a safe default.**
+
+```go
+type Sender interface { Send(ctx, *Message) error; Name() string }   // mail  — done
+type Sender interface { Send(ctx, []Push) error; Name() string }     // push  — done
+type ICEProvider interface { Servers(ctx, room) ([]ICEServer, error) } // TURN — to build
+type Storage   interface { ... }   // files  — currently MinIO-shaped, works via S3 API
+type Index     interface { ... }   // search — currently Meilisearch-shaped
+```
+
+Three rules that make this worth having rather than ceremony:
+
+1. **The default must be safe, not convenient.** Mail defaults to `log` so a
+   fresh deployment cannot mail real people by accident. Push defaults to off.
+   TURN should default to STUN-only with a startup warning, not to a
+   half-configured relay that fails at call time.
+2. **Misconfiguration must fail at boot, not at first use.** Selecting a
+   transport without its credentials is a startup error. Silent
+   misconfiguration in this category is invisible until a user is affected —
+   an invitation nobody receives, a call that connects for everyone except the
+   person behind a corporate firewall.
+3. **Give the operator a way to verify.** An admin-triggered test that sends a
+   real message, or fetches real ICE candidates, and reports the actual error.
+
+### TURN specifically
+
+Options, in the order worth considering:
+
+| Approach | When |
+|---|---|
+| **Comes with the SFU** | If LiveKit is chosen for media (§5 recommends it), self-hosted LiveKit **embeds a TURN server** — the question largely collapses into the SFU decision. It still needs the public IP, ports and TLS certificate; bundled is not free. |
+| **Bundled coturn** | Compose service + Helm subchart, for on-prem where the network is yours. Ships working out of the box. |
+| **External provider** | Twilio NTS, Cloudflare, Metered, Xirsys. Right for cloud deployments that do not want to run or scale a relay. |
+| **STUN only** | Works on permissive networks, fails for ~15–20% of users. Acceptable as a *documented* default, never as a silent one. |
+
+Whichever is used, **credentials must be short-lived and minted per session**
+by the backend (`GET /huddles/{id}/ice`, HMAC time-limited, RFC 7635-style).
+Shipping static TURN credentials to clients hands anyone who opens devtools a
+free media relay.
+
+---
+
 ## 4. Phase 0 — the spine (before any new pillar)
 
 Nothing here is glamorous and all of it is load-bearing.
@@ -161,7 +224,7 @@ Nothing here is glamorous and all of it is load-bearing.
 |---|---|---|
 | **Object-level permission model** | L | Generalize `internal/authz` from (workspace, channel) to (subject, object, capability) with inheritance. Every pillar needs it and retrofitting eight is worse than designing one. |
 | **Collaboration layer (CRDT)** | L | Three editors need multiplayer. Building it once is the difference between one project and three. See below. |
-| **Mail sending** | S | Invites and password reset are broken *today*. Needed regardless of which email scope you choose later. Use a relay (SES/Postmark), not your own MTA. |
+| **Mail sending** | S | Invites are copy-pasted by hand *today* and password reset does not exist. Needed regardless of which email scope comes later. **Transport is operator-chosen** — see below. |
 | **Unified search** | M | Generalize the Meili index from `MessageDoc` to typed objects with an ACL field, so one query spans messages, files and docs. |
 | **Unified inbox / notifications** | M | One "needs attention" surface. Today's notification table is close; it needs an object reference instead of a message id. |
 | **SSO (OIDC) + SCIM** | M | Becomes a procurement blocker the moment this is the company's whole stack. |
@@ -230,9 +293,10 @@ is already there; authz answers who may join.
 **Missing:** media path, TURN, client UI.
 **Hard part:** media, not signaling. Mesh P2P works to ~4–6 people; past that
 you need an SFU. **Use LiveKit** (Go, self-hostable, Apache-2.0) rather than
-building one — it fits the stack and removes most of the risk. Budget for a
-TURN server: ~15–20% of connections cannot go peer-to-peer, and relayed media
-is real bandwidth.
+building one — it fits the stack, removes most of the risk, and **embeds a TURN
+server**, which folds most of §3c's TURN question into this one decision.
+Budget for the relay regardless: ~15–20% of connections cannot go
+peer-to-peer, and relayed media is real bandwidth on a real public IP.
 **Size:** M with LiveKit, XL without.
 **Cut for v1:** recording, transcription, >10 participants.
 
@@ -422,8 +486,11 @@ Each one is a re-planning trigger, not a backlog item.
 
 1. **The RN fork in §3** — web-first, WebView, or split app?
 2. **Deployment posture** — is this self-hosted-only, or will you run a hosted
-   tier? It changes the permission model (single vs multi-org), the email
-   story, and the workflow sandbox requirement.
+   tier? It changes the permission model (single vs multi-org), the workflow
+   sandbox requirement, and every capability in §3c. Note this is the one
+   decision that does **not** block starting: §3c exists precisely so the
+   answer can be per-deployment rather than baked in. It does decide which
+   transports ship configured by default.
 3. **Who is the first customer?** The order above optimizes for a company using
    this as their whole stack. If the near-term buyer wants one specific pillar,
    that pillar moves up regardless of leverage.
