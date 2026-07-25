@@ -66,15 +66,17 @@ func (h *harness) indexDriveFile(t *testing.T, workspaceID, fileID string) {
 	})
 }
 
-// uploadToDrive posts a multipart file into a Drive folder and returns the
-// status and the decoded envelope.
-func (h *harness) uploadToDrive(t *testing.T, token, workspaceID, folderID, name string, body []byte) (int, apiResp) {
+// multipart posts a file part plus optional form fields, and returns the status
+// and the decoded envelope. Every Drive upload path shares it, so a change to
+// how the server reads a multipart body is a change in one place here.
+func (h *harness) multipart(t *testing.T, token, method, path string,
+	fields map[string]string, name string, body []byte) (int, apiResp) {
 	t.Helper()
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	if folderID != "" {
-		if err := mw.WriteField("folder_id", folderID); err != nil {
+	for k, v := range fields {
+		if err := mw.WriteField(k, v); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -89,8 +91,7 @@ func (h *harness) uploadToDrive(t *testing.T, token, workspaceID, folderID, name
 		t.Fatal(err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost,
-		h.base+"/api/v1/workspaces/"+workspaceID+"/drive/files/upload", &buf)
+	req, err := http.NewRequest(method, h.base+path, &buf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +100,7 @@ func (h *harness) uploadToDrive(t *testing.T, token, workspaceID, folderID, name
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("upload: %v", err)
+		t.Fatalf("%s %s: %v", method, path, err)
 	}
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
@@ -107,6 +108,62 @@ func (h *harness) uploadToDrive(t *testing.T, token, workspaceID, folderID, name
 	var resp apiResp
 	_ = json.Unmarshal(raw, &resp)
 	return res.StatusCode, resp
+}
+
+// uploadToDrive posts a multipart file into a Drive folder.
+func (h *harness) uploadToDrive(t *testing.T, token, workspaceID, folderID, name string, body []byte) (int, apiResp) {
+	t.Helper()
+	fields := map[string]string{}
+	if folderID != "" {
+		fields["folder_id"] = folderID
+	}
+	return h.multipart(t, token, http.MethodPost,
+		"/api/v1/workspaces/"+workspaceID+"/drive/files/upload", fields, name, body)
+}
+
+// followRedirect fetches a route that answers 302 to a presigned URL and
+// returns the object's bytes and the content type the BUCKET served.
+//
+// Following the redirect is the point: the presigned URL is where the download
+// hardening either survives or is silently lost, and only the bucket's own
+// response can show which.
+func (h *harness) followRedirect(t *testing.T, token, path string) ([]byte, string) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, h.base+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	// No automatic redirect: the Authorization header must not be replayed to
+	// the bucket, and the presigned URL carries its own credentials.
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusFound {
+		raw, _ := io.ReadAll(res.Body)
+		t.Fatalf("GET %s = %d, want 302 (%s)", path, res.StatusCode, raw)
+	}
+
+	object, err := http.Get(res.Header.Get("Location")) //nolint:gosec // a URL the server just minted
+	if err != nil {
+		t.Fatalf("fetch presigned url: %v", err)
+	}
+	defer object.Body.Close()
+	if object.StatusCode != http.StatusOK {
+		t.Fatalf("presigned GET = %d", object.StatusCode)
+	}
+	raw, err := io.ReadAll(object.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw, object.Header.Get("Content-Type")
 }
 
 func (h *harness) usage(t *testing.T, token, workspaceID string) map[string]any {

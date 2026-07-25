@@ -74,6 +74,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("POST /api/v1/drive/files/{file_id}/move", authMw(http.HandlerFunc(h.MoveFile)))
 	mux.Handle("DELETE /api/v1/drive/files/{file_id}", authMw(http.HandlerFunc(h.TrashFile)))
 	mux.Handle("POST /api/v1/drive/files/{file_id}/content", authMw(http.HandlerFunc(h.ReplaceContent)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}/versions", authMw(http.HandlerFunc(h.ListVersions)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}/versions/{version}/content", authMw(http.HandlerFunc(h.VersionContent)))
+	mux.Handle("POST /api/v1/drive/files/{file_id}/versions/{version}/restore", authMw(http.HandlerFunc(h.RestoreVersion)))
 }
 
 func (h *Handler) Registry(w http.ResponseWriter, _ *http.Request) {
@@ -637,41 +640,6 @@ func (h *Handler) TrashFile(w http.ResponseWriter, r *http.Request) {
 	// stays searchable is the user finding what they just deleted.
 	h.events.PublishFile(r.Context(), ActionDeleted, file)
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// ReplaceContent is where the collab question is answered in code rather than
-// in a design document (plan 02 §8).
-//
-// The upload half is Phase 1's next commit; what is settled here is the refusal,
-// because it is the part a later phase would otherwise have to discover.
-func (h *Handler) ReplaceContent(w http.ResponseWriter, r *http.Request) {
-	id, err := httputil.RequirePathParam(r, "file_id")
-	if err != nil {
-		httputil.HandleError(w, err)
-		return
-	}
-	if _, ok := h.authorize(w, r, authz.FileObject(id), authz.CapWrite); !ok {
-		return
-	}
-	file, err := h.repo.File(r.Context(), id)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	if file == nil {
-		fail(w, ErrNotFound)
-		return
-	}
-	kind, ok := h.kinds.Lookup(file.FileType)
-	if !ok || !kind.Versioned {
-		// 409, not 400 and not a silent success. A PUT into a CRDT-backed
-		// object would be discarded by the next merge, and accepting bytes we
-		// intend to drop is the worst of the three answers.
-		fail(w, ErrNotVersioned)
-		return
-	}
-	httputil.JSONError(w, http.StatusNotImplemented, "NOT_IMPLEMENTED",
-		"uploading a new version is not available yet")
 }
 
 // record writes an audit entry, best effort. Try rather than Log: the action
