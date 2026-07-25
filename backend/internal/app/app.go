@@ -35,6 +35,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/rbac"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/internal/sso"
+	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/internal/webhook"
 	"github.com/Wick-Lim/SuperOps/backend/internal/workspace"
@@ -214,18 +215,40 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		logger.Info("search disabled by configuration")
 	}
 
-	// File Storage
-	var fileStorage *file.Storage
+	// Object storage — a deployment-dependent capability (ROADMAP §3c).
+	//
+	// A CONFIGURATION error is fatal: STORAGE_BACKEND=s4, or s3 with no region,
+	// is a typo the operator fixes in a minute, and booting past it means
+	// discovering it as a 500 on somebody's first upload.
+	//
+	// A REACHABILITY error is not. The API has always booted without object
+	// storage and simply not registered the file routes, and compose starts
+	// every service at once — making an unreachable MinIO fatal would turn a
+	// startup race into a crash loop. It is logged at Error, the routes are
+	// absent rather than broken, and POST /admin/storage/test re-runs the same
+	// check on demand once the operator has something to fix.
+	var fileStorage storage.Backend
 	if cfg.MinIO.IsEnabled() {
-		fileStorage, err = file.NewStorage(file.StorageConfig{
-			Endpoint:  cfg.MinIO.Endpoint,
-			AccessKey: cfg.MinIO.AccessKey,
-			SecretKey: cfg.MinIO.SecretKey,
-			Bucket:    cfg.MinIO.Bucket,
-			UseSSL:    cfg.MinIO.UseSSL,
-		}, logger)
+		storageCfg := storage.Config{
+			Backend:      cfg.MinIO.Backend,
+			Endpoint:     cfg.MinIO.Endpoint,
+			AccessKey:    cfg.MinIO.AccessKey,
+			SecretKey:    cfg.MinIO.SecretKey,
+			Bucket:       cfg.MinIO.Bucket,
+			UseSSL:       cfg.MinIO.UseSSL,
+			Region:       cfg.MinIO.Region,
+			PathStyle:    cfg.MinIO.PathStyle,
+			CreateBucket: cfg.MinIO.CreateBucket,
+		}
+		if err := storageCfg.Normalize(); err != nil {
+			natsClient.Close()
+			pool.Close()
+			return nil, err
+		}
+		fileStorage, err = storage.Open(ctx, storageCfg, logger)
 		if err != nil {
-			logger.Warn("MinIO not available, file uploads disabled", "error", err)
+			logger.Error("object storage unavailable; file uploads and Drive are disabled",
+				"backend", storageCfg.Backend, "endpoint", storageCfg.Endpoint, "error", err)
 			fileStorage = nil
 		}
 	} else {
@@ -381,6 +404,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		Sender:    mailSender,
 		Secrets:   []string{cfg.Mail.SMTP.Password, cfg.Mail.Resend.APIKey},
 		Logger:    logger,
+	}, admin.StorageDeps{
+		// nil when storage failed to open, which is what makes
+		// POST /admin/storage/test answer 503 ("not configured") rather than
+		// 502 ("configured and broken"). The operator needs to tell those apart.
+		Backend: storageValidator(fileStorage),
+		Secrets: []string{cfg.MinIO.SecretKey, cfg.MinIO.AccessKey},
 	})
 	var searchHandler *search.Handler
 	if searchService != nil {
@@ -522,6 +551,20 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// limit — which at 600/min would let one admin account emit ten test
 	// messages a second.
 	adminHandler.RegisterMailRoutes(mux, func(next http.Handler) http.Handler {
+		if !cfg.RateLimit.Enabled {
+			return adminMw(next)
+		}
+		return ratelimit.MiddlewareByIP(redisClient, ratelimit.Config{
+			RequestsPerMinute: cfg.Mail.TestPerMinute,
+			Window:            time.Minute,
+			TrustProxy:        cfg.RateLimit.TrustProxy,
+			TrustedProxyHops:  cfg.RateLimit.TrustedProxyHops,
+		})(adminMw(next))
+	})
+	// The storage configuration test shares the mail test's budget for the same
+	// reason: it is a real round trip to a third party, triggered by an HTTP
+	// request, and the general API limit is far too generous for that.
+	adminHandler.RegisterStorageRoutes(mux, func(next http.Handler) http.Handler {
 		if !cfg.RateLimit.Enabled {
 			return adminMw(next)
 		}
@@ -858,4 +901,18 @@ func (a *App) readyHandler() http.HandlerFunc {
 		}
 		httputil.JSON(w, status, map[string]any{"status": label, "checks": checks})
 	}
+}
+
+// storageValidator narrows a Backend for the admin surface, preserving nil.
+//
+// The explicit nil check is load-bearing: assigning a nil storage.Backend to an
+// admin.StorageValidator produces a NON-nil interface holding a nil value, so
+// `h.storage.Backend == nil` would be false and the handler would call Validate
+// on nothing. That is the classic typed-nil trap and it would turn "storage is
+// not configured" into a panic.
+func storageValidator(b storage.Backend) admin.StorageValidator {
+	if b == nil {
+		return nil
+	}
+	return b
 }

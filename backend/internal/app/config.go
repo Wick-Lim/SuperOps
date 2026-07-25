@@ -256,13 +256,34 @@ type JWTConfig struct {
 // leftover placeholder.
 const MinJWTSecretBytes = 32
 
+// MinIOConfig is object storage. The name is historical — it now selects
+// between S3-compatible backends (internal/storage), of which MinIO is the
+// default and the one compose runs.
+//
+// Every field reads STORAGE_* first and falls back to the MINIO_* name it had
+// before, so an existing deployment keeps working without touching its
+// environment. New settings have no MINIO_ spelling.
 type MinIOConfig struct {
-	Enabled   bool
+	Enabled bool
+
+	// Backend is "minio" (default) or "s3". Anything else fails at boot with
+	// the list of valid values rather than falling through to a default.
+	Backend string
+
 	Endpoint  string
 	AccessKey string
 	SecretKey string
 	Bucket    string
 	UseSSL    bool
+
+	// Region is required by s3 unless an explicit endpoint is given.
+	Region string
+
+	// PathStyle and CreateBucket are three-valued: unset means "whatever this
+	// backend should do", which differs between minio and s3. See
+	// storage.Config.
+	PathStyle    *bool
+	CreateBucket *bool
 }
 
 // IsEnabled reports whether the file feature should be constructed.
@@ -421,12 +442,16 @@ func LoadConfig() (*Config, error) {
 			RefreshTokenTTL: e.duration("JWT_REFRESH_TTL", 30*24*time.Hour),
 		},
 		MinIO: MinIOConfig{
-			Enabled:   e.bool("FILES_ENABLED", true),
-			Endpoint:  e.str("MINIO_ENDPOINT", "localhost:9000"),
-			AccessKey: e.str("MINIO_ACCESS_KEY", "minioadmin"),
-			SecretKey: e.str("MINIO_SECRET_KEY", "minioadmin"),
-			Bucket:    e.str("MINIO_BUCKET", "superops"),
-			UseSSL:    e.bool("MINIO_USE_SSL", false),
+			Enabled:      e.bool("FILES_ENABLED", true),
+			Backend:      e.str("STORAGE_BACKEND", "minio"),
+			Endpoint:     e.str("STORAGE_ENDPOINT", e.str("MINIO_ENDPOINT", "localhost:9000")),
+			AccessKey:    e.str("STORAGE_ACCESS_KEY", e.str("MINIO_ACCESS_KEY", "minioadmin")),
+			SecretKey:    e.str("STORAGE_SECRET_KEY", e.str("MINIO_SECRET_KEY", "minioadmin")),
+			Bucket:       e.str("STORAGE_BUCKET", e.str("MINIO_BUCKET", "superops")),
+			UseSSL:       e.bool("STORAGE_USE_SSL", e.bool("MINIO_USE_SSL", false)),
+			Region:       e.str("STORAGE_REGION", ""),
+			PathStyle:    e.optBool("STORAGE_PATH_STYLE"),
+			CreateBucket: e.optBool("STORAGE_CREATE_BUCKET"),
 		},
 		Meili: MeiliConfig{
 			Enabled:   e.bool("SEARCH_ENABLED", true),
@@ -869,6 +894,25 @@ func (e *env) bool(key string, fallback bool) bool {
 		return fallback
 	}
 	return b
+}
+
+// optBool distinguishes "unset" from "false".
+//
+// It exists for the settings whose right default depends on something else —
+// STORAGE_PATH_STYLE is true for MinIO and false for S3 — where a plain bool
+// would make "the operator did not say" indistinguishable from "the operator
+// said no", and the backend would silently get the wrong one.
+func (e *env) optBool(key string) *bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		e.fail(key, v, "boolean", err)
+		return nil
+	}
+	return &b
 }
 
 func (e *env) duration(key string, fallback time.Duration) time.Duration {

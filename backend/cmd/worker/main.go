@@ -52,6 +52,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/push"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
+	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/logger"
@@ -378,10 +379,10 @@ func run() int {
 	})
 	l.Info("audit anchoring ready", "sink", auditSink.Name())
 
-	if storage := openStorage(cfg, l); storage != nil {
+	if store := openStorage(ctx, cfg, l); store != nil {
 		fileRepo := file.NewRepository(pool)
 		start(jobObjectGC, objectGCStartDelay, objectGCInterval, func(c context.Context) error {
-			return runObjectGC(c, pool, fileRepo, storage, l)
+			return runObjectGC(c, pool, fileRepo, store, l)
 		})
 	}
 
@@ -1392,23 +1393,31 @@ func runAuditVerify(ctx context.Context, pool *pgxpool.Pool, v *audit.Verifier, 
 // the predicate that decides whether a user's file is garbage had no test.
 var objectGCCursor atomic.Int64
 
-func openStorage(cfg *app.Config, l *slog.Logger) *file.Storage {
+// openStorage returns nil when object storage is not configured or not
+// reachable, in which case the collector simply does not start. A worker that
+// refused to boot would also stop indexing and stop sending notifications, over
+// a job whose entire purpose is to reclaim disk.
+func openStorage(ctx context.Context, cfg *app.Config, l *slog.Logger) storage.Backend {
 	if !cfg.MinIO.IsEnabled() {
 		l.Info("file storage disabled by configuration; object GC not started")
 		return nil
 	}
-	storage, err := file.NewStorage(file.StorageConfig{
-		Endpoint:  cfg.MinIO.Endpoint,
-		AccessKey: cfg.MinIO.AccessKey,
-		SecretKey: cfg.MinIO.SecretKey,
-		Bucket:    cfg.MinIO.Bucket,
-		UseSSL:    cfg.MinIO.UseSSL,
+	backend, err := storage.Open(ctx, storage.Config{
+		Backend:      cfg.MinIO.Backend,
+		Endpoint:     cfg.MinIO.Endpoint,
+		AccessKey:    cfg.MinIO.AccessKey,
+		SecretKey:    cfg.MinIO.SecretKey,
+		Bucket:       cfg.MinIO.Bucket,
+		UseSSL:       cfg.MinIO.UseSSL,
+		Region:       cfg.MinIO.Region,
+		PathStyle:    cfg.MinIO.PathStyle,
+		CreateBucket: cfg.MinIO.CreateBucket,
 	}, l)
 	if err != nil {
-		l.Warn("MinIO not available; object GC not started", "error", err)
+		l.Error("object storage unavailable; object GC not started", "error", err)
 		return nil
 	}
-	return storage
+	return backend
 }
 
 // runObjectGC takes the singleton lock and runs one collection pass.
@@ -1420,12 +1429,12 @@ func runObjectGC(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	repo *file.Repository,
-	storage *file.Storage,
+	store storage.Backend,
 	l *slog.Logger,
 ) error {
 	ran, err := withSingletonLock(ctx, pool, lockObjectGC, func(ctx context.Context) error {
 		prefix := file.GCPrefixes[int(objectGCCursor.Add(1)-1)%len(file.GCPrefixes)]
-		_, err := file.Collect(ctx, repo, storage, file.CollectOptions{
+		_, err := file.Collect(ctx, repo, store, file.CollectOptions{
 			Now:         time.Now(),
 			SweepPrefix: prefix,
 		}, l)

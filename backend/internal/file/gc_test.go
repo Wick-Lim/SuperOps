@@ -134,7 +134,7 @@ func (s *memStore) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-func (s *memStore) ListKeys(_ context.Context, prefix string, limit int) ([]string, error) {
+func (s *memStore) List(_ context.Context, prefix string, limit int) ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := []string{}

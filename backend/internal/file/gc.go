@@ -59,12 +59,13 @@ var GCPrefixes = []string{
 	"8", "9", "a", "b", "c", "d", "e", "f",
 }
 
-// ObjectStore is the part of Storage the collector uses. An interface so a test
-// can hand Collect a bucket it controls, and so nothing here can reach for the
-// MinIO client and start uploading.
+// ObjectStore is the part of storage.Backend the collector uses — a narrowing,
+// not a second abstraction, so *the* Backend satisfies it and a test can hand
+// Collect a bucket it controls. Nothing here can reach for the client and start
+// uploading, which is the point of the narrowing.
 type ObjectStore interface {
 	Delete(ctx context.Context, key string) error
-	ListKeys(ctx context.Context, prefix string, limit int) ([]string, error)
+	List(ctx context.Context, prefix string, limit int) ([]string, error)
 }
 
 // CollectOptions is one run's parameters. The zero value is not usable: Now and
@@ -182,7 +183,7 @@ func Collect(
 	}
 
 	// (ii) Objects with no reference at all.
-	keys, err := store.ListKeys(ctx, opts.SweepPrefix, opts.keyBatch())
+	keys, err := store.List(ctx, opts.SweepPrefix, opts.keyBatch())
 	if err != nil {
 		return res, err
 	}

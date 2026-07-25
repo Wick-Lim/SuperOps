@@ -156,10 +156,13 @@ jobs:
       JWT_SECRET: ci_jwt_secret_at_least_32_characters_long
       ADMIN_EMAIL: admin@company.com
       ADMIN_PASSWORD: changeme_admin_password
-      # No MinIO/Meilisearch in CI — app.New degrades gracefully, and empty now
-      # really means empty, so file uploads and search are deliberately off.
-      MEILI_HOST: ''
-      MINIO_ENDPOINT: ''
+      # No object storage or Meilisearch in CI. The *_ENABLED switches are the
+      # documented way to turn them off and the only one that works: env.str
+      # treats a set-but-empty variable as unset and returns the default, so
+      # MEILI_HOST='' meant "http://localhost:7700" and the app spent every boot
+      # failing to reach a service nobody had started.
+      SEARCH_ENABLED: 'false'
+      FILES_ENABLED: 'false'
       # GitHub sets CI=true, which makes the harness fail instead of skip when
       # the infrastructure is unreachable. A suite that cannot go red is not a
       # suite.

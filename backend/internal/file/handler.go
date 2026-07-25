@@ -17,6 +17,7 @@ import (
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
@@ -44,13 +45,13 @@ type Auditor interface {
 }
 
 type Handler struct {
-	storage *Storage
+	storage storage.Backend
 	pool    *pgxpool.Pool
 	authz   *authz.Checker
 	audit   Auditor
 }
 
-func NewHandler(storage *Storage, pool *pgxpool.Pool, az *authz.Checker, auditor Auditor) *Handler {
+func NewHandler(storage storage.Backend, pool *pgxpool.Pool, az *authz.Checker, auditor Auditor) *Handler {
 	return &Handler{storage: storage, pool: pool, authz: az, audit: auditor}
 }
 
@@ -202,7 +203,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	// file is a multipart.File: either the small in-memory buffer or a temp file
 	// on disk. Either way this streams to MinIO instead of materialising the
 	// whole object in the heap.
-	if err := h.storage.Upload(ctx, storageKey, file, header.Size, contentType); err != nil {
+	if err := h.storage.Put(ctx, storageKey, file, header.Size, contentType); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
@@ -298,7 +299,7 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reader, _, err := h.storage.Download(r.Context(), f.StorageKey)
+	reader, _, err := h.storage.Get(r.Context(), f.StorageKey)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return

@@ -114,7 +114,7 @@ func setup(t *testing.T) *suite {
 	az := authz.New(pool)
 	return &suite{
 		pool:   pool,
-		h:      NewHandler(pool, auditSvc, az, deps),
+		h:      NewHandler(pool, auditSvc, az, deps, StorageDeps{}),
 		auditH: audit.NewHandler(pool, auditSvc, az, nil),
 		f:      fix,
 		mail:   queue,

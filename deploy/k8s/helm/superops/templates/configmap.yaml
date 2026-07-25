@@ -15,9 +15,32 @@ data:
   DB_APPLICATION_NAME: "superops"
   REDIS_ADDR: "{{ include "superops.redisHost" . }}:6379"
   NATS_URL: "nats://{{ include "superops.natsHost" . }}:4222"
-  MINIO_ENDPOINT: "{{ include "superops.minioHost" . }}:9000"
-  MINIO_BUCKET: "superops"
-  MINIO_USE_SSL: {{ .Values.backend.env.MINIO_USE_SSL | default "false" | quote }}
+  # Object storage. The backend is a deployment decision (ROADMAP §3c): "minio"
+  # for the in-cluster server this chart can install, "s3" for a managed bucket.
+  # An unknown value fails at boot with the list of valid ones.
+  STORAGE_BACKEND: {{ .Values.storage.backend | quote }}
+  {{- if eq .Values.storage.backend "s3" }}
+  {{- with .Values.storage.endpoint }}
+  STORAGE_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.storage.region }}
+  STORAGE_REGION: {{ . | quote }}
+  {{- end }}
+  {{- else }}
+  STORAGE_ENDPOINT: "{{ include "superops.minioHost" . }}:9000"
+  {{- end }}
+  STORAGE_BUCKET: {{ .Values.storage.bucket | quote }}
+  STORAGE_USE_SSL: {{ .Values.storage.useSSL | toString | quote }}
+  {{- /* `with` would drop an explicit `false`, which is the one value these two
+  settings exist to express. Unset means "whatever this backend should do";
+  false means the operator said no. A template that cannot tell them apart
+  silently creates buckets in an account that forbids it. */}}
+  {{- if ne (toString .Values.storage.pathStyle) "" }}
+  STORAGE_PATH_STYLE: {{ .Values.storage.pathStyle | toString | quote }}
+  {{- end }}
+  {{- if ne (toString .Values.storage.createBucket) "" }}
+  STORAGE_CREATE_BUCKET: {{ .Values.storage.createBucket | toString | quote }}
+  {{- end }}
   FILES_ENABLED: {{ .Values.minio.enabled | toString | quote }}
   # Search only works against an externally provisioned Meilisearch — the chart
   # has no meilisearch dependency.
@@ -173,7 +196,8 @@ data:
   {{- /* Keys this template emits itself; a passthrough copy would be a
   duplicate map key in the rendered ConfigMap. Use `push.*` / `mail.*` for
   these. */}}
-  {{- if not (has $k (list "DB_SSLMODE" "MINIO_USE_SSL" "PUSH_ENABLED" "PUSH_TIMEOUT" "EXPO_PUSH_ENDPOINT"
+  {{- if not (has $k (list "DB_SSLMODE" "STORAGE_BACKEND" "STORAGE_ENDPOINT" "STORAGE_REGION" "STORAGE_BUCKET"
+      "STORAGE_USE_SSL" "STORAGE_PATH_STYLE" "STORAGE_CREATE_BUCKET" "PUSH_ENABLED" "PUSH_TIMEOUT" "EXPO_PUSH_ENDPOINT"
       "MAIL_TRANSPORT" "MAIL_TIMEOUT" "MAIL_TEST_PER_MIN" "PRODUCT_NAME" "PUBLIC_BASE_URL" "MAIL_FROM" "MAIL_FROM_NAME"
       "MAIL_SMTP_HOST" "MAIL_SMTP_PORT" "MAIL_SMTP_TLS" "MAIL_SMTP_ALLOW_INSECURE_AUTH" "MAIL_SMTP_INSECURE_SKIP_VERIFY"
       "MAIL_SMTP_USERNAME" "MAIL_SMTP_HELO" "MAIL_DIRECT_HELO" "MAIL_DIRECT_PORT" "MAIL_DKIM_DOMAIN" "MAIL_DKIM_SELECTOR"

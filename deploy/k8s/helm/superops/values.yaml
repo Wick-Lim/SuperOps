@@ -401,6 +401,24 @@ nats:
 externalNats:
   host: ""
 
+# Object storage settings the application reads. The `minio` block below decides
+# whether this chart INSTALLS a MinIO server; this block decides what the
+# application talks to. They are separate because "s3" is a supported backend
+# with no in-cluster server at all.
+storage:
+  # "minio" (default) or "s3". Both are the same S3 implementation with
+  # different defaults; anything else fails at boot rather than falling through.
+  backend: minio
+  bucket: superops
+  useSSL: false
+  # s3 only. Leave endpoint empty to derive it from the region.
+  endpoint: ""
+  region: ""
+  # Unset means "whatever this backend should do" — path style on for minio, off
+  # for s3; bucket creation on for minio, off for s3. Set only to override.
+  pathStyle: ""
+  createBucket: ""
+
 minio:
   enabled: true
   auth:

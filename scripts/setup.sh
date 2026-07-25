@@ -89,8 +89,12 @@ else
   set_env NATS_PASSWORD "$(gen_secret 32)"
   set_env JWT_SECRET "$(gen_secret 64)"
   set_env ADMIN_PASSWORD "$(gen_secret 24)"
-  set_env MINIO_ACCESS_KEY "superops_$(gen_secret 12)"
-  set_env MINIO_SECRET_KEY "$(gen_secret 40)"
+  # STORAGE_*, not MINIO_*. Both names are read (STORAGE_ wins), but only one
+  # may be written: the MinIO container takes its root credentials from the same
+  # pair, and generating both would leave the server on one password and the
+  # application on the other.
+  set_env STORAGE_ACCESS_KEY "superops_$(gen_secret 12)"
+  set_env STORAGE_SECRET_KEY "$(gen_secret 40)"
   set_env MEILI_MASTER_KEY "$(gen_secret 40)"
   set_env METRICS_TOKEN "$(gen_secret 32)"
   set_env GRAFANA_ADMIN_PASSWORD "$(gen_secret 24)"

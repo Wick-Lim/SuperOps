@@ -35,17 +35,18 @@ var invitableRoles = map[string]bool{
 }
 
 type Handler struct {
-	pool  *pgxpool.Pool
-	audit *audit.Service
-	authz *authz.Checker
-	mail  MailDeps
+	pool    *pgxpool.Pool
+	audit   *audit.Service
+	authz   *authz.Checker
+	mail    MailDeps
+	storage StorageDeps
 }
 
 // NewHandler wires the admin endpoints. A zero MailDeps disables outbound
 // email: invitations are still created and still return a usable URL, they are
 // simply not delivered.
-func NewHandler(pool *pgxpool.Pool, auditSvc *audit.Service, az *authz.Checker, mailDeps MailDeps) *Handler {
-	return &Handler{pool: pool, audit: auditSvc, authz: az, mail: mailDeps}
+func NewHandler(pool *pgxpool.Pool, auditSvc *audit.Service, az *authz.Checker, mailDeps MailDeps, storageDeps StorageDeps) *Handler {
+	return &Handler{pool: pool, audit: auditSvc, authz: az, mail: mailDeps, storage: storageDeps}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
