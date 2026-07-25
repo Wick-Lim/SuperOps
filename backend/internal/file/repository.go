@@ -49,15 +49,47 @@ func (o Orphan) Keys() []string {
 	return keys
 }
 
-// ListOrphans returns unattached files older than cutoff. The cutoff exists so
-// an upload that is mid-flight towards its message is never collected.
+// ListOrphans returns files that nothing owns, older than cutoff. The cutoff
+// exists so an upload that is mid-flight towards its message is never
+// collected.
+//
+// THE PREDICATE BELOW IS THE ONE THAT DELETES CUSTOMER DATA IF IT IS WRONG, and
+// it has exactly one correct form: every ownership column, named together.
+//
+// It used to be `message_id IS NULL`, from a time when a message attachment was
+// the only kind of file there was. A Drive file has no message, so under that
+// predicate every file a user uploaded to Drive was deleted 24 hours later by a
+// job that logged it as success (docs/plans/02-drive.md §2).
+//
+// docs/plans/README.md ruling 2 makes this the single owner of the predicate:
+// four separate plans each proposed rewriting one clause of it, none aware of
+// the others, and a missed clause is not a bug report. A pillar that gives
+// files a new owner adds ONE column here and ONE case to TestOrphansAreOnlyThe
+// Unowned — it does not rewrite the query.
+//
+// Ownership today:
+//
+//	folder_id  — a Drive file. Its owner is a folder, and it may live there
+//	             forever without ever being attached to anything.
+//	message_id — a chat attachment.
+//	trashed_at — trashed, which means the user asked for it to go away through
+//	             the trash, and the trash purge job owns it from that moment.
+//	             Collecting it here would race that job and skip its audit
+//	             entry.
+//
+// The direction of the risk is asymmetric: an over-narrow predicate leaks
+// objects, which costs storage; an over-broad one deletes user data. When a new
+// owner is uncertain, exclude it.
 func (r *Repository) ListOrphans(ctx context.Context, cutoff time.Time, limit int) ([]Orphan, error) {
 	if limit <= 0 {
 		limit = 500
 	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT id, storage_key, COALESCE(thumbnail_key, '') FROM files
-		  WHERE message_id IS NULL AND created_at < $1
+		  WHERE folder_id  IS NULL
+		    AND message_id IS NULL
+		    AND trashed_at IS NULL
+		    AND created_at < $1
 		  ORDER BY created_at
 		  LIMIT $2`, cutoff, limit)
 	if err != nil {
@@ -88,24 +120,44 @@ func (r *Repository) DeleteByIDs(ctx context.Context, ids []string) (int64, erro
 	return tag.RowsAffected(), nil
 }
 
-// StorageKeysPresent returns the subset of keys that still have a files row.
-// Anything the sweeper listed from the bucket and that is absent from the
-// result has no owner left in Postgres and can be removed.
+// StorageKeysPresent returns the subset of keys that are still referenced from
+// Postgres. Anything the sweeper listed from the bucket and that is absent from
+// the result has no owner left and can be removed.
 //
-// It checks thumbnail_key as well as storage_key. Those are two different
-// objects in the same bucket, so a lookup that only knew about storage_key
-// would report a perfectly live thumbnail as unreferenced and the sweeper would
-// delete it. (`thumbnail_key = ANY(...)` never matches a NULL, so rows without
-// a thumbnail contribute nothing.)
+// THE SECOND PREDICATE THAT DELETES CUSTOMER DATA IF IT IS WRONG, and it is the
+// quieter of the two: it works from the bucket inwards, so a reference this
+// query does not know about is not merely missed — it is proof, to the sweeper,
+// that the object is garbage.
+//
+// One arm per table that can name an object key. Adding a table that stores a
+// key and forgetting to add an arm here deletes every object that table owns:
+//
+//	files.storage_key    — the head object.
+//	files.thumbnail_key  — a different object in the same bucket. A lookup that
+//	                       only knew about storage_key would report a live
+//	                       thumbnail as unreferenced. (`= ANY(...)` never
+//	                       matches NULL, so rows without one contribute
+//	                       nothing.)
+//	file_versions        — every non-head version. Without this arm, uploading
+//	                       a second version of a file marks the first one's
+//	                       object garbage and the next sweep deletes the history
+//	                       the versions UI is about to offer to restore.
+//
+// docs/plans/README.md ruling 2 flags the next omission in advance: plan 08
+// stores raw RFC822 originals under a key with no files row at all. As written
+// this query would sweep every archived email. That arm belongs to plan 08 and
+// goes here, with a case in TestStorageKeysPresentCoversEveryReference.
 func (r *Repository) StorageKeysPresent(ctx context.Context, keys []string) (map[string]bool, error) {
 	present := map[string]bool{}
 	if len(keys) == 0 {
 		return present, nil
 	}
 	rows, err := r.pool.Query(ctx,
-		`SELECT storage_key   FROM files WHERE storage_key   = ANY($1)
+		`SELECT storage_key   FROM files         WHERE storage_key   = ANY($1)
 		  UNION
-		 SELECT thumbnail_key FROM files WHERE thumbnail_key = ANY($1)`, keys)
+		 SELECT thumbnail_key FROM files         WHERE thumbnail_key = ANY($1)
+		  UNION
+		 SELECT storage_key   FROM file_versions WHERE storage_key   = ANY($1)`, keys)
 	if err != nil {
 		return nil, fmt.Errorf("check storage keys: %w", err)
 	}

@@ -143,14 +143,7 @@ const (
 	retentionBatchSize  = 500
 	retentionMaxBatches = 40 // ceiling per tick: 20k messages, then wait for the next hour
 
-	objectGCGrace = 24 * time.Hour // an upload is unattached until its message is sent
-	// objectKeyDateSlack is how much a storage key's date can understate the
-	// object's real age: a whole day (the key has date granularity) plus the
-	// worst-case timezone skew. See olderThan.
-	objectKeyDateSlack = 48 * time.Hour
-	objectGCRowBatch   = 500
-	objectGCKeyBatch   = 1000
-	scheduledPageSize  = 200
+	scheduledPageSize = 200
 )
 
 // drainTimeout bounds the whole shutdown: consumer drain, in-flight handlers
@@ -1393,12 +1386,11 @@ func runAuditVerify(ctx context.Context, pool *pgxpool.Pool, v *audit.Verifier, 
 
 // --- orphaned object GC --------------------------------------------------------
 
-// objectGCPrefixes shard the bucket sweep; objectGCCursor rotates through them
-// so successive runs cover the whole keyspace.
-var (
-	objectGCPrefixes = []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"}
-	objectGCCursor   atomic.Int64
-)
+// objectGCCursor rotates through file.GCPrefixes so successive runs cover the
+// whole keyspace. The collector itself lives in internal/file — it owns both
+// the key format and the ownership columns, and as an unexported function here
+// the predicate that decides whether a user's file is garbage had no test.
+var objectGCCursor atomic.Int64
 
 func openStorage(cfg *app.Config, l *slog.Logger) *file.Storage {
 	if !cfg.MinIO.IsEnabled() {
@@ -1419,12 +1411,11 @@ func openStorage(cfg *app.Config, l *slog.Logger) *file.Storage {
 	return storage
 }
 
-// runObjectGC removes storage objects that nothing points at any more.
+// runObjectGC takes the singleton lock and runs one collection pass.
 //
-// Two independent leaks: a files row whose message_id went NULL (message
-// deleted, or the upload was never attached), and an object whose row is gone
-// entirely (workspace deletion cascades the rows away). The first is visible in
-// Postgres; the second is only visible by walking the bucket.
+// The lock stays here rather than moving with the collector: it is a
+// worker-replica concern, keyed by this file's lock-id registry, and it is the
+// one part of the job with nothing to assert about.
 func runObjectGC(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -1433,78 +1424,12 @@ func runObjectGC(
 	l *slog.Logger,
 ) error {
 	ran, err := withSingletonLock(ctx, pool, lockObjectGC, func(ctx context.Context) error {
-		cutoff := time.Now().Add(-objectGCGrace)
-
-		// (i) Unattached rows past the grace period. The grace period matters:
-		// a file is unattached from upload until its message is sent.
-		orphans, err := repo.ListOrphans(ctx, cutoff, objectGCRowBatch)
-		if err != nil {
-			return err
-		}
-		removed := make([]string, 0, len(orphans))
-		for _, o := range orphans {
-			// A row owns its thumbnail as well as its main object; the row is only
-			// dropped once every object it owns is gone, so a partial failure is
-			// retried next hour instead of leaking the remainder forever.
-			ok := true
-			for _, key := range o.Keys() {
-				if err := storage.Delete(ctx, key); err != nil {
-					l.Warn("object gc: delete object", "key", key, "error", err)
-					ok = false
-				}
-			}
-			if ok {
-				removed = append(removed, o.ID)
-			}
-		}
-		if n, err := repo.DeleteByIDs(ctx, removed); err != nil {
-			return err
-		} else if n > 0 {
-			l.Info("object gc: removed orphaned files", "count", n)
-		}
-
-		// (ii) Objects with no row at all.
-		//
-		// ListKeys has no continuation token, so an unprefixed listing would
-		// return the same first N keys every hour and never reach anything past
-		// them. Storage keys start with the workspace uuid, so sweeping one hex
-		// prefix per run covers the whole bucket every 16 runs.
-		prefix := objectGCPrefixes[int(objectGCCursor.Add(1)-1)%len(objectGCPrefixes)]
-		keys, err := storage.ListKeys(ctx, prefix, objectGCKeyBatch)
-		if err != nil {
-			return err
-		}
-		// Only consider objects old enough that a concurrent upload cannot be
-		// mid-flight between PutObject and its INSERT. The key encodes the
-		// upload date (workspace/YYYY/MM/DD/id.ext); anything unparseable is
-		// left alone rather than guessed at.
-		candidates := make([]string, 0, len(keys))
-		for _, k := range keys {
-			if olderThan(k, cutoff) {
-				candidates = append(candidates, k)
-			}
-		}
-		// Checks thumbnail_key as well as storage_key, so a live thumbnail is
-		// never mistaken for an object whose row is gone.
-		present, err := repo.StorageKeysPresent(ctx, candidates)
-		if err != nil {
-			return err
-		}
-		swept := 0
-		for _, k := range candidates {
-			if present[k] {
-				continue
-			}
-			if err := storage.Delete(ctx, k); err != nil {
-				l.Warn("object gc: delete unreferenced object", "key", k, "error", err)
-				continue
-			}
-			swept++
-		}
-		if swept > 0 {
-			l.Info("object gc: removed unreferenced objects", "count", swept)
-		}
-		return nil
+		prefix := file.GCPrefixes[int(objectGCCursor.Add(1)-1)%len(file.GCPrefixes)]
+		_, err := file.Collect(ctx, repo, storage, file.CollectOptions{
+			Now:         time.Now(),
+			SweepPrefix: prefix,
+		}, l)
+		return err
 	})
 	if err != nil {
 		return err
@@ -1513,61 +1438,6 @@ func runObjectGC(
 		l.Debug("object gc skipped: another replica holds the lock")
 	}
 	return nil
-}
-
-// olderThan reports whether an object can be proven, from its key alone, to
-// have been uploaded before cutoff.
-//
-// This is the guard that stops the bucket sweep from deleting an upload that
-// has been PUT but whose files row is not committed yet, and it has to be
-// conservative in the right direction.
-//
-// All the key carries is a date, so an object under .../2026/07/25/ may have
-// been written at any instant during that day — the youngest it can possibly be
-// is the *end* of it, not the start. Comparing the start of the day against the
-// cutoff, as this used to, collapsed the 24-hour grace period to nothing:
-// an object written at 23:59:59 was eligible for deletion two seconds later,
-// because its day started 24 hours and one second before the cutoff.
-//
-// The extra slack on top covers the zone: file.Handler.Upload formats the key
-// with time.Now() in local time while this parses it as UTC, so the day can sit
-// up to fourteen hours either side of where it looks. Two days of slack makes
-// the guarantee "at least objectGCGrace old" hold for any deployment timezone,
-// at the price of a candidate becoming eligible two or three days after upload
-// instead of one. For a leak collector that is the right trade.
-func olderThan(key string, cutoff time.Time) bool {
-	day, ok := objectDay(key)
-	if !ok {
-		return false
-	}
-	return day.Add(objectKeyDateSlack).Before(cutoff)
-}
-
-// objectDay parses the upload date out of a storage key of the shape
-// {workspace_id}/YYYY/MM/DD/{file_id}{ext}, written by file.Handler.Upload.
-// The returned time is midnight UTC at the start of that day.
-func objectDay(key string) (time.Time, bool) {
-	parts := splitN(key, '/', 5)
-	if len(parts) < 5 {
-		return time.Time{}, false
-	}
-	day, err := time.Parse("2006/01/02", parts[1]+"/"+parts[2]+"/"+parts[3])
-	if err != nil {
-		return time.Time{}, false
-	}
-	return day, true
-}
-
-func splitN(s string, sep byte, n int) []string {
-	out := make([]string, 0, n)
-	start := 0
-	for i := 0; i < len(s) && len(out) < n-1; i++ {
-		if s[i] == sep {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	return append(out, s[start:])
 }
 
 // --- health endpoint -----------------------------------------------------------

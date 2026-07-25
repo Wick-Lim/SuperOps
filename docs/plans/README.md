@@ -40,7 +40,7 @@ without colliding with a phase that has not started:
 | `015` | collaboration layer (`internal/collab`) |
 | `016`–`019` | object permissions (plan 00) — `016` taken (`acl_object`, `acl_grant`, `acl_key`, the two expected-state views and the backfill); `017`–`019` free |
 | `020`–`024` | unified inbox + audit (plan 01) — `020` taken (`inbox_events`, `inbox_items`, `notification_prefs`, `inbox_digest_state`, backfill), `021` taken (`audit_logs` → TEXT `resource_id`, monthly partitions, `dedupe_key`, chain, `audit_chain_heads`); `022`–`024` free |
-| `025`–`029` | Drive + editor registry (plan 02) |
+| `025`–`029` | Drive + editor registry (plan 02) — `025` taken (`drive_folders`, `files` reshape, `file_versions`, quota, the `collab_documents` FK, the `workspace` grant subject, both expected-state views); `026`–`029` free |
 | `030`–`034` | work tracking (plan 03) |
 | `035`–`039` | docs (plan 04) |
 | `040`–`044` | spreadsheet (plan 05) |
@@ -137,6 +137,17 @@ hours after upload.
 plus the `file_versions` arm, as its first commit, with a regression test.
 Later plans add one clause and one test case; nobody rewrites it again.
 
+**Landed** in migration `025` + `internal/file`. Both predicates and the
+collector now live in `internal/file` (`repository.go`, `gc.go`); `cmd/worker`
+holds only the advisory lock. `ListOrphans` names `folder_id`, `message_id` and
+`trashed_at`; `StorageKeysPresent` has arms for `files.storage_key`,
+`files.thumbnail_key` and `file_versions.storage_key`.
+`TestGCPredicatesFailIfReverted` runs the OLD queries against the SAME fixtures
+and asserts they get it wrong, so "a test that fails if the predicate is
+reverted" is proven rather than hoped for. **Your arm goes in
+`StorageKeysPresent` with a case in `TestStorageKeysPresentCoversEveryReference`
+— plan 08's `raw_key` is still missing and is still the dangerous one.**
+
 Plan 08's list of required edits is **incomplete in the dangerous direction**:
 the bucket sweep deletes any object whose key is absent from
 `files.storage_key`/`thumbnail_key` (`internal/file/repository.go:100-122`),
@@ -163,6 +174,51 @@ projection — different tables, different id spaces (`files.id` vs
 projection mechanism belongs in the registry contract (plan 02), keyed
 consistently, with each editor supplying only the extraction. Settle it in plan
 02 before plan 04 starts; three of these will not converge later.
+
+---
+
+### 5. How a Drive object becomes readable — a grant, not a rule (high)
+
+Decided while implementing `025`, and it constrains every pillar that puts an
+object in Drive.
+
+Plan 02 never says what a folder's default permission is, and both obvious
+answers are wrong. Deny-by-default (what plan 00 built, and what
+`internal/authz`'s tests pin) makes the Drive root invisible to everyone but its
+creator. A view arm that makes Drive workspace-readable is a second inheritance
+mechanism that only the LIST path knows about — `acl_key` and `Capability` are
+computed by different code, so the listing would show what opening refuses, or
+the reverse, which is a leak. Both were built and both were wrong.
+
+**Resolution: `acl_grant` gains a `workspace` subject type**, meaning "everyone
+in this workspace", with the key prefix `w-` that `KeysFor` already puts in
+every member's key set. Creating a workspace's Drive is three writes:
+
+```go
+// 1. the row
+INSERT INTO drive_folders (workspace_id, name, is_root, created_by) ...
+// 2. the ACL object — folders are ACL-NATIVE, so Register owns the path
+az.Register(ctx, authz.FolderObject(id), authz.WorkspaceObject(ws))
+// 3. the grant that makes it shared — ROOT ONLY; everything below inherits
+az.Grant(ctx, actor, authz.WorkspaceSubject(ws), authz.FolderObject(id), authz.CapWrite)
+```
+
+Three consequences a pillar has to know:
+
+1. **A workspace grant is capped by the recipient's workspace role** — owner and
+   admin get admin, member write, guest read. A grant addressed to "everyone
+   here" must not promote anybody past their own role.
+2. **Folders are ACL-native and files are derived.** `Register`/`Move` own a
+   folder's `acl_object` row; a file's row and path come from
+   `acl_object_expected`, which reads the folder's *current* path. Do not put
+   folders in that view — that would make them a derived type, and `Register`
+   and `Move` both refuse derived types, so Drive could not move a folder.
+3. **There is no private folder in v1.** Restricting a subtree means inheritance
+   must STOP at a boundary, and inheritance is computed twice — by
+   `acl_key_expected` arm 5 in SQL and by `grantedCapability` in Go. Implemented
+   in one and not the other it is exactly the bug above. It is a named cut, not
+   an oversight; the fix is a boundary expressed once, and it gets its own
+   migration.
 
 ---
 

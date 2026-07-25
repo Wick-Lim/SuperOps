@@ -87,12 +87,33 @@ func createUser(t *testing.T, pool *pgxpool.Pool) string {
 	return id
 }
 
-// newDocument creates a collaborative document for a synthetic Drive object.
+// newDocument creates a collaborative document for a Drive object.
 func (f *fixture) newDocument(t *testing.T) *Document {
 	t.Helper()
-	doc, err := f.repo.EnsureDocument(context.Background(), f.workspaceID, "document", uuid.NewString(), f.owner)
+	doc, err := f.repo.EnsureDocument(context.Background(), f.workspaceID, "document", f.newDriveFile(t), f.owner)
 	if err != nil {
 		t.Fatalf("create collaboration document: %v", err)
 	}
 	return doc
+}
+
+// newDriveFile returns the id of a real files row.
+//
+// It used to be uuid.NewString(). Migration 025 closed the foreign key that
+// migration 015 left open on purpose — collab_documents.resource_id REFERENCES
+// files(id) — so a document about a resource that does not exist is no longer
+// storable. That is the point of the FK: without it, purging a file leaves its
+// update log behind as user-content Postgres bytes with nothing pointing at
+// them, invisible to the object GC because they are not objects.
+func (f *fixture) newDriveFile(t *testing.T) string {
+	t.Helper()
+	var id string
+	err := f.pool.QueryRow(context.Background(),
+		`INSERT INTO files (workspace_id, user_id, name, file_type, content_type, size_bytes, storage_key)
+		 VALUES ($1, $2, 'doc', 'document', 'application/vnd.superops.document', 0, '')
+		 RETURNING id`, f.workspaceID, f.owner).Scan(&id)
+	if err != nil {
+		t.Fatalf("create drive file: %v", err)
+	}
+	return id
 }

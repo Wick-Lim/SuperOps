@@ -15,7 +15,7 @@ import (
 func TestEnsureDocument(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
-	resourceID := uuid.NewString()
+	resourceID := f.newDriveFile(t)
 
 	first, err := f.repo.EnsureDocument(ctx, f.workspaceID, "document", resourceID, f.owner)
 	if err != nil {

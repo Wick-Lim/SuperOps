@@ -151,11 +151,22 @@ var containerKeyPrefix = map[string]string{
 const (
 	SubjectUser  = "user"
 	SubjectGroup = "group" // reserved; matches the g- key prefix, nothing writes it yet
+	// SubjectWorkspace is "everyone in this workspace". It is what makes Drive
+	// the company's shared drive without inventing a second inheritance
+	// mechanism: one acl_grant row on the Drive root, and the ordinary subtree
+	// inheritance carries it to every folder and file below.
+	//
+	// Its key is w-<workspace>, which KeysFor already puts in every member's key
+	// set, so nothing downstream had to learn a new prefix. What it is NOT is a
+	// tenancy statement: acl_object.workspace_id decides that, and a workspace
+	// grant on an object in another tenant would still fail the path CHECK.
+	SubjectWorkspace = "workspace"
 )
 
 var subjectKeyPrefix = map[string]string{
-	SubjectUser:  "u-",
-	SubjectGroup: "g-",
+	SubjectUser:      "u-",
+	SubjectGroup:     "g-",
+	SubjectWorkspace: "w-",
 }
 
 // ObjectRef names one object: a type and a uuid. It is a value, not an
@@ -180,11 +191,23 @@ func UserSubject(userID string) SubjectRef { return SubjectRef{Type: SubjectUser
 // subject-type namespace is decided in one place.
 func GroupSubject(groupID string) SubjectRef { return SubjectRef{Type: SubjectGroup, ID: groupID} }
 
-// WorkspaceObject, ChannelObject and FileObject build refs for the three types
-// that exist today.
+// WorkspaceSubject names every member of a workspace at once. Granting to it is
+// how an object becomes workspace-shared; see SubjectWorkspace.
+func WorkspaceSubject(workspaceID string) SubjectRef {
+	return SubjectRef{Type: SubjectWorkspace, ID: workspaceID}
+}
+
+// Ref constructors for the types that exist today.
+//
+// FolderObject is the odd one out and worth the note: workspaces, channels and
+// files are DERIVED (their rows come from acl_object_expected), so their refs
+// are only ever read. A folder is ACL-native — Register writes its row and Move
+// rewrites its subtree — so this is the one constructor whose result is passed
+// to a mutation.
 func WorkspaceObject(id string) ObjectRef { return ObjectRef{Type: TypeWorkspace, ID: id} }
 func ChannelObject(id string) ObjectRef   { return ObjectRef{Type: TypeChannel, ID: id} }
 func FileObject(id string) ObjectRef      { return ObjectRef{Type: TypeFile, ID: id} }
+func FolderObject(id string) ObjectRef    { return ObjectRef{Type: TypeFolder, ID: id} }
 
 func (o ObjectRef) String() string  { return o.Type + ":" + o.ID }
 func (s SubjectRef) String() string { return s.Type + ":" + s.ID }

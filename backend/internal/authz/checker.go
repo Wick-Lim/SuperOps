@@ -103,32 +103,49 @@ func (c *Checker) resolve(ctx context.Context, obj ObjectRef) (*objectState, err
 		return st, nil
 
 	case TypeFile:
-		// The channel join is constrained to the file's own workspace for the
-		// same reason acl_object_expected constrains it: a cross-workspace
-		// message_id is corrupt data, and degrading to "uploader only" is the
-		// fail-closed reading of it.
-		var channelID, channelType *string
+		// Both joins are constrained to the file's own workspace for the same
+		// reason acl_object_expected constrains them: a cross-workspace
+		// folder_id or message_id is corrupt data, and degrading to "uploader
+		// only" is the fail-closed reading of it.
+		//
+		// The folder's path is read rather than derived. It is the folder's
+		// CURRENT path — a folder that has been moved carries a different one —
+		// and computing a second opinion here would make a moved subtree
+		// authorize against where it used to be.
+		var channelID, channelType, folderPath *string
 		err := c.pool.QueryRow(ctx, `
-			SELECT f.workspace_id::text, f.user_id::text, ch.id::text, ch.type::text
+			SELECT f.workspace_id::text, f.user_id::text, ch.id::text, ch.type::text, fo.path
 			  FROM files f
+			  LEFT JOIN acl_object fo ON fo.object_type  = 'folder'
+			                         AND fo.object_id    = f.folder_id
+			                         AND fo.workspace_id = f.workspace_id
 			  LEFT JOIN messages m  ON m.id = f.message_id
 			  LEFT JOIN channels ch ON ch.id = m.channel_id AND ch.workspace_id = f.workspace_id
 			 WHERE f.id = $1`, obj.ID).
-			Scan(&st.workspaceID, &st.ownerID, &channelID, &channelType)
+			Scan(&st.workspaceID, &st.ownerID, &channelID, &channelType, &folderPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
 		if err != nil {
 			return nil, fmt.Errorf("resolve file object: %w", err)
 		}
-		wsSeg := "/" + pathSegment(WorkspaceObject(st.workspaceID)) + "/"
 		if channelID != nil {
 			st.parentChannel = *channelID
 			if channelType != nil {
 				st.channelType = *channelType
 			}
+		}
+		// Path precedence matches acl_object_expected exactly: folder, then the
+		// attached message's channel, then the workspace. It has to, because
+		// grantedCapability walks these path segments looking for grants and a
+		// path this function invented would look for them in the wrong place.
+		wsSeg := "/" + pathSegment(WorkspaceObject(st.workspaceID)) + "/"
+		switch {
+		case folderPath != nil:
+			st.path = *folderPath + pathSegment(obj) + "/"
+		case channelID != nil:
 			st.path = wsSeg + pathSegment(ChannelObject(*channelID)) + "/" + pathSegment(obj) + "/"
-		} else {
+		default:
 			st.path = wsSeg + pathSegment(obj) + "/"
 		}
 		return st, nil
@@ -246,6 +263,12 @@ func (c *Checker) derivedCapability(ctx context.Context, sub SubjectRef, st *obj
 		// hard-deleted) by its uploader alone. Workspace membership is
 		// deliberately NOT enough — that gap is what let any member fetch a file
 		// posted in a private channel given only its uuid.
+		//
+		// A Drive file falls through to CapNone here and gets its capability
+		// from grantedCapability instead, via the workspace grant on the Drive
+		// root. That is the whole reason Drive is expressed as a grant: this
+		// function did not have to learn about folders, and the list path and
+		// the decision path stayed one rule instead of two.
 		if st.parentChannel != "" {
 			return c.channelCapability(ctx, st.parentChannel, st.channelType, st.workspaceID, sub.ID)
 		}
@@ -334,31 +357,73 @@ func (c *Checker) grantedCapability(ctx context.Context, sub SubjectRef, st *obj
 		return CapNone, nil
 	}
 
+	// A user holds their own grants AND every grant whose subject is a workspace
+	// they belong to. The second half is what makes Drive shared: one
+	// acl_grant(root folder, workspace, write) row, inherited down the path like
+	// any other grant, instead of a special case in this function.
+	//
+	// The membership test is inside the query rather than a separate round trip,
+	// so "the grants that apply to me" stays one statement — and so a user
+	// removed from a workspace loses its grants in the same instant, with no
+	// second read that could observe the old state.
+	workspaceSubject := sub.Type == SubjectUser
 	rows, err := c.pool.Query(ctx, `
-		SELECT g.capability
+		SELECT g.subject_type, g.capability
 		  FROM acl_grant g
 		  JOIN acl_object a ON a.object_type = g.object_type AND a.object_id = g.object_id
-		 WHERE g.subject_type = $1 AND g.subject_id = $2 AND a.path = ANY($3)`,
-		sub.Type, sub.ID, paths)
+		 WHERE a.path = ANY($3)
+		   AND (
+		       (g.subject_type = $1 AND g.subject_id = $2)
+		    OR ($4 AND g.subject_type = 'workspace'
+		           AND g.subject_id = a.workspace_id
+		           AND EXISTS (SELECT 1 FROM workspace_members wm
+		                        WHERE wm.workspace_id = a.workspace_id
+		                          AND wm.user_id = $2))
+		   )`,
+		sub.Type, sub.ID, paths, workspaceSubject)
 	if err != nil {
 		return CapNone, fmt.Errorf("list effective grants: %w", err)
 	}
 	defer rows.Close()
 
-	best := CapNone
+	best, workspaceBest := CapNone, CapNone
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var subjectType, raw string
+		if err := rows.Scan(&subjectType, &raw); err != nil {
 			return CapNone, fmt.Errorf("scan effective grant: %w", err)
 		}
 		// An unparseable capability is a row the CHECK constraint should have
 		// refused. Ignoring it denies; treating it as admin would not.
-		if capability, ok := ParseCapability(raw); ok && capability > best {
-			best = capability
+		capability, ok := ParseCapability(raw)
+		if !ok {
+			continue
 		}
+		if subjectType == SubjectWorkspace {
+			// Held back and capped below. A grant to "everyone in the workspace"
+			// is addressed to a group whose members do NOT all deserve the same
+			// thing: a guest is in the workspace. Applying it verbatim would let
+			// a shared Drive hand write access to every guest account, which is
+			// the opposite of what granting write to the team means.
+			workspaceBest = max(workspaceBest, capability)
+			continue
+		}
+		best = max(best, capability)
 	}
 	if err := rows.Err(); err != nil {
 		return CapNone, fmt.Errorf("list effective grants: %w", err)
+	}
+
+	// A workspace grant is bounded by what the recipient's ROLE in that
+	// workspace is worth: owner/admin admin, member write, guest read. So
+	// granting write to the workspace gives members write and guests read,
+	// and it can never promote anybody past their own role. A grant made to a
+	// person directly is not capped — that is the point of granting to a person.
+	if workspaceBest != CapNone && st.workspaceID != "" {
+		role, err := c.workspaceCapability(ctx, st.workspaceID, sub.ID)
+		if err != nil {
+			return CapNone, err
+		}
+		best = max(best, min(workspaceBest, role))
 	}
 	return best, nil
 }
