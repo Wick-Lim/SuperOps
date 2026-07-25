@@ -13,10 +13,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+	"github.com/Wick-Lim/SuperOps/backend/internal/quota"
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
@@ -167,7 +169,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	name := httputil.SanitizeFileName(header.Filename)
 	fileID := uuid.NewString()
 	ext := filepath.Ext(name)
-	storageKey := fmt.Sprintf("%s/%s/%s%s", workspaceID, time.Now().Format("2006/01/02"), fileID, ext)
+	storageKey := StorageKey(workspaceID, fileID, ext)
 
 	// file is a multipart.File: either the small in-memory buffer or a temp file
 	// on disk. Either way this streams to MinIO instead of materialising the
@@ -181,7 +183,16 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	// invisible to every list path — including search — until the hourly drift
 	// job runs, and then it appears on its own. MaterializeTx runs the same
 	// views that job does, filtered to this object.
+	// The row, its version row, its ACL and the quota charge are ONE commit.
+	//
+	// The charge belongs here rather than on the Drive route alone: a quota any
+	// member can bypass by posting to /api/v1/files/upload is not enforcement.
+	// The version row belongs here because quota's invariant I1 sums
+	// file_versions — a file with no version row is silently free storage.
 	if err := database.WithTx(ctx, h.pool, func(tx pgx.Tx) error {
+		if _, err := quota.ChargeTx(ctx, tx, workspaceID, header.Size); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO files (id, workspace_id, user_id, name, content_type, size_bytes, storage_key)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -189,10 +200,21 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO file_versions (file_id, version, storage_key, size_bytes, content_type, created_by)
+			 VALUES ($1, 1, $2, $3, $4, $5)`,
+			fileID, storageKey, header.Size, contentType, userID); err != nil {
+			return err
+		}
 		return authz.MaterializeTx(ctx, tx, authz.FileObject(fileID))
 	}); err != nil {
 		// Do not leave the object behind if the metadata row could not be written.
 		_ = h.storage.Delete(ctx, storageKey)
+		if errors.Is(err, quota.ErrExceeded) {
+			httputil.JSONError(w, http.StatusInsufficientStorage, "QUOTA_EXCEEDED",
+				"the workspace has no storage left; free space or raise the quota")
+			return
+		}
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
@@ -367,8 +389,18 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tag, err := h.pool.Exec(ctx, `DELETE FROM files WHERE id = $1`, fileID)
-	if err != nil {
+	// The refund is in the same transaction as the DELETE, and it reads the
+	// version rows BEFORE they cascade away — file_versions is ON DELETE CASCADE
+	// from files, so after the DELETE there is nothing left to sum.
+	var tag pgconn.CommandTag
+	if err := database.WithTx(ctx, h.pool, func(tx pgx.Tx) error {
+		if err := quota.RefundForFilesTx(ctx, tx, []string{fileID}); err != nil {
+			return err
+		}
+		var execErr error
+		tag, execErr = tx.Exec(ctx, `DELETE FROM files WHERE id = $1`, fileID)
+		return execErr
+	}); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}

@@ -2,6 +2,7 @@ package file
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -215,6 +216,21 @@ func Collect(
 		l.Info("object gc: removed unreferenced objects", "count", res.ObjectsSwept)
 	}
 	return res, nil
+}
+
+// StorageKey builds the object key for a file: {workspace}/YYYY/MM/DD/{id}{ext}.
+//
+// UTC, and that is the point. It used to be time.Now() in LOCAL time while
+// objectDay parses the key as UTC, so the encoded day could sit up to fourteen
+// hours either side of where it looked — which is most of what GCKeyDateSlack
+// exists to absorb. One clock on both sides makes the slack cover only the
+// key's one-day granularity, which is the part that is irreducible.
+//
+// The slack is NOT reduced here. Keys written by the old builder are still in
+// every bucket, and shortening the window would make those objects collectable
+// sooner than their real age allows.
+func StorageKey(workspaceID, fileID, ext string) string {
+	return fmt.Sprintf("%s/%s/%s%s", workspaceID, time.Now().UTC().Format("2006/01/02"), fileID, ext)
 }
 
 // olderThan reports whether an object can be proven, from its key alone, to

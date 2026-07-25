@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Wick-Lim/SuperOps/backend/internal/quota"
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
 
 // Repository serves the object-storage garbage collector.
@@ -108,16 +112,32 @@ func (r *Repository) ListOrphans(ctx context.Context, cutoff time.Time, limit in
 	return orphans, rows.Err()
 }
 
-// DeleteByIDs removes file rows once their objects are gone.
+// DeleteByIDs removes file rows once their objects are gone, and returns their
+// bytes to the workspace's quota.
+//
+// The refund is here rather than in the caller because it has to read
+// file_versions BEFORE the DELETE cascades those rows away, and because the
+// collector is the one delete path with no user watching it: a leak here shows
+// up months later as a workspace that is full of nothing.
 func (r *Repository) DeleteByIDs(ctx context.Context, ids []string) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	tag, err := r.pool.Exec(ctx, `DELETE FROM files WHERE id = ANY($1)`, ids)
-	if err != nil {
-		return 0, fmt.Errorf("delete files: %w", err)
+	var affected int64
+	if err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		if err := quota.RefundForFilesTx(ctx, tx, ids); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM files WHERE id = ANY($1)`, ids)
+		if err != nil {
+			return fmt.Errorf("delete files: %w", err)
+		}
+		affected = tag.RowsAffected()
+		return nil
+	}); err != nil {
+		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return affected, nil
 }
 
 // StorageKeysPresent returns the subset of keys that are still referenced from
