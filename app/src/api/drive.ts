@@ -55,6 +55,10 @@ export interface DriveDescriptor extends DriveFile {
   collab_document_id: string | null
   content_url: string | null
   thumbnail_url: string | null
+  /** How far the searchable body has fallen behind the log. Null for a blob.
+   * The client compares the two to decide whether to re-project on open — the
+   * only backstop for a document edited and closed before its debounce fired. */
+  projection: ProjectionStatus | null
 }
 
 /** One row of a folder listing. Folders and files arrive in one stream, because
@@ -85,6 +89,33 @@ export interface RegistryKind {
    * independently is exactly how you end up with three projection pipelines.
    */
   client_projected: boolean
+}
+
+/** How far the client-published body has fallen behind the CRDT log. Null for
+ * a blob kind, which has no projection at all. */
+export interface ProjectionStatus {
+  head_seq: number
+  projection_seq: number
+  schema_version: number
+  projected_at: string | null
+}
+
+/** One resolved embed. `title` is ABSENT — not empty — when access is denied:
+ * an empty string would confirm the object exists and has a name. */
+export interface ResolvedRef {
+  ref_type: string
+  ref_id: string
+  access: 'granted' | 'denied'
+  title?: string
+}
+
+export interface Backlink {
+  file_id: string
+  name: string
+  file_type: string
+  folder_id: string | null
+  block_id: string
+  updated_at: string
 }
 
 export interface DriveVersion {
@@ -179,6 +210,33 @@ export const driveApi = {
    * that has no spreadsheet. */
   registry() {
     return api.get<RegistryKind[]>('/drive/registry')
+  },
+
+  /**
+   * Publishes the client's rendering of a document the server cannot read.
+   *
+   * Derived, non-authoritative state: it makes the document searchable, mobile
+   * renderable and previewable, and corrupting it costs none of the writing.
+   * The server refuses a projection above the log head, from a stale schema, or
+   * over its bounds — every one a refusal rather than a truncation.
+   */
+  project(fileId: string, projection: unknown) {
+    return api.post<{ applied: boolean; status: ProjectionStatus }>(
+      `/drive/files/${fileId}/projection`,
+      projection,
+    )
+  },
+
+  /** Resolves embedded references against THE CALLER's capability. An embed
+   * node carries only {ref_type, ref_id}, so this is the only thing that can
+   * name its target — and it answers `denied` with no title at all for one the
+   * caller may not read. */
+  resolveRefs(fileId: string, refs: { ref_type: string; ref_id: string }[]) {
+    return api.post<ResolvedRef[]>(`/drive/files/${fileId}/refs/resolve`, { refs })
+  },
+
+  backlinks(refType: string, refId: string) {
+    return api.get<Backlink[]>(`/drive/refs/${refType}/${refId}/files`)
   },
 
   root(workspaceId: string) {

@@ -308,6 +308,39 @@ jobs:
         working-directory: app
         run: npm test
 
+      # THE BUNDLE CHECK. The document editor is TipTap/ProseMirror, which is
+      # DOM-only, so it lives in Editor.web.tsx and the phones get a read-only
+      # renderer instead. Nothing else can verify that split: both files
+      # type-check, both render something, and a resolution mistake shows up as
+      # "the editor is missing" on one platform or "+400 KB" on the other.
+      #
+      # It has already caught one. The first version of the tsc shim was an
+      # `Editor.ts` re-export, which Metro resolved AHEAD of the platform
+      # variants — so the web build shipped the read-only native renderer and
+      # the editor silently did not exist. It is a `.d.ts` now, which Metro
+      # cannot pick.
+      - name: Bundle check — the editor is web-only
+        working-directory: app
+        run: |
+          set -euo pipefail
+          npx expo export --platform web --output-dir /tmp/bundle-web >/dev/null
+          npx expo export --platform ios --output-dir /tmp/bundle-ios >/dev/null
+
+          web=$(ls /tmp/bundle-web/_expo/static/js/web/*.js | head -1)
+          # iOS ships Hermes bytecode; its string table still carries literals.
+          ios=$(ls /tmp/bundle-ios/_expo/static/js/ios/* | head -1)
+
+          grep -q 'superops-editor' "$web" \
+            || { echo "::error::the web bundle has no editor — the platform split resolved the wrong file"; exit 1; }
+
+          if strings "$ios" | grep -q 'prosemirror'; then
+            echo "::error::prosemirror leaked into the iOS bundle; the mobile app grew ~400 KB for a feature it does not have"
+            exit 1
+          fi
+          strings "$ios" | grep -q 'Editing documents is available on the web' \
+            || { echo "::error::the iOS bundle has no document renderer at all"; exit 1; }
+          echo "editor is web-only, renderer is native-only"
+
       - name: Audit runtime dependencies
         working-directory: app
         run: npm audit --omit=dev --audit-level=critical

@@ -13,6 +13,28 @@ import type { Channel, PresenceStatus, WireMessage } from './types'
 export type WSEventHandler = (data: unknown) => void
 export type ResyncReason = 'seq-gap' | 'reconnect' | 'revoked' | 'manual'
 
+/**
+ * What happened to a collaboration room.
+ *
+ * `joined` carries the log head so a provider knows whether it is behind and
+ * must fetch state over HTTP before it starts editing, and whether it may write
+ * at all — the server decides that, and a client that assumed it could would
+ * render an editable surface whose every keystroke is refused.
+ *
+ * `left` distinguishes the two reasons deliberately: `client` is "you closed
+ * it", `revoked` is "your access was withdrawn", and the editor shows a
+ * different thing for each. Collapsing them would tell somebody who was removed
+ * from a document that they had left it.
+ */
+export type RoomEvent =
+  | { kind: 'joined'; documentId: string; headSeq: number; canWrite: boolean }
+  | { kind: 'left'; documentId: string; reason: 'client' | 'revoked' }
+  | { kind: 'update'; documentId: string; seq: number; actorId: string; originConn: string; update: string }
+  | { kind: 'awareness'; documentId: string; actorId: string; originConn: string; state: string }
+  | { kind: 'compact'; documentId: string; headSeq: number; snapshotSeq: number }
+  /** The socket dropped and came back; every room was re-joined from scratch. */
+  | { kind: 'resumed'; documentId: string }
+
 /** Server → client frame. `seq` is monotonic per connection on EVERY frame. */
 interface InboundFrame {
   type: string
@@ -33,6 +55,11 @@ function record(data: unknown): Record<string, unknown> | null {
 function str(d: Record<string, unknown> | null, key: string): string | undefined {
   const v = d?.[key]
   return typeof v === 'string' ? v : undefined
+}
+
+function num(d: Record<string, unknown> | null, key: string): number | undefined {
+  const v = d?.[key]
+  return typeof v === 'number' ? v : undefined
 }
 
 /**
@@ -68,6 +95,20 @@ class WebSocketManager {
   private handlers: Map<string, WSEventHandler[]> = new Map()
   /** Channels the app wants subscribed. */
   private desiredChannels: Set<string> = new Set()
+  /**
+   * Collaboration rooms this client wants to be in.
+   *
+   * A room is PER CONNECTION, exactly like a channel subscription, so a
+   * reconnect must re-join them or the editor goes quietly one-way: it keeps
+   * sending updates the server refuses ("join the document before sending
+   * updates") while the document on screen stops changing. Tracking the desire
+   * here rather than in the provider is what makes the re-join possible at all,
+   * because only the manager sees `onopen`.
+   */
+  private desiredRooms: Set<string> = new Set()
+  /** Rooms the server has acknowledged on THIS connection. */
+  private joinedRooms: Map<string, { canWrite: boolean; headSeq: number }> = new Map()
+  private roomListeners: Set<(e: RoomEvent) => void> = new Set()
   /** Channels the server has acknowledged with a `subscribed` frame. */
   private confirmedChannels: Set<string> = new Set()
   private typingTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
@@ -102,10 +143,19 @@ class WebSocketManager {
       this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS
       this.lastSeq = 0
       this.confirmedChannels.clear()
+      this.joinedRooms.clear()
       this.setConnected(true)
       // Subscriptions are per connection; re-assert them all. The server acks
       // each with a `subscribed` frame, so nothing races the upgrade any more.
       this.desiredChannels.forEach((chId) => this.send('subscribe', { channel_id: chId }))
+      // Rooms are per connection too. Re-joining is not enough on its own —
+      // the provider must also reconcile its watermark against the head the
+      // server reports, because updates published while the socket was down are
+      // not replayed — so it is told the room resumed.
+      this.desiredRooms.forEach((docId) => {
+        this.send('collab.join', { document_id: docId })
+        this.emitRoom({ kind: 'resumed', documentId: docId })
+      })
       if (this.everConnected) {
         // Anything published while the socket was down is gone — there is no
         // server-side replay, so the only recovery is a REST refetch.
@@ -175,6 +225,8 @@ class WebSocketManager {
     }
     this.desiredChannels.clear()
     this.confirmedChannels.clear()
+    this.desiredRooms.clear()
+    this.joinedRooms.clear()
     this.connectionId = null
     this.lastSeq = 0
     // A deliberate teardown is a clean slate: the next connect() is a first
@@ -191,6 +243,7 @@ class WebSocketManager {
     this.disconnect()
     this.handlers.clear()
     this.resyncListeners.clear()
+    this.roomListeners.clear()
     this.everConnected = false
     this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS
   }
@@ -356,6 +409,44 @@ class WebSocketManager {
 
   setPresence(status: PresenceStatus) {
     this.send('presence.update', { status })
+  }
+
+  // ---------------------------------------------------------------------------
+  // Collaboration rooms
+  // ---------------------------------------------------------------------------
+
+  joinRoom(documentId: string) {
+    if (this.desiredRooms.has(documentId)) return
+    this.desiredRooms.add(documentId)
+    this.send('collab.join', { document_id: documentId })
+  }
+
+  leaveRoom(documentId: string) {
+    if (!this.desiredRooms.delete(documentId)) return
+    this.joinedRooms.delete(documentId)
+    this.send('collab.leave', { document_id: documentId })
+  }
+
+  /** What the server said this connection may do in a room, or undefined. */
+  roomAccess(documentId: string) {
+    return this.joinedRooms.get(documentId)
+  }
+
+  sendCollabUpdate(documentId: string, updateBase64: string) {
+    this.send('collab.update', { document_id: documentId, update: updateBase64 })
+  }
+
+  sendAwareness(documentId: string, stateBase64: string) {
+    this.send('collab.awareness', { document_id: documentId, state: stateBase64 })
+  }
+
+  onRoom(listener: (e: RoomEvent) => void) {
+    this.roomListeners.add(listener)
+    return () => this.roomListeners.delete(listener)
+  }
+
+  private emitRoom(e: RoomEvent) {
+    this.roomListeners.forEach((l) => l(e))
   }
 
   on(type: string, handler: WSEventHandler) {
@@ -536,6 +627,72 @@ class WebSocketManager {
           this.subscribe(channelId)
           void this.resync('manual')
         }
+        break
+      }
+      // --- collaboration -----------------------------------------------------
+      //
+      // These arms keep no document state. The CRDT lives in the provider and
+      // the manager is a transport: it tracks which rooms this connection is in
+      // (so a reconnect can restore them) and forwards everything else.
+      case 'collab.joined': {
+        const documentId = str(d, 'document_id')
+        if (!documentId) break
+        const headSeq = num(d, 'head_seq') ?? 0
+        const canWrite = d?.can_write === true
+        this.joinedRooms.set(documentId, { canWrite, headSeq })
+        this.emitRoom({ kind: 'joined', documentId, headSeq, canWrite })
+        break
+      }
+      case 'collab.left': {
+        const documentId = str(d, 'document_id')
+        if (!documentId) break
+        this.joinedRooms.delete(documentId)
+        const revoked = str(d, 'reason') === 'revoked'
+        if (revoked) {
+          // Access was withdrawn. Drop the DESIRE too, or the next reconnect
+          // re-joins a room the server will refuse — and the editor would show
+          // a document nobody may open, forever retrying.
+          this.desiredRooms.delete(documentId)
+        }
+        this.emitRoom({ kind: 'left', documentId, reason: revoked ? 'revoked' : 'client' })
+        break
+      }
+      case 'collab.update': {
+        const documentId = str(d, 'document_id')
+        const update = str(d, 'update')
+        if (!documentId || !update) break
+        this.emitRoom({
+          kind: 'update',
+          documentId,
+          seq: num(d, 'seq') ?? 0,
+          actorId: str(d, 'actor_id') ?? '',
+          originConn: str(d, 'origin_conn') ?? '',
+          update,
+        })
+        break
+      }
+      case 'collab.awareness': {
+        const documentId = str(d, 'document_id')
+        const state = str(d, 'state')
+        if (!documentId || !state) break
+        this.emitRoom({
+          kind: 'awareness',
+          documentId,
+          actorId: str(d, 'actor_id') ?? '',
+          originConn: str(d, 'origin_conn') ?? '',
+          state,
+        })
+        break
+      }
+      case 'collab.compact': {
+        const documentId = str(d, 'document_id')
+        if (!documentId) break
+        this.emitRoom({
+          kind: 'compact',
+          documentId,
+          headSeq: num(d, 'head_seq') ?? 0,
+          snapshotSeq: num(d, 'snapshot_seq') ?? 0,
+        })
         break
       }
       case 'member.left': {

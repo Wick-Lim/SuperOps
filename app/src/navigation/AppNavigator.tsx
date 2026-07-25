@@ -29,6 +29,7 @@ import DriveScreen from '../screens/DriveScreen'
 import DriveFileScreen from '../screens/DriveFileScreen'
 import DriveTrashScreen from '../screens/DriveTrashScreen'
 import DriveShareScreen from '../screens/DriveShareScreen'
+import CollabDocumentScreen from '../screens/CollabDocumentScreen'
 import SettingsScreen from '../screens/SettingsScreen'
 import AdminScreen from '../screens/AdminScreen'
 import ChannelDetailScreen from '../screens/ChannelDetailScreen'
@@ -66,6 +67,11 @@ export type RootStackParamList = {
   DriveFile: { fileId: string }
   DriveTrash: undefined
   DriveShare: { objectType: 'folder' | 'file'; objectId: string; name?: string }
+  /** A collaborative editor. `documentId` is the collab room — NOT the file id.
+   * The protocol addresses rooms by collab_documents.id, and conflating the two
+   * is the obvious first bug of this phase. `fileId` is carried alongside
+   * because the projection is posted against the Drive object. */
+  CollabDocument: { documentId: string; fileId: string; name?: string }
   /** Internal: shown while the post-login workspace lookup is in flight. */
   Bootstrap: undefined
 }
@@ -324,6 +330,7 @@ export default function AppNavigator() {
       <Stack.Screen name="DriveFile" component={DriveFileScreen} />
       <Stack.Screen name="DriveTrash" component={DriveTrashScreen} />
       <Stack.Screen name="DriveShare" component={DriveShareScreen} />
+      <Stack.Screen name="CollabDocument" component={CollabDocumentScreen} />
       <Stack.Screen name="Settings" component={SettingsScreen} />
       <Stack.Screen name="Admin" component={AdminScreen} />
     </>
