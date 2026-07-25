@@ -26,8 +26,18 @@ const (
 	pingPeriod = 30 * time.Second
 	pongWait   = 20 * time.Second
 
-	maxMessageSize = 4096
-	sendBuffer     = 256
+	// maxMessageSize bounds one inbound frame. It was 4 KiB, which no CRDT
+	// update larger than a few keystrokes fits in. 64 KiB is the budget for a
+	// collaboration frame plus its JSON and base64 overhead; anything bigger —
+	// a paste, an offline client flushing a backlog — belongs on the HTTP
+	// append endpoint, which streams and has its own much larger cap. The
+	// per-connection inbound rate limiter is what stops this becoming a memory
+	// amplifier: the read buffer is transient, the frame rate is not.
+	maxMessageSize = 64 << 10
+	// maxCollabPayloadBytes bounds the decoded CRDT payload inside such a
+	// frame, leaving room for base64 (4/3) and the envelope.
+	maxCollabPayloadBytes = 32 << 10
+	sendBuffer            = 256
 
 	// maxConsecutiveDrops is how many frames may be dropped for a wedged client
 	// before the connection is closed. A client that cannot drain sendBuffer
@@ -41,6 +51,15 @@ const (
 	inboundBurst         = 20
 	maxRateStrikes       = 20
 
+	// Collaboration frames get their own, much larger budget. A person typing
+	// in a document with their cursor moving produces an order of magnitude
+	// more frames than a chat client, and charging them to the 5/s bucket would
+	// disconnect every editor within seconds. The budget is defensible because
+	// awareness costs nothing but a fan-out and an update costs one small
+	// INSERT — not the several queries a subscribe does.
+	collabRatePerSecond = 40
+	collabBurst         = 120
+
 	// membershipRecheckPeriod backstops RevokeChannelSubscription.
 	membershipRecheckPeriod = 5 * time.Minute
 
@@ -48,6 +67,11 @@ const (
 	presenceOpTimeout = 5 * time.Second
 	// memberCheckTimeout bounds the Postgres membership query made from a pump.
 	memberCheckTimeout = 5 * time.Second
+	// collabOpTimeout bounds a collaboration append. It is derived from the
+	// socket context rather than Background so a dead connection does not leave
+	// a transaction holding the document row lock every other writer queues
+	// behind.
+	collabOpTimeout = 5 * time.Second
 )
 
 type Client struct {
@@ -73,11 +97,16 @@ type Client struct {
 
 	mu            sync.RWMutex
 	subscriptions map[string]bool
+	// rooms maps a collaboration document id to the write permission granted
+	// at join time. Separate from subscriptions on purpose — see room.go.
+	rooms map[string]bool
 
-	limiter  *tokenBucket
-	presence *presence.Service
-	isMember MemberChecker
-	logger   *slog.Logger
+	limiter       *tokenBucket
+	collabLimiter *tokenBucket
+	presence      *presence.Service
+	isMember      MemberChecker
+	roomHandler   RoomHandler
+	logger        *slog.Logger
 }
 
 func NewClient(
@@ -88,6 +117,7 @@ func NewClient(
 	workspaceIDs []string,
 	presenceSvc *presence.Service,
 	isMember MemberChecker,
+	roomHandler RoomHandler,
 	logger *slog.Logger,
 ) *Client {
 	ctx, cancel := context.WithCancel(parent)
@@ -103,6 +133,7 @@ func NewClient(
 		workspaces[id] = true
 	}
 
+	now := time.Now()
 	return &Client{
 		hub:           hub,
 		conn:          conn,
@@ -113,9 +144,12 @@ func NewClient(
 		workspaces:    workspaces,
 		send:          make(chan []byte, sendBuffer),
 		subscriptions: make(map[string]bool),
-		limiter:       newTokenBucket(inboundRatePerSecond, inboundBurst, time.Now()),
+		rooms:         make(map[string]bool),
+		limiter:       newTokenBucket(inboundRatePerSecond, inboundBurst, now),
+		collabLimiter: newTokenBucket(collabRatePerSecond, collabBurst, now),
 		presence:      presenceSvc,
 		isMember:      isMember,
+		roomHandler:   roomHandler,
 		logger:        logger,
 	}
 }
@@ -155,23 +189,55 @@ func (c *Client) ReadPump() {
 			return
 		}
 
-		if !c.limiter.allow(time.Now()) {
-			c.sendError("RATE_LIMITED", "too many frames")
-			if c.strikes.Add(1) >= maxRateStrikes {
-				c.hub.kill(c, websocket.StatusPolicyViolation, "inbound rate limit exceeded")
+		// The frame is parsed before it is rate-limited because the budget
+		// depends on its class: a collaboration session legitimately sends far
+		// more frames than a chat client (see collabRatePerSecond). Parsing
+		// first is safe — the frame is already bounded by SetReadLimit — but a
+		// frame that does not parse is charged to the general bucket so an
+		// unparseable flood is still bounded.
+		var msg InboundMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			allowed, done := c.chargeInbound(c.limiter)
+			if done {
 				return
+			}
+			if allowed {
+				c.sendError("BAD_REQUEST", "invalid message format")
 			}
 			continue
 		}
 
-		var msg InboundMessage
-		if err := json.Unmarshal(data, &msg); err != nil {
-			c.sendError("BAD_REQUEST", "invalid message format")
+		limiter := c.limiter
+		if isCollabStreamType(msg.Type) {
+			limiter = c.collabLimiter
+		}
+		allowed, done := c.chargeInbound(limiter)
+		if done {
+			return
+		}
+		if !allowed {
 			continue
 		}
 
 		c.handleMessage(c.ctx, msg)
 	}
+}
+
+// chargeInbound spends one token from a frame's budget. It reports whether the
+// frame may be processed and whether the connection is finished — a client that
+// keeps overrunning its budget is disconnected rather than throttled forever,
+// because a permanently throttled socket is a client that silently misses
+// everything it tried to send.
+func (c *Client) chargeInbound(l *tokenBucket) (allowed, done bool) {
+	if l.allow(time.Now()) {
+		return true, false
+	}
+	c.sendError("RATE_LIMITED", "too many frames")
+	if c.strikes.Add(1) >= maxRateStrikes {
+		c.hub.kill(c, websocket.StatusPolicyViolation, "inbound rate limit exceeded")
+		return false, true
+	}
+	return false, false
 }
 
 func (c *Client) WritePump() {
@@ -225,6 +291,7 @@ func (c *Client) KeepAlive() {
 
 		case <-recheck.C:
 			c.recheckSubscriptions()
+			c.recheckRooms()
 		}
 	}
 }
@@ -416,6 +483,18 @@ func (c *Client) handleMessage(ctx context.Context, msg InboundMessage) {
 			"channel_id": channelID,
 			"reason":     ReasonClient,
 		})
+
+	case TypeCollabJoin:
+		c.handleCollabJoin(ctx, msg.Data)
+
+	case TypeCollabLeave:
+		c.handleCollabLeave(msg.Data)
+
+	case TypeCollabUpdate:
+		c.handleCollabUpdate(ctx, msg.Data)
+
+	case TypeCollabAwareness:
+		c.handleCollabAwareness(ctx, msg.Data)
 
 	case TypeTypingStart:
 		c.handleTyping(ctx, msg.Data, true)

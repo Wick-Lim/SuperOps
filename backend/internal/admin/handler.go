@@ -38,10 +38,14 @@ type Handler struct {
 	pool  *pgxpool.Pool
 	audit *audit.Service
 	authz *authz.Checker
+	mail  MailDeps
 }
 
-func NewHandler(pool *pgxpool.Pool, auditSvc *audit.Service, az *authz.Checker) *Handler {
-	return &Handler{pool: pool, audit: auditSvc, authz: az}
+// NewHandler wires the admin endpoints. A zero MailDeps disables outbound
+// email: invitations are still created and still return a usable URL, they are
+// simply not delivered.
+func NewHandler(pool *pgxpool.Pool, auditSvc *audit.Service, az *authz.Checker, mailDeps MailDeps) *Handler {
+	return &Handler{pool: pool, audit: auditSvc, authz: az, mail: mailDeps}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -51,6 +55,13 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("GET /api/v1/admin/audit-logs", authMw(http.HandlerFunc(h.AuditLogs)))
 	mux.Handle("POST /api/v1/admin/invitations", authMw(http.HandlerFunc(h.CreateInvitation)))
 	mux.Handle("GET /api/v1/admin/invitations", authMw(http.HandlerFunc(h.ListInvitations)))
+}
+
+// RegisterMailRoutes is separate from RegisterRoutes because this one route
+// needs a stricter middleware chain than the rest of /admin/*: it triggers
+// outbound mail, so the composition root wraps it in its own rate limiter.
+func (h *Handler) RegisterMailRoutes(mux *http.ServeMux, mw func(http.Handler) http.Handler) {
+	mux.Handle("POST /api/v1/admin/mail/test", mw(http.HandlerFunc(h.SendTestMail)))
 }
 
 // scope resolves the workspaces the caller administers. Every /admin/* query is
@@ -144,14 +155,33 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 			map[string]interface{}{"email": email, "role": input.Role})
 	}
 
-	// The token is shown exactly once: only its hash is stored.
+	// Delivery is best effort and deliberately after the commit. The invitation
+	// row is the source of truth: a mail queue that is down must not destroy an
+	// invitation that is otherwise perfectly usable.
+	acceptPath := "/invite/" + token
+	queued := h.queueInvitationMail(ctx, invitationMail{
+		InvitationID: inviteID,
+		WorkspaceID:  input.WorkspaceID,
+		InviterID:    actor,
+		Email:        email,
+		Role:         input.Role,
+		AcceptPath:   acceptPath,
+		ExpiresAt:    expiresAt,
+	})
+
+	// The token is shown exactly once: only its hash is stored. invite_url stays
+	// in the response even when the mail was queued — an admin still needs it
+	// when mail is disabled, when the address bounces, or when the recipient
+	// never finds the message.
 	httputil.JSON(w, http.StatusCreated, map[string]interface{}{
-		"id":           inviteID,
-		"invite_url":   "/invite/" + token,
-		"email":        email,
-		"role":         input.Role,
-		"workspace_id": input.WorkspaceID,
-		"expires_at":   expiresAt,
+		"id":              inviteID,
+		"invite_url":      acceptPath,
+		"email":           email,
+		"role":            input.Role,
+		"workspace_id":    input.WorkspaceID,
+		"expires_at":      expiresAt,
+		"email_queued":    queued,
+		"email_transport": h.mail.transportName(),
 	})
 }
 

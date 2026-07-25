@@ -24,14 +24,17 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/block"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
+	"github.com/Wick-Lim/SuperOps/backend/internal/collab"
 	"github.com/Wick-Lim/SuperOps/backend/internal/emoji"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
+	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ratelimit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/rbac"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
+	"github.com/Wick-Lim/SuperOps/backend/internal/sso"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/internal/webhook"
 	"github.com/Wick-Lim/SuperOps/backend/internal/workspace"
@@ -122,7 +125,11 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 
 	// Services
 	jwtMgr := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenTTL)
-	authService := auth.NewService(authRepo, userRepo, pool, jwtMgr, cfg.JWT.RefreshTokenTTL, auditService)
+	// WithAuthz is what lets password login, refresh and accept-invite consult
+	// SSO enforcement. Without it they behave exactly as they did before, which
+	// is correct for a deployment that has no SSO provider anywhere.
+	authService := auth.NewService(authRepo, userRepo, pool, jwtMgr, cfg.JWT.RefreshTokenTTL, auditService,
+		auth.WithAuthz(az))
 	presenceService := presence.NewService(redisClient)
 
 	// Search
@@ -155,13 +162,66 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		logger.Info("file uploads disabled by configuration")
 	}
 
+	// Single sign-on. Disabled without SSO_SECRET_KEY: a per-workspace OIDC
+	// client secret has to be sealed at rest, and without a key there is
+	// nothing to seal it with — so the feature refuses to construct rather than
+	// storing tenant credentials in the clear.
+	var ssoHandler *sso.Handler
+	if cfg.SSO.IsEnabled() {
+		key, err := sso.ParseSecretKey(cfg.SSO.SecretKey)
+		if err != nil {
+			// Already validated in LoadConfig; belt and braces, because App.New
+			// is also reachable from tests that build a Config by hand.
+			natsClient.Close()
+			redisClient.Close()
+			pool.Close()
+			return nil, fmt.Errorf("sso: %w", err)
+		}
+		ssoCfg := sso.Config{
+			SecretKey:           key,
+			AllowInsecureIssuer: cfg.SSO.AllowInsecureIssuer,
+			HTTPTimeout:         cfg.SSO.HTTPTimeout,
+			AuthRequestTTL:      cfg.SSO.AuthRequestTTL,
+			PendingTTL:          cfg.SSO.PendingTTL,
+			JWKSCacheTTL:        cfg.SSO.JWKSCacheTTL,
+			ClockSkew:           cfg.SSO.ClockSkew,
+		}
+		ssoRepo := sso.NewRepository(pool)
+		ssoService := sso.NewService(ssoRepo, sso.NewClient(ssoCfg), authService, auditService, ssoCfg, logger)
+		ssoHandler = sso.NewHandler(ssoService, az)
+		logger.Info("single sign-on enabled", "allow_insecure_issuer", cfg.SSO.AllowInsecureIssuer)
+		if cfg.SSO.AllowInsecureIssuer {
+			logger.Warn("SSO_ALLOW_INSECURE_ISSUER is on: a workspace admin can point an OIDC issuer at " +
+				"an http:// URL or a private/link-local address and have this process fetch it. " +
+				"Local test providers only")
+		}
+	} else {
+		logger.Info("single sign-on disabled: SSO_SECRET_KEY is not set")
+	}
+
 	// WebSocket Hub with NATS bridge for multi-replica support.
 	// - NATS bridge: relays client-originated ephemeral events (typing) between replicas.
 	// - Event relay: fans application domain events (message/reaction/notification) to local clients.
+	// - Room bridge: fans collaboration updates and revocations between replicas,
+	//   so two editors on different pods see each other's keystrokes.
 	hub := ws.NewHub(logger)
 	hub.StartNATSBridge(natsClient.Conn, logger)
 	hub.StartEventRelay(natsClient.Conn, logger)
+	hub.StartRoomBridge(natsClient.Conn, logger)
 	go hub.Run()
+
+	// Collaborative editing. No configuration: it needs Postgres and, for more
+	// than one replica, the NATS connection that already exists. The service is
+	// both the HTTP handler's backend and the WebSocket room handler, which is
+	// why it is built before wsHandler.
+	collabRepo := collab.NewRepository(pool)
+	collabSvc := collab.NewService(
+		collabRepo,
+		collab.NewWorkspaceAuthorizer(az),
+		hub,
+		logger,
+	)
+	collabHandler := collab.NewHandler(collabSvc)
 
 	// Handlers
 	authHandler := auth.NewHandler(authService)
@@ -202,6 +262,9 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		},
 		cfg.CORS.AllowedOrigins,
 		logger,
+		// Attaches the collaboration layer to the existing socket. Without it
+		// every collab.* frame is answered UNSUPPORTED.
+		ws.WithRoomHandler(collabSvc),
 	)
 	presenceHandler := presence.NewHandler(presenceService, az, pool)
 	var fileHandler *file.Handler
@@ -209,7 +272,45 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		fileHandler = file.NewHandler(fileStorage, pool, az)
 	}
 	notificationHandler := notification.NewHandler(notificationRepo)
-	adminHandler := admin.NewHandler(pool, auditService, az)
+
+	// Outbound mail. Both the sender and the renderer are constructed here, and
+	// a failure is fatal: the whole point of the configuration validation is
+	// that a mail misconfiguration must be a boot failure and not a user who
+	// silently never receives their invitation.
+	//
+	// The API holds a Sender as well as a Publisher even though it never sends
+	// invitations itself: the admin configuration test is synchronous, because
+	// an operator verifying their settings needs the transport's real error.
+	mailSender, err := NewMailSender(cfg, logger)
+	if err != nil {
+		natsClient.Close()
+		redisClient.Close()
+		pool.Close()
+		return nil, fmt.Errorf("mail: %w", err)
+	}
+	mailRenderer, err := NewMailRenderer(cfg)
+	if err != nil {
+		natsClient.Close()
+		redisClient.Close()
+		pool.Close()
+		return nil, fmt.Errorf("mail: %w", err)
+	}
+	logger.Info("outbound mail configured",
+		"transport", mailSender.Name(),
+		"from", cfg.Mail.From,
+		"public_base_url", mailRenderer.BaseURL())
+	if cfg.Mail.Transport == mail.TransportLog {
+		logger.Warn("MAIL_TRANSPORT is 'log': invitations are written to this log instead of being delivered. " +
+			"Set MAIL_TRANSPORT (smtp / smtp-direct / resend) to send real email")
+	}
+
+	adminHandler := admin.NewHandler(pool, auditService, az, admin.MailDeps{
+		Publisher: mail.NewPublisher(natsClient, logger),
+		Renderer:  mailRenderer,
+		Sender:    mailSender,
+		Secrets:   []string{cfg.Mail.SMTP.Password, cfg.Mail.Resend.APIKey},
+		Logger:    logger,
+	})
 	var searchHandler *search.Handler
 	if searchService != nil {
 		searchHandler = search.NewHandler(searchService, az)
@@ -274,6 +375,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 
 	// Auth routes (no auth middleware; login/refresh/accept-invite are rate-limited)
 	authHandler.RegisterRoutes(mux, loginLimiter)
+	if ssoHandler != nil {
+		// The same per-IP budget the password endpoints get: every one of these
+		// either triggers an outbound request to a provider or accepts a
+		// guessable single-use token.
+		ssoHandler.RegisterRoutes(mux, loginLimiter)
+	}
 
 	// Auth middleware
 	authMw := auth.Middleware(jwtMgr)
@@ -293,7 +400,13 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		logger.Info("push notifications disabled by configuration (PUSH_ENABLED)")
 	}
 	workspaceHandler.RegisterRoutes(mux, authMw)
+	if ssoHandler != nil {
+		// Per-workspace provider administration; the handler re-checks that the
+		// caller administers the workspace in the path.
+		ssoHandler.RegisterProtectedRoutes(mux, authMw)
+	}
 	channelHandler.RegisterRoutes(mux, authMw)
+	collabHandler.RegisterRoutes(mux, authMw)
 	presenceHandler.RegisterRoutes(mux, authMw)
 	if fileHandler != nil {
 		fileHandler.RegisterRoutes(mux, authMw)
@@ -306,6 +419,21 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		return authMw(rbac.RequireAnyWorkspaceAdmin(az)(next))
 	}
 	adminHandler.RegisterRoutes(mux, adminMw)
+	// The mail configuration test gets its own chain. It is an outbound-mail
+	// trigger, so it carries a much lower per-IP budget than the general API
+	// limit — which at 600/min would let one admin account emit ten test
+	// messages a second.
+	adminHandler.RegisterMailRoutes(mux, func(next http.Handler) http.Handler {
+		if !cfg.RateLimit.Enabled {
+			return adminMw(next)
+		}
+		return ratelimit.MiddlewareByIP(redisClient, ratelimit.Config{
+			RequestsPerMinute: cfg.Mail.TestPerMinute,
+			Window:            time.Minute,
+			TrustProxy:        cfg.RateLimit.TrustProxy,
+			TrustedProxyHops:  cfg.RateLimit.TrustedProxyHops,
+		})(adminMw(next))
+	})
 	if searchHandler != nil {
 		searchHandler.RegisterRoutes(mux, authMw)
 	}

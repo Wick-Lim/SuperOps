@@ -285,6 +285,72 @@ func (c *Checker) ReadableChannelIDs(ctx context.Context, workspaceID, userID st
 }
 
 // ---------------------------------------------------------------------------
+// Single sign-on enforcement
+// ---------------------------------------------------------------------------
+
+// PasswordLoginAllowed reports whether a user may still authenticate with a
+// password.
+//
+// It lives here, and not in internal/sso, because it is a membership-and-role
+// decision: a session is global while enforcement is per-workspace, so "may
+// this person use a password" is answered by looking at every workspace they
+// belong to and at their role in each. Exactly the class of query this package
+// exists to keep out of handlers.
+//
+// The role clause is the lockout escape hatch. sso_providers.
+// allow_owner_password_login (default true) keeps a workspace owner able to
+// sign in with a password even under enforcement, so an IdP that breaks after
+// the switch was flipped still leaves somebody able to reach the switch.
+//
+// Fails closed by construction: the caller treats an error as a 500, so a
+// database fault refuses the login rather than allowing it.
+func (c *Checker) PasswordLoginAllowed(ctx context.Context, userID string) (bool, error) {
+	if userID == "" {
+		return false, nil
+	}
+	var blocked bool
+	err := c.pool.QueryRow(ctx,
+		`SELECT EXISTS(
+		    SELECT 1
+		      FROM workspace_members wm
+		      JOIN sso_providers p ON p.workspace_id = wm.workspace_id
+		     WHERE wm.user_id = $1
+		       AND p.enabled
+		       AND p.enforced
+		       AND NOT (p.allow_owner_password_login AND wm.role = 'owner')
+		 )`,
+		userID,
+	).Scan(&blocked)
+	if err != nil {
+		return false, fmt.Errorf("check sso enforcement: %w", err)
+	}
+	return !blocked, nil
+}
+
+// SSOEnforced reports whether a workspace requires single sign-on.
+//
+// Used by invitation acceptance: joining an enforced workspace by password
+// would mint a session that PasswordLoginAllowed then refuses to refresh, so
+// the invite is refused up front instead — before it is consumed.
+func (c *Checker) SSOEnforced(ctx context.Context, workspaceID string) (bool, error) {
+	if workspaceID == "" {
+		return false, nil
+	}
+	var enforced bool
+	err := c.pool.QueryRow(ctx,
+		`SELECT EXISTS(
+		    SELECT 1 FROM sso_providers
+		     WHERE workspace_id = $1 AND enabled AND enforced
+		 )`,
+		workspaceID,
+	).Scan(&enforced)
+	if err != nil {
+		return false, fmt.Errorf("check workspace sso enforcement: %w", err)
+	}
+	return enforced, nil
+}
+
+// ---------------------------------------------------------------------------
 // Blocks
 // ---------------------------------------------------------------------------
 

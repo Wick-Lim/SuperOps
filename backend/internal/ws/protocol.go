@@ -48,7 +48,32 @@ const (
 	TypeTypingStart = "typing.start"
 	TypeTypingStop  = "typing.stop"
 	TypePresence    = "presence.update"
+
+	// Collaboration. collab.update and collab.awareness are also outbound
+	// types: an update is relayed to the room verbatim under the same name,
+	// which is what lets a client use one apply path for its own echo and for
+	// everyone else's.
+	TypeCollabJoin      = "collab.join"
+	TypeCollabLeave     = "collab.leave"
+	TypeCollabUpdate    = "collab.update"
+	TypeCollabAwareness = "collab.awareness"
 )
+
+// isCollabStreamType reports whether an inbound frame is part of the continuous
+// editing stream, which is charged to the larger collaboration budget.
+//
+// collab.join and collab.leave are deliberately absent: a join costs two
+// Postgres queries — more than a subscribe — and happens once per document per
+// session, so it belongs on the general budget with everything else that hits
+// the database. Only the two frames a person generates by typing get the higher
+// rate.
+func isCollabStreamType(t string) bool {
+	switch t {
+	case TypeCollabUpdate, TypeCollabAwareness:
+		return true
+	}
+	return false
+}
 
 // Outbound types
 const (
@@ -70,6 +95,13 @@ const (
 	TypeNotificationNew = "notification.new"
 	TypeUnreadUpdate    = "unread.update"
 	TypeError           = "error"
+
+	TypeCollabJoined = "collab.joined"
+	TypeCollabLeft   = "collab.left"
+	// TypeCollabCompact asks one client in the room to produce a snapshot of
+	// the document and POST it back, because the server cannot merge CRDT
+	// state itself.
+	TypeCollabCompact = "collab.compact"
 )
 
 // Reasons carried by an "unsubscribed" frame.
@@ -88,4 +120,24 @@ type TypingData = SubscribeData
 
 type PresenceData struct {
 	Status string `json:"status"`
+}
+
+// CollabDocumentData is the payload of collab.join and collab.leave.
+type CollabDocumentData struct {
+	DocumentID string `json:"document_id"`
+}
+
+// CollabUpdateData carries one opaque CRDT update. encoding/json renders a
+// []byte as a base64 string, which is the wire form the Yjs client sends and
+// the only reason the payload can ride a JSON frame at all.
+type CollabUpdateData struct {
+	DocumentID string `json:"document_id"`
+	Update     []byte `json:"update"`
+}
+
+// CollabAwarenessData carries one awareness (cursor/selection/presence) state.
+// It is relayed and never stored.
+type CollabAwarenessData struct {
+	DocumentID string `json:"document_id"`
+	State      []byte `json:"state"`
 }

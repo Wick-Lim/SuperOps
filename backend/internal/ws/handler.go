@@ -25,13 +25,32 @@ type MemberChecker func(ctx context.Context, channelID, userID string) (bool, er
 type WorkspaceLister func(ctx context.Context, userID string) ([]string, error)
 
 type WSHandler struct {
-	hub        *Hub
-	jwtMgr     *auth.JWTManager
-	presence   *presence.Service
-	isMember   MemberChecker
-	workspaces WorkspaceLister
-	acceptOpts *websocket.AcceptOptions
-	logger     *slog.Logger
+	hub         *Hub
+	jwtMgr      *auth.JWTManager
+	presence    *presence.Service
+	isMember    MemberChecker
+	workspaces  WorkspaceLister
+	roomHandler RoomHandler
+	acceptOpts  *websocket.AcceptOptions
+	logger      *slog.Logger
+}
+
+// Option configures an optional capability of the socket. It is a variadic
+// option rather than another positional parameter because the collaboration
+// layer is genuinely optional — a deployment can run every existing feature
+// without it — and because the composition root should not have to name a
+// dependency it has not wired.
+type Option func(*WSHandler)
+
+// WithRoomHandler attaches the collaboration layer. Without it the collab.*
+// frames are answered with UNSUPPORTED rather than ignored: an editor should be
+// told the server cannot do this, not left looking at a network fault.
+//
+// It must be passed at construction. The field is read from every read pump
+// with no synchronisation, which is sound only because it is never written
+// after the handler is registered.
+func WithRoomHandler(rh RoomHandler) Option {
+	return func(h *WSHandler) { h.roomHandler = rh }
 }
 
 func NewWSHandler(
@@ -42,8 +61,9 @@ func NewWSHandler(
 	workspaces WorkspaceLister,
 	allowedOrigins []string,
 	logger *slog.Logger,
+	opts ...Option,
 ) *WSHandler {
-	return &WSHandler{
+	h := &WSHandler{
 		hub:        hub,
 		jwtMgr:     jwtMgr,
 		presence:   presenceSvc,
@@ -52,6 +72,10 @@ func NewWSHandler(
 		acceptOpts: acceptOptions(allowedOrigins, logger),
 		logger:     logger,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // acceptOptions turns the CORS allowlist into WebSocket origin patterns. The
@@ -114,7 +138,7 @@ func (h *WSHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := NewClient(r.Context(), h.hub, conn, claims.UserID, workspaceIDs, h.presence, h.isMember, h.logger)
+	client := NewClient(r.Context(), h.hub, conn, claims.UserID, workspaceIDs, h.presence, h.isMember, h.roomHandler, h.logger)
 	defer client.close(websocket.StatusNormalClosure, "")
 
 	select {

@@ -1,0 +1,15 @@
+Outbound mail works.
+
+This message was sent by {{.Data.RequestedBy}} from the {{.Product}} admin API
+to verify the mail configuration of {{.BaseURL}}.
+
+  Transport: {{.Data.Transport}}
+  Sent at:   {{.Data.SentAt.UTC.Format "2 January 2006 at 15:04:05 UTC"}}
+
+Receiving this message proves the transport accepted the message for delivery.
+It does not prove anything about deliverability to other domains: SPF, DKIM and
+DMARC alignment, plus the sending IP's reputation, decide whether real
+recipients see mail in the inbox or in the spam folder.
+
+--
+This is an automated message from {{.Product}} at {{.BaseURL}}. Please do not reply to it.

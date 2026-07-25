@@ -1,0 +1,18 @@
+{{template "layout" .}}
+{{define "content" -}}
+<p style="margin:0 0 16px;"><strong>Outbound mail works.</strong></p>
+<p style="margin:0 0 16px;">
+This message was sent by {{.Data.RequestedBy}} from the {{.Product}} admin API to
+verify the mail configuration of <a href="{{.BaseURL}}" style="color:#1264a3;">{{.BaseURL}}</a>.
+</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 16px;font-size:13px;color:#1d1c1d;">
+<tr><td style="padding:2px 12px 2px 0;color:#616061;">Transport</td><td style="padding:2px 0;"><code>{{.Data.Transport}}</code></td></tr>
+<tr><td style="padding:2px 12px 2px 0;color:#616061;">Sent at</td><td style="padding:2px 0;"><code>{{.Data.SentAt.UTC.Format "2 January 2006 at 15:04:05 UTC"}}</code></td></tr>
+</table>
+<p style="margin:0;color:#616061;font-size:13px;">
+Receiving this message proves the transport accepted it for delivery. It does not
+prove anything about deliverability to other domains: SPF, DKIM and DMARC
+alignment, plus the sending IP's reputation, decide whether real recipients see
+mail in the inbox or in the spam folder.
+</p>
+{{- end}}

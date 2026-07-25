@@ -32,6 +32,9 @@ var authErrorResponses = []struct {
 	{ErrInvalidTOTPCode, http.StatusUnauthorized, "INVALID_TOTP_CODE", ""},
 	{ErrInvalidRefreshToken, http.StatusUnauthorized, "UNAUTHORIZED", ""},
 	{ErrReauthRequired, http.StatusUnauthorized, "REAUTH_REQUIRED", ""},
+	// 403 rather than 401: the credentials were right, the method is not
+	// allowed. A client that retries the same password on a 401 would loop.
+	{ErrSSORequired, http.StatusForbidden, "SSO_REQUIRED", ""},
 	{ErrInviteWrongAccount, http.StatusForbidden, "INVITE_WRONG_ACCOUNT", ""},
 	{ErrUsernameTaken, http.StatusConflict, "USERNAME_TAKEN", ""},
 	{ErrCurrentPassword, http.StatusBadRequest, "INVALID_PASSWORD", ""},

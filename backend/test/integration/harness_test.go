@@ -39,6 +39,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/app"
+	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/logger"
 )
@@ -157,6 +158,19 @@ func buildConfig() *app.Config {
 	cfg.MinIO.Bucket = env("MINIO_BUCKET", "superops")
 	cfg.Meili.Host = env("MEILI_HOST", "http://localhost:7700")
 	cfg.Meili.MasterKey = env("MEILI_MASTER_KEY", "changeme_meili_master_key")
+	// Mail. This literal never goes through LoadConfig, so nothing here has a
+	// default: an unset PublicBaseURL fails NewMailRenderer and takes app.New
+	// with it. The log transport is what a fresh deployment gets, and it is what
+	// the suite exercises — the queue publish is the part that is worth
+	// integrating, not the relay conversation (internal/mail tests that against
+	// a real listener).
+	cfg.Mail.Transport = mail.TransportLog
+	cfg.Mail.From = "no-reply@superops.test"
+	cfg.Mail.FromName = "SuperOps"
+	cfg.Mail.PublicBaseURL = env("PUBLIC_BASE_URL", "http://127.0.0.1:8080")
+	cfg.Mail.ProductName = "SuperOps"
+	cfg.Mail.Timeout = 30 * time.Second
+	cfg.Mail.TestPerMinute = 60
 	cfg.Admin.Email = adminEmail
 	cfg.Admin.Password = adminPass
 	cfg.Admin.Username = "admin"

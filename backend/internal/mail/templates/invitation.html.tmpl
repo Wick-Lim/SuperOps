@@ -1,0 +1,22 @@
+{{template "layout" .}}
+{{define "content" -}}
+<p style="margin:0 0 16px;">
+<strong>{{.Data.InviterName}}</strong> has invited you to join the
+<strong>{{.Data.WorkspaceName}}</strong> workspace on {{.Product}} as a {{.Data.Role}}.
+</p>
+<p style="margin:0 0 24px;">
+<a href="{{.URL .Data.AcceptPath}}" style="display:inline-block;padding:11px 20px;background:#1264a3;color:#ffffff;text-decoration:none;border-radius:4px;font-weight:600;">Accept the invitation</a>
+</p>
+<p style="margin:0 0 16px;color:#616061;font-size:13px;">
+Or paste this link into your browser:<br>
+<a href="{{.URL .Data.AcceptPath}}" style="color:#1264a3;word-break:break-all;">{{.URL .Data.AcceptPath}}</a>
+</p>
+<p style="margin:0 0 8px;color:#616061;font-size:13px;">
+The link works once and expires on {{.Data.ExpiresAt.UTC.Format "2 January 2006 at 15:04 UTC"}}.
+If it has already expired, ask {{.Data.InviterName}} to send a new one.
+</p>
+<p style="margin:0;color:#616061;font-size:13px;">
+If you were not expecting this invitation you can ignore this message; nothing is
+created until the link is opened.
+</p>
+{{- end}}

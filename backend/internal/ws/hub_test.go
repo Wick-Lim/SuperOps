@@ -18,7 +18,7 @@ func testLogger() *slog.Logger {
 // newTestClient builds a Client with no underlying socket. Nothing the hub does
 // touches the connection; only the pumps and close() do.
 func newTestClient(hub *Hub, userID string, workspaceIDs ...string) *Client {
-	return NewClient(context.Background(), hub, nil, userID, workspaceIDs, nil, nil, testLogger())
+	return NewClient(context.Background(), hub, nil, userID, workspaceIDs, nil, nil, nil, testLogger())
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {

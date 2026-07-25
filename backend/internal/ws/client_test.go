@@ -173,7 +173,7 @@ func TestHandleMessage(t *testing.T) {
 				func(context.Context, string, string) (bool, error) {
 					checked = true
 					return tt.member, tt.memberErr
-				}, testLogger())
+				}, nil, testLogger())
 			if tt.subscribed {
 				c.Subscribe(testChannelID)
 			}
@@ -212,7 +212,7 @@ func TestHandleMessage(t *testing.T) {
 // not mean "everyone is a member".
 func TestMissingMemberCheckerFailsClosed(t *testing.T) {
 	hub := NewHub(testLogger())
-	c := NewClient(context.Background(), hub, nil, "u1", nil, nil, nil, testLogger())
+	c := NewClient(context.Background(), hub, nil, "u1", nil, nil, nil, nil, testLogger())
 
 	c.handleMessage(context.Background(), inbound(t, TypeSubscribe, SubscribeData{ChannelID: testChannelID}))
 

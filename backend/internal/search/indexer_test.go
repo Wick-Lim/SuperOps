@@ -78,9 +78,72 @@ func TestHandleMessagePermanentFailures(t *testing.T) {
 // Events the indexer has no opinion about are a clean ack, not a failure: the
 // consumer's filter is superops.*.message.* and carries more than these three.
 func TestHandleMessageIgnoresOtherEventTypes(t *testing.T) {
-	for _, typ := range []string{"message.pinned", "reaction.added", ""} {
+	for _, typ := range []string{"message.pinned", "reaction.added", "file.uploaded", ""} {
 		body := `{"type":"` + typ + `","data":{}}`
 		if err := testIndexer().HandleMessage(context.Background(), msg("superops."+wsA+".message.created", body)); err != nil {
+			t.Fatalf("type %q: %v", typ, err)
+		}
+	}
+}
+
+// A message with no channel has no access key, so it could never be found
+// again. The old code indexed it anyway; now the event is terminated.
+func TestHandleMessageWithoutAChannelIsPermanent(t *testing.T) {
+	body := `{"type":"message.new","data":{"id":"` + chB + `","created_at":"2026-07-25T10:00:00Z"}}`
+	err := testIndexer().HandleMessage(context.Background(), msg("superops."+wsA+".message.created", body))
+	if err == nil || !isPermanent(err) {
+		t.Fatalf("err = %v, want a permanent error", err)
+	}
+}
+
+// The file handler is the same contract as the message one; the cases that
+// decide the ack must be decided from the payload, before Meilisearch.
+func TestHandleFilePermanentFailures(t *testing.T) {
+	const subject = "superops." + wsA + ".file.uploaded"
+
+	tests := []struct {
+		name    string
+		subject string
+		data    string
+	}{
+		{"envelope is not json", subject, `{`},
+		{"payload is not json", subject, `{"type":"file.uploaded","data":42}`},
+		{"no file id", subject, `{"type":"file.uploaded","data":{"name":"x.pdf"}}`},
+		{
+			"subject has no workspace id",
+			"superops",
+			`{"type":"file.uploaded","data":{"id":"` + fil + `","user_id":"` + usr + `","created_at":"2026-07-25T10:00:00Z"}}`,
+		},
+		{
+			"created_at is unusable",
+			subject,
+			`{"type":"file.uploaded","data":{"id":"` + fil + `","user_id":"` + usr + `","created_at":"yesterday"}}`,
+		},
+		{
+			// No channel and no uploader means no access key at all.
+			"neither a channel nor an uploader",
+			subject,
+			`{"type":"file.uploaded","data":{"id":"` + fil + `","created_at":"2026-07-25T10:00:00Z"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := testIndexer().HandleFile(context.Background(), msg(tt.subject, tt.data))
+			if err == nil {
+				t.Fatal("expected an error, got nil (the event would have been acked and lost)")
+			}
+			if !isPermanent(err) {
+				t.Fatalf("error %v is retryable; a permanently bad event must be terminated", err)
+			}
+		})
+	}
+}
+
+func TestHandleFileIgnoresOtherEventTypes(t *testing.T) {
+	for _, typ := range []string{"file.downloaded", "message.new", ""} {
+		body := `{"type":"` + typ + `","data":{}}`
+		if err := testIndexer().HandleFile(context.Background(), msg("superops."+wsA+".file.uploaded", body)); err != nil {
 			t.Fatalf("type %q: %v", typ, err)
 		}
 	}
@@ -125,19 +188,30 @@ func TestSettingsComparison(t *testing.T) {
 	}
 }
 
-// The filter that enforces channel visibility can only be evaluated if every
-// attribute it names is filterable.
+// The filter that enforces object visibility can only be evaluated if every
+// attribute it names is filterable — Meilisearch 400s on the rest, which would
+// take search down rather than widen it, but down is not much better.
 func TestFilterableAttributesCoverTheAuthorizationFilter(t *testing.T) {
-	filter, ok := buildFilter(Query{WorkspaceID: wsA, ChannelIDs: []string{chA}, FromUserID: usr})
+	filter, ok := buildFilter(Query{
+		WorkspaceID: wsA,
+		Keys:        keysFor(chA),
+		Types:       []ObjectType{TypeMessage},
+		ChannelID:   chA,
+		FromUserID:  usr,
+	})
 	if !ok {
 		t.Fatal("expected a filter")
 	}
-	for _, attr := range []string{"workspace_id", "channel_id", "user_id", "is_deleted"} {
+	for _, attr := range []string{"acl", "type", "workspace_id", "channel_id", "user_id", "is_deleted"} {
 		if !contains(wantFilterable, attr) {
 			t.Errorf("filter %q uses %s, which is not in wantFilterable", filter, attr)
 		}
 	}
 	if !contains(wantSortable, "created_at") {
 		t.Error("search sorts on created_at, which must be sortable")
+	}
+	// Titles are searchable and ranked ahead of bodies; a file has nothing else.
+	if !sameSequence(wantSearchable, []string{"title", "content"}) {
+		t.Errorf("wantSearchable = %v", wantSearchable)
 	}
 }

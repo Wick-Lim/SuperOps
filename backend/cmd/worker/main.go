@@ -45,6 +45,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
+	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/push"
@@ -232,6 +233,27 @@ func run() int {
 	// creation and a deletion move the badge.
 	unreadFanout := channel.NewUnreadFanout(channel.NewRepository(pool), natsClient, l)
 	bind(durableSpec{durable: "unread-fanout", filter: "superops.*.message.*", handle: unreadFanout.HandleMessage})
+
+	// Outbound mail. The API renders a message and publishes it durably; this
+	// consumer is what actually talks to a relay, so a provider outage becomes
+	// redelivery here instead of a failed HTTP request there.
+	//
+	// The transport is built from the same config helper the API uses, so the
+	// admin configuration test cannot verify one transport while a different one
+	// sends. A failure is fatal for the same reason the stream is: a worker that
+	// looks healthy while silently sending no invitations is worse than one that
+	// refuses to start.
+	mailSender, err := app.NewMailSender(cfg, l)
+	if err != nil {
+		l.Error("mail transport unavailable; refusing to start with a queue nothing will drain", "error", err)
+		return 1
+	}
+	bind(durableSpec{
+		durable: mail.ConsumerDurable,
+		filter:  mail.ConsumerFilter,
+		handle:  mail.NewConsumer(mailSender, l).HandleRequest,
+	})
+	l.Info("outbound mail consumer ready", "transport", mailSender.Name())
 
 	// --- periodic jobs -------------------------------------------------------
 

@@ -41,10 +41,105 @@ data:
   EXPO_PUSH_ENDPOINT: {{ $push.endpoint | quote }}
   {{- end }}
   {{- end }}
+  {{- /*
+  Outbound email. The transport is a property of the deployment, not of the
+  code: on a cloud provider outbound port 25 is blocked (AWS, GCP, Azure, DO and
+  most VPS hosts), so `smtp` through a provider is the only option; on-premises
+  `smtp-direct` can deliver to the recipient's MX itself.
+
+  `smtp` covers SES, Postmark, SendGrid, Mailgun, Resend and a corporate relay —
+  all of them expose authenticated SMTP, and only the host and credentials
+  change. `resend` exists for hosts where even 587/465 are blocked outbound.
+
+  Secrets (SMTP password, Resend API key, DKIM private key) are in the Secret
+  template, never here. `default dict` so a values file predating this block
+  still renders.
+  */ -}}
+  {{- $mail := .Values.mail | default dict }}
+  {{- $transport := $mail.transport | default "log" }}
+  MAIL_TRANSPORT: {{ $transport | quote }}
+  MAIL_TIMEOUT: {{ $mail.timeout | default "30s" | quote }}
+  MAIL_TEST_PER_MIN: {{ $mail.testPerMinute | default 3 | toString | quote }}
+  PRODUCT_NAME: {{ $mail.productName | default "SuperOps" | quote }}
+  {{- /*
+  Every link in every message is built from PUBLIC_BASE_URL. The backend rejects
+  a loopback value for any sending transport, so `required` here turns "nobody
+  can open the invitation link" into a render-time error instead of a batch of
+  useless invitations.
+  */}}
+  {{- if eq $transport "log" }}
+  PUBLIC_BASE_URL: {{ $mail.publicBaseURL | default "http://localhost:8080" | quote }}
+  {{- else }}
+  PUBLIC_BASE_URL: {{ required "mail.publicBaseURL is required once mail.transport sends real email — it is what every link in every message is built from" $mail.publicBaseURL | quote }}
+  MAIL_FROM: {{ required "mail.from is required once mail.transport sends real email" $mail.from | quote }}
+  MAIL_FROM_NAME: {{ $mail.fromName | default "SuperOps" | quote }}
+  {{- end }}
+  {{- if eq $transport "smtp" }}
+  {{- $smtp := $mail.smtp | default dict }}
+  MAIL_SMTP_HOST: {{ required "mail.smtp.host is required when mail.transport is \"smtp\"" $smtp.host | quote }}
+  MAIL_SMTP_PORT: {{ $smtp.port | default 587 | toString | quote }}
+  MAIL_SMTP_TLS: {{ $smtp.tls | default "starttls" | quote }}
+  MAIL_SMTP_ALLOW_INSECURE_AUTH: {{ $smtp.allowInsecureAuth | default false | toString | quote }}
+  MAIL_SMTP_INSECURE_SKIP_VERIFY: {{ $smtp.insecureSkipVerify | default false | toString | quote }}
+  {{- if $smtp.username }}
+  MAIL_SMTP_USERNAME: {{ $smtp.username | quote }}
+  {{- end }}
+  {{- if $smtp.helo }}
+  MAIL_SMTP_HELO: {{ $smtp.helo | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if eq $transport "smtp-direct" }}
+  {{- $direct := $mail.direct | default dict }}
+  {{- /* Receiving MTAs check the EHLO name against the connecting IP's PTR
+  record, so this is load-bearing rather than cosmetic. */}}
+  MAIL_DIRECT_HELO: {{ required "mail.direct.helo is required when mail.transport is \"smtp-direct\" — it must be this cluster's public FQDN, which receiving MTAs check against the sending IP's PTR record" $direct.helo | quote }}
+  MAIL_DIRECT_PORT: {{ $direct.port | default 25 | toString | quote }}
+  {{- $dkim := $direct.dkim | default dict }}
+  {{- if and $dkim.domain $dkim.selector }}
+  MAIL_DKIM_DOMAIN: {{ $dkim.domain | quote }}
+  MAIL_DKIM_SELECTOR: {{ $dkim.selector | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if and (eq $transport "resend") ((.Values.mail | default dict).resend | default dict).endpoint }}
+  MAIL_RESEND_ENDPOINT: {{ .Values.mail.resend.endpoint | quote }}
+  {{- end }}
+  {{- /*
+  Single sign-on (OIDC). sso.secretKey is the on/off switch and lives in the
+  Secret template, never here: it decrypts every tenant's stored OIDC client
+  secret, and a ConfigMap is readable by anything with get/list on the
+  namespace. Only the non-secret tuning half is emitted here, and only when the
+  feature is on — the same shape as the push block. `default dict` so a values
+  file predating this block still renders.
+  */ -}}
+  {{- $sso := .Values.sso | default dict }}
+  {{- if or (hasKey (.Values.backend.env | default dict) "SSO_SECRET_KEY") (hasKey (.Values.backend.extraEnv | default dict) "SSO_SECRET_KEY") }}
+  {{- fail "SSO_SECRET_KEY must be given as sso.secretKey, which renders into the release Secret. backend.env / backend.extraEnv render into this ConfigMap, and SSO_SECRET_KEY decrypts every workspace's stored OIDC client secret" }}
+  {{- end }}
+  {{- if $sso.secretKey }}
+  {{- /* The issuer URL is supplied by a workspace administrator, i.e. a tenant.
+  With this on, the backend drops both the https requirement and the dial-time
+  private-address guard, so any workspace admin can point an issuer at
+  169.254.169.254 and read the node's metadata service through the API. The
+  backend refuses to boot with it on unless PUBLIC_BASE_URL is a loopback
+  address. */}}
+  SSO_ALLOW_INSECURE_ISSUER: {{ $sso.allowInsecureIssuer | default false | toString | quote }}
+  SSO_HTTP_TIMEOUT: {{ $sso.httpTimeout | default "10s" | quote }}
+  SSO_AUTH_REQUEST_TTL: {{ $sso.authRequestTTL | default "10m" | quote }}
+  SSO_PENDING_TTL: {{ $sso.pendingTTL | default "5m" | quote }}
+  SSO_JWKS_CACHE_TTL: {{ $sso.jwksCacheTTL | default "1h" | quote }}
+  SSO_CLOCK_SKEW: {{ $sso.clockSkew | default "2m" | quote }}
+  {{- end }}
   {{- range $k, $v := .Values.backend.env }}
   {{- /* Keys this template emits itself; a passthrough copy would be a
-  duplicate map key in the rendered ConfigMap. Use `push.*` for these. */}}
-  {{- if not (has $k (list "DB_SSLMODE" "MINIO_USE_SSL" "PUSH_ENABLED" "PUSH_TIMEOUT" "EXPO_PUSH_ENDPOINT")) }}
+  duplicate map key in the rendered ConfigMap. Use `push.*` / `mail.*` for
+  these. */}}
+  {{- if not (has $k (list "DB_SSLMODE" "MINIO_USE_SSL" "PUSH_ENABLED" "PUSH_TIMEOUT" "EXPO_PUSH_ENDPOINT"
+      "MAIL_TRANSPORT" "MAIL_TIMEOUT" "MAIL_TEST_PER_MIN" "PRODUCT_NAME" "PUBLIC_BASE_URL" "MAIL_FROM" "MAIL_FROM_NAME"
+      "MAIL_SMTP_HOST" "MAIL_SMTP_PORT" "MAIL_SMTP_TLS" "MAIL_SMTP_ALLOW_INSECURE_AUTH" "MAIL_SMTP_INSECURE_SKIP_VERIFY"
+      "MAIL_SMTP_USERNAME" "MAIL_SMTP_HELO" "MAIL_DIRECT_HELO" "MAIL_DIRECT_PORT" "MAIL_DKIM_DOMAIN" "MAIL_DKIM_SELECTOR"
+      "MAIL_RESEND_ENDPOINT"
+      "SSO_ALLOW_INSECURE_ISSUER" "SSO_HTTP_TIMEOUT" "SSO_AUTH_REQUEST_TTL" "SSO_PENDING_TTL" "SSO_JWKS_CACHE_TTL"
+      "SSO_CLOCK_SKEW")) }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}
   {{- end }}

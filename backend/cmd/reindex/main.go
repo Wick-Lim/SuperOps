@@ -1,4 +1,4 @@
-// Command reindex rebuilds the Meilisearch message index from Postgres.
+// Command reindex rebuilds the Meilisearch object index from Postgres.
 //
 // Nothing else in the tree can do this. The index is only ever written
 // incrementally, by the worker's JetStream consumer reacting to live events, so
@@ -8,21 +8,42 @@
 //
 // Usage:
 //
-//	reindex [-batch 500] [-workspace <uuid>] [-dry-run]
+//	reindex [-type all|message|file] [-batch 500] [-workspace <uuid>] [-dry-run]
+//	reindex -prune-legacy
 //
 // It reads the same MEILI_HOST / MEILI_MASTER_KEY / SEARCH_ENABLED configuration
-// as the server, walks messages in keyset order, and is safe to re-run: indexing
-// a document that already exists is an upsert on the primary key.
+// as the server, walks each object type in keyset order, and is safe to re-run:
+// indexing a document that already exists is an upsert on the primary key.
+//
+// # Migrating a deployment that predates typed objects
+//
+// The old index (`messages`, primary key `id`) cannot be converted in place —
+// Meilisearch will not change the primary key of a non-empty index — so the new
+// shape lives in `objects` and the old index is left alone until it is dropped
+// explicitly:
+//
+//	# 1. before deploying the new API/worker: fill the new index. Nothing reads
+//	#    it yet, so this is invisible to users and interruptible.
+//	reindex
+//	# 2. deploy the new API and worker.
+//	# 3. backfill the gap: anything written between (1) and (2) landed in the
+//	#    old index only. Upserts, so this is cheap.
+//	reindex
+//	# 4. when search looks right, reclaim the disk. Opt-in and separate, so a
+//	#    rollback in (2) or (3) still has an index to roll back to.
+//	reindex -prune-legacy
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,11 +60,19 @@ func main() { os.Exit(run()) }
 func run() int {
 	batch := flag.Int("batch", 500, "rows fetched per page")
 	workspace := flag.String("workspace", "", "restrict the rebuild to one workspace id")
+	typeName := flag.String("type", "all", "object type to rebuild: all, "+strings.Join(sourceNames(), ", "))
 	dryRun := flag.Bool("dry-run", false, "count what would be indexed without writing to Meilisearch")
+	pruneLegacy := flag.Bool("prune-legacy", false, "delete the pre-generalization `messages` index and exit")
 	flag.Parse()
 
 	if *batch < 1 || *batch > 10000 {
 		log.Print("-batch must be between 1 and 10000")
+		return 2
+	}
+
+	selected, err := selectSources(*typeName)
+	if err != nil {
+		log.Print(err)
 		return 2
 	}
 
@@ -63,6 +92,10 @@ func run() int {
 	// index with no indication of where it stopped.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	if *pruneLegacy {
+		return prune(ctx, cfg, l, *dryRun)
+	}
 
 	pool, err := database.NewPool(ctx, database.Config{
 		DSN:      cfg.DB.DSN(),
@@ -85,25 +118,85 @@ func run() int {
 		}
 	}
 
-	indexed, failed, err := reindex(ctx, pool, svc, *workspace, *batch, l)
-	l.Info("reindex finished", "indexed", indexed, "failed", failed, "dry_run", *dryRun)
-	if err != nil {
-		l.Error("reindex stopped early", "error", err)
-		return 1
+	var totalIndexed, totalFailed int
+	for _, src := range selected {
+		indexed, failed, err := rebuild(ctx, pool, svc, src, *workspace, *batch, l)
+		totalIndexed += indexed
+		totalFailed += failed
+		l.Info("type finished", "type", src.typ, "indexed", indexed, "failed", failed, "dry_run", *dryRun)
+		if err != nil {
+			l.Error("reindex stopped early", "type", src.typ, "error", err)
+			return 1
+		}
 	}
-	if failed > 0 {
+
+	l.Info("reindex finished", "indexed", totalIndexed, "failed", totalFailed, "dry_run", *dryRun)
+	if totalFailed > 0 {
 		return 1
 	}
 	return 0
 }
 
-// pageSQL walks messages in (created_at, id) keyset order.
+// prune drops the legacy message-only index. It is a separate mode rather than
+// a step of the rebuild: dropping it is irreversible, and the operator should
+// be the one to decide that the new index is serving correctly.
+func prune(ctx context.Context, cfg *app.Config, l *slog.Logger, dryRun bool) int {
+	if dryRun {
+		l.Info("dry run: would delete the legacy messages index")
+		return 0
+	}
+	svc, err := search.NewService(cfg.Meili.Host, cfg.Meili.MasterKey, l)
+	if err != nil {
+		l.Error("meilisearch", "error", err)
+		return 1
+	}
+	if err := svc.DropLegacyIndex(ctx); err != nil {
+		l.Error("prune legacy index", "error", err)
+		return 1
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Sources
+// ---------------------------------------------------------------------------
+
+// cursor is a keyset position: (created_at, id) of the last row of the previous
+// page. The tuple, not created_at alone, is what makes the cursor total —
+// messages promoted in the same scheduled tick share a timestamp exactly.
+type cursor struct {
+	at time.Time
+	id string
+}
+
+// zeroCursor sorts before every real row.
+func zeroCursor() cursor {
+	return cursor{at: time.Unix(0, 0).UTC(), id: "00000000-0000-0000-0000-000000000000"}
+}
+
+// source is one object type's walk over Postgres. Adding a type to search is a
+// doc constructor (internal/search) plus one entry here — not a new command and
+// not a new index.
+type source struct {
+	typ search.ObjectType
+	// sql selects one page after the cursor, with the same four parameters in
+	// the same order: workspace filter, cursor timestamp, cursor id, limit.
+	sql string
+	// scan reads one row into a Doc and reports its cursor position.
+	scan func(rows pgxRow) (search.Doc, cursor, error)
+}
+
+// pgxRow is the row-scanning surface of pgx.Rows, so a scan function can be
+// tested without a database.
+type pgxRow interface {
+	Scan(dest ...any) error
+}
+
+// messageSQL walks messages in (created_at, id) keyset order.
 //
 // Keyset rather than OFFSET: OFFSET re-scans every row it skips, so the last
-// page of a large table costs as much as the whole walk. The tuple comparison
-// (not created_at alone) is what makes the cursor total — messages promoted in
-// the same scheduled tick used to share a timestamp exactly.
-const pageSQL = `
+// page of a large table costs as much as the whole walk.
+const messageSQL = `
 	SELECT m.id, m.channel_id, c.workspace_id, m.user_id, m.content, m.created_at
 	  FROM messages m
 	  JOIN channels c ON c.id = m.channel_id
@@ -114,10 +207,93 @@ const pageSQL = `
 	 ORDER BY m.created_at, m.id
 	 LIMIT $4`
 
-func reindex(
+// fileSQL walks files, resolving the channel of the message each one is
+// attached to.
+//
+// The join is deliberately not filtered by messages.is_deleted: a soft-deleted
+// message keeps its channel, and internal/file authorizes a download through
+// authz.MessageChannel, which ignores the flag too. Filtering here would make
+// the index stricter than the API in one direction and — after the row is hard
+// deleted and m is NULL — fall back to uploader-only, which is what the API
+// does as well. An unattached upload is readable by its uploader alone, so that
+// is the access key it gets.
+const fileSQL = `
+	SELECT f.id, f.workspace_id, f.user_id, f.name, COALESCE(m.channel_id::text, ''), f.created_at
+	  FROM files f
+	  LEFT JOIN messages m ON m.id = f.message_id
+	 WHERE ($1::uuid IS NULL OR f.workspace_id = $1::uuid)
+	   AND (f.created_at, f.id) > ($2::timestamptz, $3::uuid)
+	 ORDER BY f.created_at, f.id
+	 LIMIT $4`
+
+func sources() []source {
+	return []source{
+		{
+			typ: search.TypeMessage,
+			sql: messageSQL,
+			scan: func(row pgxRow) (search.Doc, cursor, error) {
+				var (
+					doc       search.MessageDoc
+					createdAt time.Time
+				)
+				if err := row.Scan(&doc.ID, &doc.ChannelID, &doc.WorkspaceID, &doc.UserID, &doc.Content, &createdAt); err != nil {
+					return search.Doc{}, cursor{}, fmt.Errorf("scan message: %w", err)
+				}
+				doc.CreatedAt = createdAt.Unix()
+				return doc.Doc(), cursor{at: createdAt, id: doc.ID}, nil
+			},
+		},
+		{
+			typ: search.TypeFile,
+			sql: fileSQL,
+			scan: func(row pgxRow) (search.Doc, cursor, error) {
+				var (
+					doc       search.FileDoc
+					createdAt time.Time
+				)
+				if err := row.Scan(&doc.ID, &doc.WorkspaceID, &doc.UserID, &doc.Name, &doc.ChannelID, &createdAt); err != nil {
+					return search.Doc{}, cursor{}, fmt.Errorf("scan file: %w", err)
+				}
+				doc.CreatedAt = createdAt.Unix()
+				return doc.Doc(), cursor{at: createdAt, id: doc.ID}, nil
+			},
+		},
+	}
+}
+
+func sourceNames() []string {
+	names := make([]string, 0, len(sources()))
+	for _, s := range sources() {
+		names = append(names, string(s.typ))
+	}
+	return names
+}
+
+// selectSources resolves the -type flag. "all" means every type that has a
+// source today, not every type search.ObjectTypes declares: a type with no
+// producer would rebuild to nothing and report success.
+func selectSources(name string) ([]source, error) {
+	all := sources()
+	if name == "" || name == "all" {
+		return all, nil
+	}
+	for _, s := range all {
+		if string(s.typ) == name {
+			return []source{s}, nil
+		}
+	}
+	return nil, fmt.Errorf("-type must be all or one of %s", strings.Join(sourceNames(), ", "))
+}
+
+// ---------------------------------------------------------------------------
+// The walk
+// ---------------------------------------------------------------------------
+
+func rebuild(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	svc *search.Service,
+	src source,
 	workspaceID string,
 	batch int,
 	l *slog.Logger,
@@ -127,61 +303,89 @@ func reindex(
 		wsFilter = &workspaceID
 	}
 
-	// Zero cursor: (epoch, all-zero uuid) sorts before every real row.
-	cursorTime := time.Unix(0, 0).UTC()
-	cursorID := "00000000-0000-0000-0000-000000000000"
+	cur := zeroCursor()
 
 	for {
 		if err := ctx.Err(); err != nil {
 			return indexed, failed, err
 		}
 
-		rows, qErr := pool.Query(ctx, pageSQL, wsFilter, cursorTime, cursorID, batch)
+		rows, qErr := pool.Query(ctx, src.sql, wsFilter, cur.at, cur.id, batch)
 		if qErr != nil {
-			return indexed, failed, fmt.Errorf("read messages: %w", qErr)
+			return indexed, failed, fmt.Errorf("read %s rows: %w", src.typ, qErr)
 		}
 
 		page := 0
-		var docs []search.MessageDoc
+		var docs []search.Doc
 		for rows.Next() {
-			var (
-				doc       search.MessageDoc
-				createdAt time.Time
-			)
-			if scanErr := rows.Scan(&doc.ID, &doc.ChannelID, &doc.WorkspaceID, &doc.UserID, &doc.Content, &createdAt); scanErr != nil {
+			doc, next, scanErr := src.scan(rows)
+			if scanErr != nil {
 				rows.Close()
-				return indexed, failed, fmt.Errorf("scan message: %w", scanErr)
+				return indexed, failed, scanErr
 			}
-			doc.CreatedAt = createdAt.Unix()
 			docs = append(docs, doc)
-			cursorTime, cursorID = createdAt, doc.ID
+			cur = next
 			page++
 		}
 		rows.Close()
 		if rowsErr := rows.Err(); rowsErr != nil {
-			return indexed, failed, fmt.Errorf("read messages: %w", rowsErr)
+			return indexed, failed, fmt.Errorf("read %s rows: %w", src.typ, rowsErr)
 		}
 		if page == 0 {
 			return indexed, failed, nil
 		}
 
-		for _, doc := range docs {
-			if svc == nil { // dry run
-				indexed++
-				continue
-			}
-			if idxErr := svc.IndexMessage(doc); idxErr != nil {
-				failed++
-				l.Error("index message", "id", doc.ID, "error", idxErr)
-				continue
-			}
-			indexed++
+		if svc == nil { // dry run
+			indexed += page
+		} else {
+			ok, bad := writePage(ctx, svc, docs, src.typ, l)
+			indexed += ok
+			failed += bad
 		}
 
-		l.Info("reindex progress", "indexed", indexed, "failed", failed, "cursor", cursorTime.Format(time.RFC3339Nano))
+		l.Info("reindex progress", "type", src.typ, "indexed", indexed, "failed", failed,
+			"cursor", cur.at.Format(time.RFC3339Nano))
 
 		if page < batch {
 			return indexed, failed, nil
 		}
 	}
+}
+
+// writePage indexes one page, falling back to one document at a time when the
+// batch is rejected.
+//
+// The batch is a single HTTP request for up to `batch` documents — the previous
+// version made one request per document, which is what made a full rebuild an
+// overnight job. But a batch is all-or-nothing: one row that cannot be turned
+// into a valid document (no workspace, no channel, so no access keys) would
+// take the other 499 with it. The fallback isolates the bad rows, so a rebuild
+// reports exactly which objects it could not index and indexes everything else.
+func writePage(ctx context.Context, svc *search.Service, docs []search.Doc, typ search.ObjectType, l *slog.Logger) (indexed, failed int) {
+	if err := svc.IndexBatch(ctx, docs); err == nil {
+		return len(docs), 0
+	} else if !permanent(err) {
+		// Meilisearch is unreachable or refusing work: retrying the same page
+		// document by document would just make N failures out of one.
+		l.Error("index batch", "type", typ, "count", len(docs), "error", err)
+		return 0, len(docs)
+	}
+
+	for _, doc := range docs {
+		if err := svc.IndexAwait(ctx, doc); err != nil {
+			failed++
+			l.Error("index document", "type", typ, "id", doc.ID, "error", err)
+			continue
+		}
+		indexed++
+	}
+	return indexed, failed
+}
+
+// permanent reports whether an error is one redelivery cannot fix. It matches
+// structurally, the same way cmd/worker does, rather than importing the
+// concrete type.
+func permanent(err error) bool {
+	var p interface{ Permanent() bool }
+	return errors.As(err, &p) && p.Permanent()
 }

@@ -9,6 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
+	"github.com/Wick-Lim/SuperOps/backend/internal/sso"
 )
 
 type Config struct {
@@ -23,8 +26,101 @@ type Config struct {
 	RateLimit    RateLimitConfig
 	CORS         CORSConfig
 	Push         PushConfig
+	Mail         MailConfig
+	SSO          SSOConfig
 	MetricsToken string // METRICS_TOKEN — if set, GET /metrics requires this bearer token
 	LogLevel     string
+}
+
+// MailConfig configures outbound email.
+//
+// The transport is deployment policy, not a code decision, which is why it is
+// here rather than compiled in. See internal/mail's package comment: almost
+// every cloud provider blocks outbound port 25, so a cloud deployment must
+// relay through a provider, while an on-premises host that allows 25 can
+// deliver directly and keep company mail off a third party.
+//
+// The default is TransportLog: a fresh deployment must not be able to mail real
+// people before an operator has opted in.
+type MailConfig struct {
+	// Transport is one of mail.TransportLog (default), mail.TransportSMTP,
+	// mail.TransportSMTPDirect, mail.TransportResend.
+	Transport string
+
+	From     string // MAIL_FROM — the envelope and header sender
+	FromName string // MAIL_FROM_NAME — optional display name
+
+	// PublicBaseURL is the absolute, publicly reachable root of the web client.
+	// Every link in every message is built from it; a relative "/invite/<token>"
+	// in an email is not a link.
+	PublicBaseURL string
+
+	// ProductName appears in subjects and in the message layout.
+	ProductName string
+
+	// Timeout bounds one send attempt.
+	Timeout time.Duration
+
+	// TestPerMinute rate-limits POST /api/v1/admin/mail/test per IP. It is an
+	// outbound-mail trigger, so it gets its own (very low) budget rather than
+	// the general API limit.
+	TestPerMinute int
+
+	SMTP   MailSMTPConfig
+	Direct MailDirectConfig
+	Resend MailResendConfig
+}
+
+// MailSMTPConfig is the authenticated-relay transport.
+//
+// One transport, every provider: SES, Postmark, SendGrid, Mailgun, Resend and a
+// corporate Exchange relay all expose authenticated SMTP. Only Host, Username
+// and Password change between them — there is no per-provider code path.
+type MailSMTPConfig struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+
+	// TLS is mail.TLSStartTLS (587, the default), mail.TLSImplicit (465) or
+	// mail.TLSNone.
+	TLS string
+
+	// AllowInsecureAuth permits credentials over an unencrypted connection. Only
+	// for a relay on localhost or a trusted private network.
+	AllowInsecureAuth bool
+
+	// InsecureSkipVerify disables certificate verification, for a relay whose
+	// private CA is not in the image's trust store.
+	InsecureSkipVerify bool
+
+	HELO string
+}
+
+// MailDirectConfig is MX delivery, for on-premises only.
+type MailDirectConfig struct {
+	// HELO must be this host's public FQDN. Receiving MTAs check it against the
+	// connecting IP's PTR record.
+	HELO string
+	Port int
+
+	DKIMDomain   string
+	DKIMSelector string
+
+	// DKIMPrivateKey is a PEM-encoded RSA key, or its base64 encoding for
+	// environments that cannot carry newlines in a variable.
+	DKIMPrivateKey string
+
+	// DKIMPrivateKeyFile reads the key from disk instead — the right shape for a
+	// mounted Kubernetes Secret. Wins over DKIMPrivateKey when both are set.
+	DKIMPrivateKeyFile string
+}
+
+// MailResendConfig is the HTTP transport, for hosts where even the SMTP
+// submission ports are blocked outbound.
+type MailResendConfig struct {
+	APIKey   string
+	Endpoint string
 }
 
 type CORSConfig struct {
@@ -213,6 +309,28 @@ type MeiliConfig struct {
 // disable search did the opposite of what it looked like.
 func (c MeiliConfig) IsEnabled() bool { return c.Enabled && c.Host != "" }
 
+// SSOConfig configures OpenID Connect single sign-on.
+//
+// Per-workspace provider configuration lives in Postgres (one deployment serves
+// several organizations); this is the deployment-level half.
+//
+// SecretKey is the on/off switch: without it, client secrets cannot be sealed
+// at rest, so the whole feature refuses to construct rather than storing them
+// in the clear.
+type SSOConfig struct {
+	SecretKey           string        // SSO_SECRET_KEY — 32 bytes: 64 hex chars, base64, or 32 raw chars
+	AllowInsecureIssuer bool          // SSO_ALLOW_INSECURE_ISSUER — dev/test only
+	HTTPTimeout         time.Duration // SSO_HTTP_TIMEOUT       (default 10s)
+	AuthRequestTTL      time.Duration // SSO_AUTH_REQUEST_TTL   (default 10m)
+	PendingTTL          time.Duration // SSO_PENDING_TTL        (default 5m)
+	JWKSCacheTTL        time.Duration // SSO_JWKS_CACHE_TTL     (default 1h)
+	ClockSkew           time.Duration // SSO_CLOCK_SKEW         (default 2m)
+}
+
+// IsEnabled reports whether the SSO stack should be constructed. Mirrors
+// MinIOConfig.IsEnabled / PushConfig.IsEnabled so no caller tests a raw field.
+func (c SSOConfig) IsEnabled() bool { return strings.TrimSpace(c.SecretKey) != "" }
+
 func LoadConfig() (*Config, error) {
 	e := &env{}
 
@@ -293,6 +411,46 @@ func LoadConfig() (*Config, error) {
 			QueueSize:   e.int("PUSH_QUEUE_SIZE", 0),
 			Workers:     e.int("PUSH_WORKERS", 0),
 		},
+		Mail: MailConfig{
+			Transport:     strings.ToLower(strings.TrimSpace(e.str("MAIL_TRANSPORT", mail.TransportLog))),
+			From:          e.str("MAIL_FROM", ""),
+			FromName:      e.str("MAIL_FROM_NAME", "SuperOps"),
+			PublicBaseURL: e.str("PUBLIC_BASE_URL", "http://localhost:8080"),
+			ProductName:   e.str("PRODUCT_NAME", "SuperOps"),
+			Timeout:       e.duration("MAIL_TIMEOUT", 30*time.Second),
+			TestPerMinute: e.int("MAIL_TEST_PER_MIN", 3),
+			SMTP: MailSMTPConfig{
+				Host:               e.str("MAIL_SMTP_HOST", ""),
+				Port:               e.int("MAIL_SMTP_PORT", 587),
+				Username:           e.str("MAIL_SMTP_USERNAME", ""),
+				Password:           e.str("MAIL_SMTP_PASSWORD", ""),
+				TLS:                strings.ToLower(strings.TrimSpace(e.str("MAIL_SMTP_TLS", mail.TLSStartTLS))),
+				AllowInsecureAuth:  e.bool("MAIL_SMTP_ALLOW_INSECURE_AUTH", false),
+				InsecureSkipVerify: e.bool("MAIL_SMTP_INSECURE_SKIP_VERIFY", false),
+				HELO:               e.str("MAIL_SMTP_HELO", ""),
+			},
+			Direct: MailDirectConfig{
+				HELO:               e.str("MAIL_DIRECT_HELO", ""),
+				Port:               e.int("MAIL_DIRECT_PORT", 25),
+				DKIMDomain:         e.str("MAIL_DKIM_DOMAIN", ""),
+				DKIMSelector:       e.str("MAIL_DKIM_SELECTOR", ""),
+				DKIMPrivateKey:     e.str("MAIL_DKIM_PRIVATE_KEY", ""),
+				DKIMPrivateKeyFile: e.str("MAIL_DKIM_PRIVATE_KEY_FILE", ""),
+			},
+			Resend: MailResendConfig{
+				APIKey:   e.str("MAIL_RESEND_API_KEY", ""),
+				Endpoint: e.str("MAIL_RESEND_ENDPOINT", ""),
+			},
+		},
+		SSO: SSOConfig{
+			SecretKey:           e.str("SSO_SECRET_KEY", ""),
+			AllowInsecureIssuer: e.bool("SSO_ALLOW_INSECURE_ISSUER", false),
+			HTTPTimeout:         e.duration("SSO_HTTP_TIMEOUT", 10*time.Second),
+			AuthRequestTTL:      e.duration("SSO_AUTH_REQUEST_TTL", 10*time.Minute),
+			PendingTTL:          e.duration("SSO_PENDING_TTL", 5*time.Minute),
+			JWKSCacheTTL:        e.duration("SSO_JWKS_CACHE_TTL", time.Hour),
+			ClockSkew:           e.duration("SSO_CLOCK_SKEW", 2*time.Minute),
+		},
 		MetricsToken: e.str("METRICS_TOKEN", ""),
 		LogLevel:     e.str("LOG_LEVEL", "info"),
 	}
@@ -370,7 +528,219 @@ func (c *Config) validate() error {
 		}
 	}
 
+	errs = append(errs, c.Mail.validate()...)
+	errs = append(errs, c.validateSSO()...)
+
 	return errors.Join(errs...)
+}
+
+// validateSSO rejects an SSO configuration that cannot work, and refuses the
+// one setting that turns a tenant-supplied URL into server-side request
+// forgery.
+//
+// The key is parsed here rather than at first use so a mistyped SSO_SECRET_KEY
+// fails the boot instead of surfacing as "single sign-on is not configured" the
+// first time a workspace admin saves a provider.
+func (c *Config) validateSSO() []error {
+	var errs []error
+
+	if c.SSO.IsEnabled() {
+		if _, err := sso.ParseSecretKey(c.SSO.SecretKey); err != nil {
+			// The error already names the three accepted formats.
+			errs = append(errs, err)
+		}
+		for _, d := range []struct {
+			name string
+			val  time.Duration
+		}{
+			{"SSO_HTTP_TIMEOUT", c.SSO.HTTPTimeout},
+			{"SSO_AUTH_REQUEST_TTL", c.SSO.AuthRequestTTL},
+			{"SSO_PENDING_TTL", c.SSO.PendingTTL},
+			{"SSO_JWKS_CACHE_TTL", c.SSO.JWKSCacheTTL},
+			{"SSO_CLOCK_SKEW", c.SSO.ClockSkew},
+		} {
+			if d.val <= 0 {
+				errs = append(errs, fmt.Errorf("%s must be positive (got %s)", d.name, d.val))
+			}
+		}
+	}
+
+	// SSO_ALLOW_INSECURE_ISSUER is not a "warn and carry on" flag.
+	//
+	// With it on, internal/sso drops both the https requirement and the
+	// dial-time private-address guard, and the issuer URL is supplied by a
+	// WORKSPACE ADMIN — a tenant, not the operator of this deployment. Any one
+	// of them can then point `issuer` at http://169.254.169.254/ and read the
+	// cloud metadata service, i.e. the node's IAM credentials, through this
+	// process. That is a full compromise of the deployment reachable from a
+	// tenant-facing settings form.
+	//
+	// A Warn at boot is not a control: nothing reads INFO/WARN lines from a
+	// pod that started successfully, and the flag's whole failure mode is
+	// "someone set it once for a local Keycloak and it rode along into prod".
+	// So it is fatal — except on a deployment that is self-evidently a
+	// developer's, which the mail validation already has a definition for: a
+	// loopback PUBLIC_BASE_URL, the value no real recipient can open. That
+	// keeps the local-test-provider workflow the flag exists for and makes the
+	// dangerous combination unreachable in anything that serves users.
+	if c.SSO.AllowInsecureIssuer && !isLocalDeployment(c.Mail.PublicBaseURL) {
+		errs = append(errs, fmt.Errorf(
+			"SSO_ALLOW_INSECURE_ISSUER=true is refused on a deployment whose PUBLIC_BASE_URL is %q: "+
+				"it lets any workspace admin point an OIDC issuer at a private or link-local address "+
+				"(169.254.169.254) and read it through this process. "+
+				"It is only accepted when PUBLIC_BASE_URL is a loopback address, i.e. a local test deployment",
+			c.Mail.PublicBaseURL))
+	}
+
+	return errs
+}
+
+// isLocalDeployment reports whether the public base URL says this process is a
+// developer's local stack rather than something users reach.
+func isLocalDeployment(publicBaseURL string) bool {
+	u, err := url.Parse(publicBaseURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return isLoopbackHost(u.Hostname())
+}
+
+// validate rejects a mail configuration that cannot possibly work.
+//
+// Every check here exists because mail misconfiguration is otherwise silent:
+// nothing throws, nothing 500s, and the first symptom is a user who says they
+// never received their invitation — days later, with no log line to point at.
+// Selecting a transport and forgetting its one required setting must stop the
+// boot.
+func (c MailConfig) validate() []error {
+	var errs []error
+
+	switch c.Transport {
+	case mail.TransportLog, mail.TransportSMTP, mail.TransportSMTPDirect, mail.TransportResend:
+	default:
+		errs = append(errs, fmt.Errorf("MAIL_TRANSPORT must be one of %q, %q, %q, %q (got %q)",
+			mail.TransportLog, mail.TransportSMTP, mail.TransportSMTPDirect, mail.TransportResend, c.Transport))
+		// The per-transport checks below are meaningless once the name is wrong.
+		return errs
+	}
+
+	// Links are built from this on every transport, including `log` — where the
+	// whole point is that a developer can paste the invitation URL out of the
+	// log and it works.
+	if u, err := url.Parse(c.PublicBaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		errs = append(errs, fmt.Errorf("PUBLIC_BASE_URL must be an absolute http(s) URL (got %q)", c.PublicBaseURL))
+	} else if c.Transport != mail.TransportLog && isLoopbackHost(u.Hostname()) {
+		// A real recipient cannot open http://localhost/invite/<token>. This is
+		// the single most likely way to send a batch of useless invitations.
+		errs = append(errs, fmt.Errorf(
+			"PUBLIC_BASE_URL is %q, which no email recipient can open; set it to the address users reach this deployment on",
+			c.PublicBaseURL))
+	}
+
+	if c.Timeout <= 0 {
+		errs = append(errs, fmt.Errorf("MAIL_TIMEOUT must be positive (got %s)", c.Timeout))
+	}
+	if c.TestPerMinute < 1 {
+		errs = append(errs, fmt.Errorf("MAIL_TEST_PER_MIN must be at least 1 (got %d)", c.TestPerMinute))
+	}
+
+	if c.Transport == mail.TransportLog {
+		return errs
+	}
+
+	// Every sending transport needs a From: it is the envelope sender, the
+	// header sender, and what SPF and DMARC are evaluated against.
+	if strings.TrimSpace(c.From) == "" {
+		errs = append(errs, fmt.Errorf("MAIL_FROM is required when MAIL_TRANSPORT is %q", c.Transport))
+	} else if !strings.Contains(c.From, "@") {
+		errs = append(errs, fmt.Errorf("MAIL_FROM must be an email address (got %q)", c.From))
+	}
+
+	switch c.Transport {
+	case mail.TransportSMTP:
+		if strings.TrimSpace(c.SMTP.Host) == "" {
+			errs = append(errs, errors.New(`MAIL_SMTP_HOST is required when MAIL_TRANSPORT is "smtp"`))
+		}
+		if c.SMTP.Port < 1 || c.SMTP.Port > 65535 {
+			errs = append(errs, fmt.Errorf("MAIL_SMTP_PORT must be between 1 and 65535 (got %d)", c.SMTP.Port))
+		}
+		switch c.SMTP.TLS {
+		case mail.TLSStartTLS, mail.TLSImplicit, mail.TLSNone:
+		default:
+			errs = append(errs, fmt.Errorf("MAIL_SMTP_TLS must be %q, %q or %q (got %q)",
+				mail.TLSStartTLS, mail.TLSImplicit, mail.TLSNone, c.SMTP.TLS))
+		}
+		if (c.SMTP.Username == "") != (c.SMTP.Password == "") {
+			errs = append(errs, errors.New("MAIL_SMTP_USERNAME and MAIL_SMTP_PASSWORD must be set together"))
+		}
+		if c.SMTP.TLS == mail.TLSNone && c.SMTP.Username != "" && !c.SMTP.AllowInsecureAuth {
+			errs = append(errs, errors.New(
+				`MAIL_SMTP_TLS="none" with credentials set requires MAIL_SMTP_ALLOW_INSECURE_AUTH=true; SMTP AUTH sends the password in the clear`))
+		}
+
+	case mail.TransportSMTPDirect:
+		if strings.TrimSpace(c.Direct.HELO) == "" {
+			errs = append(errs, errors.New(
+				`MAIL_DIRECT_HELO is required when MAIL_TRANSPORT is "smtp-direct": it must be this host's public FQDN, which receiving MTAs check against the connecting IP's PTR record`))
+		}
+		if c.Direct.Port < 1 || c.Direct.Port > 65535 {
+			errs = append(errs, fmt.Errorf("MAIL_DIRECT_PORT must be between 1 and 65535 (got %d)", c.Direct.Port))
+		}
+		// DKIM is optional but all-or-nothing: two of the three settings is a
+		// half-finished rollout that would sign with nothing.
+		set := 0
+		for _, v := range []string{c.Direct.DKIMDomain, c.Direct.DKIMSelector, c.Direct.dkimKeySource()} {
+			if strings.TrimSpace(v) != "" {
+				set++
+			}
+		}
+		if set != 0 && set != 3 {
+			errs = append(errs, errors.New(
+				"MAIL_DKIM_DOMAIN, MAIL_DKIM_SELECTOR and MAIL_DKIM_PRIVATE_KEY (or MAIL_DKIM_PRIVATE_KEY_FILE) must all be set, or none of them"))
+		}
+
+	case mail.TransportResend:
+		if strings.TrimSpace(c.Resend.APIKey) == "" {
+			errs = append(errs, errors.New(`MAIL_RESEND_API_KEY is required when MAIL_TRANSPORT is "resend"`))
+		}
+		if c.Resend.Endpoint != "" {
+			if u, err := url.Parse(c.Resend.Endpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Errorf("MAIL_RESEND_ENDPOINT must be an absolute http(s) URL (got %q)", c.Resend.Endpoint))
+			}
+		}
+	}
+
+	return errs
+}
+
+// dkimKeySource reports whichever of the two key settings is populated.
+func (c MailDirectConfig) dkimKeySource() string {
+	if strings.TrimSpace(c.DKIMPrivateKeyFile) != "" {
+		return c.DKIMPrivateKeyFile
+	}
+	return c.DKIMPrivateKey
+}
+
+// DKIMConfigured reports whether all three DKIM settings are present. Callers
+// use it instead of testing the fields, so "two of three" cannot be read as
+// "enabled" anywhere.
+func (c MailDirectConfig) DKIMConfigured() bool {
+	return strings.TrimSpace(c.DKIMDomain) != "" &&
+		strings.TrimSpace(c.DKIMSelector) != "" &&
+		strings.TrimSpace(c.dkimKeySource()) != ""
+}
+
+// isLoopbackHost reports whether a URL host can only be reached from the
+// machine running this process.
+func isLoopbackHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "localhost.localdomain":
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback() || ip.IsUnspecified()
+	}
+	return false
 }
 
 // env reads environment variables, collecting parse failures instead of

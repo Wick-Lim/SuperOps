@@ -17,6 +17,7 @@ import (
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 )
 
@@ -50,6 +51,37 @@ type suite struct {
 	pool *pgxpool.Pool
 	h    *Handler
 	f    *fixture
+	mail *fakeMailQueue
+}
+
+// fakeMailQueue records what the handler tried to send, so the invitation tests
+// can assert on delivery without a NATS server.
+type fakeMailQueue struct {
+	mu   sync.Mutex
+	sent []queuedMail
+	err  error
+}
+
+type queuedMail struct {
+	workspaceID string
+	kind        string
+	msg         *mail.Message
+}
+
+func (q *fakeMailQueue) Queue(_ context.Context, workspaceID, kind string, msg *mail.Message) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.err != nil {
+		return q.err
+	}
+	q.sent = append(q.sent, queuedMail{workspaceID: workspaceID, kind: kind, msg: msg})
+	return nil
+}
+
+func (q *fakeMailQueue) all() []queuedMail {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]queuedMail(nil), q.sent...)
 }
 
 func setup(t *testing.T) *suite {
@@ -62,7 +94,18 @@ func setup(t *testing.T) *suite {
 		t.Fatalf("seed fixtures: %v", fixErr)
 	}
 	auditSvc := audit.NewService(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	return &suite{pool: pool, h: NewHandler(pool, auditSvc, authz.New(pool)), f: fix}
+
+	queue := &fakeMailQueue{}
+	renderer, err := mail.NewRenderer(mail.RendererConfig{BaseURL: "https://chat.example.com", ProductName: "SuperOps"})
+	if err != nil {
+		t.Fatalf("build mail renderer: %v", err)
+	}
+	deps := MailDeps{
+		Publisher: queue,
+		Renderer:  renderer,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return &suite{pool: pool, h: NewHandler(pool, auditSvc, authz.New(pool), deps), f: fix, mail: queue}
 }
 
 func buildFixture(ctx context.Context, pool *pgxpool.Pool) (*fixture, error) {
@@ -152,11 +195,16 @@ func (e *suite) do(t *testing.T, method, path, actor string, body any) (int, env
 	t.Helper()
 
 	mux := http.NewServeMux()
-	e.h.RegisterRoutes(mux, func(next http.Handler) http.Handler {
+	authMw := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			next.ServeHTTP(w, r.WithContext(authctx.WithUserID(r.Context(), actor)))
 		})
-	})
+	}
+	e.h.RegisterRoutes(mux, authMw)
+	// The mail configuration test carries an extra rate limiter in production;
+	// what is under test here is the handler's own authorization, which is the
+	// same either way.
+	e.h.RegisterMailRoutes(mux, authMw)
 
 	var rdr io.Reader
 	if body != nil {

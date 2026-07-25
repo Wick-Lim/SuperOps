@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
+	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
@@ -41,6 +42,13 @@ var (
 	// ErrReauthRequired is returned by operations that a stolen access token
 	// alone must not be able to perform.
 	ErrReauthRequired = errors.New("current password or a valid two-factor code is required")
+
+	// ErrSSORequired means the credentials were correct but the account belongs
+	// to a workspace that requires single sign-on. It is deliberately raised
+	// only AFTER the password (and second factor) have been verified: raised
+	// earlier it would tell an unauthenticated prober which addresses belong to
+	// which organization.
+	ErrSSORequired = errors.New("this organization requires single sign-on")
 )
 
 const (
@@ -84,6 +92,10 @@ type Service struct {
 	jwtMgr     *JWTManager
 	refreshTTL time.Duration
 	auditSvc   *audit.Service
+	// az answers whether single sign-on enforcement forbids a password login.
+	// nil means no enforcement is possible (no SSO wired), which is the right
+	// behaviour for a deployment without it and is what the unit tests use.
+	az *authz.Checker
 }
 
 type TokenPair struct {
@@ -92,8 +104,20 @@ type TokenPair struct {
 	ExpiresIn    int    `json:"expires_in"`
 }
 
-func NewService(repo *Repository, userRepo *user.Repository, pool *pgxpool.Pool, jwtMgr *JWTManager, refreshTTL time.Duration, auditSvc *audit.Service) *Service {
-	return &Service{
+// Option configures optional collaborators. It exists so that adding one does
+// not renumber the positional arguments of every existing call site — the
+// composition root passes what a deployment has, and a test passes nothing.
+type Option func(*Service)
+
+// WithAuthz supplies the membership checker used for single sign-on
+// enforcement. Without it, PasswordLoginAllowed is never consulted and password
+// login behaves exactly as it did before SSO existed.
+func WithAuthz(az *authz.Checker) Option {
+	return func(s *Service) { s.az = az }
+}
+
+func NewService(repo *Repository, userRepo *user.Repository, pool *pgxpool.Pool, jwtMgr *JWTManager, refreshTTL time.Duration, auditSvc *audit.Service, opts ...Option) *Service {
+	s := &Service{
 		repo:       repo,
 		userRepo:   userRepo,
 		pool:       pool,
@@ -101,6 +125,32 @@ func NewService(repo *Repository, userRepo *user.Repository, pool *pgxpool.Pool,
 		refreshTTL: refreshTTL,
 		auditSvc:   auditSvc,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// requirePasswordLoginAllowed is the enforcement gate.
+//
+// A session is global and enforcement is per-workspace, so the question is
+// "does this person belong to any workspace that has switched password login
+// off" — answered by internal/authz, never here. A nil checker means no SSO is
+// configured at all.
+func (s *Service) requirePasswordLoginAllowed(ctx context.Context, userID string) error {
+	if s.az == nil {
+		return nil
+	}
+	allowed, err := s.az.PasswordLoginAllowed(ctx, userID)
+	if err != nil {
+		// Fail closed: an unreachable database must not be a way to sign in
+		// with a password the organization has disabled.
+		return fmt.Errorf("check sso enforcement: %w", err)
+	}
+	if !allowed {
+		return ErrSSORequired
+	}
+	return nil
 }
 
 // record writes an audit entry if auditing is configured. Failures are logged
@@ -178,7 +228,23 @@ func (s *Service) Login(ctx context.Context, input LoginInput, userAgent, ipAddr
 		}
 	}
 
-	tokens, err := s.issueTokens(ctx, u.ID, userAgent, ipAddress)
+	// Everything about the credentials checked out. The last question is
+	// whether this account is allowed to use them at all.
+	if err := s.requirePasswordLoginAllowed(ctx, u.ID); err != nil {
+		if errors.Is(err, ErrSSORequired) {
+			s.record(ctx, audit.Entry{
+				ActorID:      u.ID,
+				Action:       audit.ActionLoginFailed,
+				ResourceType: "user",
+				ResourceID:   u.ID,
+				IPAddress:    ip,
+				Metadata:     map[string]interface{}{"email": input.Email, "reason": "sso_required"},
+			})
+		}
+		return nil, err
+	}
+
+	tokens, err := s.issueTokens(ctx, u.ID, userAgent, ipAddress, MethodPassword)
 	if err != nil {
 		return nil, err
 	}
@@ -243,11 +309,21 @@ func (s *Service) RefreshTokens(ctx context.Context, refreshToken, userAgent, ip
 		return nil, ErrInvalidRefreshToken
 	}
 
+	// Enforcement turned on after this session was minted must bite now, not in
+	// thirty days when the refresh token would have expired on its own. Only a
+	// password session is re-evaluated: an SSO session is exactly what
+	// enforcement is asking for.
+	if session.AuthMethod != MethodSSO {
+		if err := s.requirePasswordLoginAllowed(ctx, session.UserID); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := s.repo.DeleteSession(ctx, session.ID); err != nil {
 		return nil, err
 	}
 
-	return s.issueTokens(ctx, session.UserID, userAgent, ipAddress)
+	return s.issueTokens(ctx, session.UserID, userAgent, ipAddress, session.AuthMethod)
 }
 
 func (s *Service) Logout(ctx context.Context, refreshToken, ipAddress string) error {
@@ -313,6 +389,21 @@ func (s *Service) AcceptInvite(ctx context.Context, in AcceptInviteInput) (*Toke
 			return nil, fmt.Errorf("expire invitation: %w", err)
 		}
 		return nil, ErrInviteExpired
+	}
+
+	// Refuse before anything is consumed. A workspace that requires single
+	// sign-on cannot be joined by password: the session this would mint is one
+	// RefreshTokens would immediately refuse, and the invite would have been
+	// burned for nothing. With enforcement on, provisioning happens through the
+	// provider instead.
+	if s.az != nil {
+		enforced, err := s.az.SSOEnforced(ctx, workspaceID)
+		if err != nil {
+			return nil, fmt.Errorf("check sso enforcement: %w", err)
+		}
+		if enforced {
+			return nil, ErrSSORequired
+		}
 	}
 
 	existing, err := s.userRepo.GetByEmail(ctx, email)
@@ -403,7 +494,7 @@ func (s *Service) AcceptInvite(ctx context.Context, in AcceptInviteInput) (*Toke
 		Metadata:     map[string]interface{}{"email": email, "role": role, "new_account": existing == nil},
 	})
 
-	return s.issueTokens(ctx, userID, in.UserAgent, in.IPAddress)
+	return s.issueTokens(ctx, userID, in.UserAgent, in.IPAddress, MethodPassword)
 }
 
 // authorizeInvitee proves that the caller accepting an invite addressed to an
@@ -506,7 +597,7 @@ func (s *Service) GetInviteInfo(ctx context.Context, token string) (*InviteInfo,
 	return &info, nil
 }
 
-func (s *Service) issueTokens(ctx context.Context, userID, userAgent, ipAddress string) (*TokenPair, error) {
+func (s *Service) issueTokens(ctx context.Context, userID, userAgent, ipAddress, method string) (*TokenPair, error) {
 	accessToken, err := s.jwtMgr.Generate(userID)
 	if err != nil {
 		return nil, err
@@ -524,6 +615,7 @@ func (s *Service) issueTokens(ctx context.Context, userID, userAgent, ipAddress 
 		RefreshTokenHash: crypto.HashToken(refreshToken),
 		UserAgent:        userAgent,
 		IPAddress:        extractIP(ipAddress),
+		AuthMethod:       method,
 		ExpiresAt:        time.Now().Add(s.refreshTTL),
 	}
 

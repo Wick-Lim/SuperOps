@@ -10,11 +10,29 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// MessageEvent is the payload of superops.{workspace_id}.message.{action}.
 type MessageEvent struct {
 	ID        string `json:"id"`
 	ChannelID string `json:"channel_id"`
 	UserID    string `json:"user_id"`
 	Content   string `json:"content"`
+	CreatedAt string `json:"created_at"`
+	IsDeleted bool   `json:"is_deleted"`
+}
+
+// FileEvent is the payload of superops.{workspace_id}.file.{action}.
+//
+// ChannelID is the channel of the message the file is attached to and is empty
+// while the upload is unattached — it is what decides the file's access keys,
+// so a publisher that omits it makes the file visible to its uploader only.
+// A file that is attached to a message after upload must be republished (as
+// file.updated) with the channel filled in, or it stays uploader-only in the
+// index.
+type FileEvent struct {
+	ID        string `json:"id"`
+	ChannelID string `json:"channel_id"`
+	UserID    string `json:"user_id"`
+	Name      string `json:"name"`
 	CreatedAt string `json:"created_at"`
 	IsDeleted bool   `json:"is_deleted"`
 }
@@ -40,25 +58,14 @@ func NewIndexer(service *Service, logger *slog.Logger) *Indexer {
 //
 //   - transient (Meilisearch unreachable, task still running): plain error, the
 //     caller naks and the event comes back. Every write here is an upsert or a
-//     delete keyed on the message id, so re-running the handler is harmless.
+//     delete keyed on the object id, so re-running the handler is harmless.
 //   - permanent (payload does not parse, subject carries no workspace id, the
 //     document was rejected): redelivery cannot help, so the caller terminates
 //     the message rather than burning five deliveries on it first.
 func (idx *Indexer) HandleMessage(ctx context.Context, msg *nats.Msg) error {
-	var envelope struct {
-		Type string          `json:"type"`
-		Data json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(msg.Data, &envelope); err != nil {
-		return &PermanentError{Reason: "malformed event envelope on " + msg.Subject, Err: err}
-	}
-
-	switch envelope.Type {
-	case "message.new", "message.updated", "message.deleted":
-	default:
-		// The consumer's filter is superops.*.message.*, which also carries events
-		// this indexer has no opinion about. Nothing to do, and nothing wrong.
-		return nil
+	envelope, ok, err := decodeEnvelope(msg, "message.new", "message.updated", "message.deleted")
+	if err != nil || !ok {
+		return err
 	}
 
 	var event MessageEvent
@@ -72,35 +79,20 @@ func (idx *Indexer) HandleMessage(ctx context.Context, msg *nats.Msg) error {
 	// A soft-deleted message can arrive as an update too; drop it from the index
 	// rather than re-indexing deleted content.
 	if envelope.Type == "message.deleted" || event.IsDeleted {
-		if err := idx.service.DeleteMessageAwait(ctx, event.ID); err != nil {
+		if err := idx.service.DeleteAwait(ctx, TypeMessage, event.ID); err != nil {
 			return fmt.Errorf("unindex message %s: %w", event.ID, err)
 		}
 		idx.logger.Debug("unindexed message", "id", event.ID)
 		return nil
 	}
 
-	// Extract the workspace id from the subject: superops.{workspace_id}.message.{action}.
-	//
-	// This is not cosmetic. Every search is filtered by `workspace_id = "..."`
-	// against a canonicalised uuid, so a document indexed with an empty or
-	// non-canonical workspace id can never be found again — it would be written,
-	// acked, and invisible. A subject that does not carry one comes from a broken
-	// publisher, not a broken network.
-	parts := splitSubject(msg.Subject)
-	if len(parts) < 2 {
-		return &PermanentError{Reason: "event subject carries no workspace id: " + msg.Subject}
-	}
-	workspaceID, ok := canonicalUUID(parts[1])
-	if !ok {
-		return &PermanentError{Reason: "event subject workspace id is not a uuid: " + msg.Subject}
-	}
-
-	// Sorting and the created_at filter both depend on this. The zero time this
-	// used to fall back to sorts every unparseable message to the very start of
-	// the index, silently.
-	createdAt, err := time.Parse(time.RFC3339Nano, event.CreatedAt)
+	workspaceID, err := workspaceFromSubject(msg.Subject)
 	if err != nil {
-		return &PermanentError{Reason: "message " + event.ID + " has an unusable created_at", Err: err}
+		return err
+	}
+	createdAt, err := eventTime(event.CreatedAt, "message "+event.ID)
+	if err != nil {
+		return err
 	}
 
 	doc := MessageDoc{
@@ -110,13 +102,120 @@ func (idx *Indexer) HandleMessage(ctx context.Context, msg *nats.Msg) error {
 		UserID:      event.UserID,
 		Content:     event.Content,
 		CreatedAt:   createdAt.Unix(),
-	}
+	}.Doc()
 
-	if err := idx.service.IndexMessageAwait(ctx, doc); err != nil {
+	if err := idx.service.IndexAwait(ctx, doc); err != nil {
 		return fmt.Errorf("index message %s: %w", event.ID, err)
 	}
 	idx.logger.Debug("indexed message", "id", event.ID)
 	return nil
+}
+
+// HandleFile is the same contract for files: subject
+// superops.{workspace_id}.file.{action}, and the ack decision is the returned
+// error.
+//
+// NOTE: nothing publishes file events yet — internal/file has no NATS client —
+// so this handler is unbound until that lands. Until then files enter the index
+// only through cmd/reindex. See the wiring notes.
+func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
+	envelope, ok, err := decodeEnvelope(msg, "file.uploaded", "file.updated", "file.deleted")
+	if err != nil || !ok {
+		return err
+	}
+
+	var event FileEvent
+	if err := json.Unmarshal(envelope.Data, &event); err != nil {
+		return &PermanentError{Reason: "malformed " + envelope.Type + " payload", Err: err}
+	}
+	if event.ID == "" {
+		return &PermanentError{Reason: envelope.Type + " event carries no file id"}
+	}
+
+	if envelope.Type == "file.deleted" || event.IsDeleted {
+		if err := idx.service.DeleteAwait(ctx, TypeFile, event.ID); err != nil {
+			return fmt.Errorf("unindex file %s: %w", event.ID, err)
+		}
+		idx.logger.Debug("unindexed file", "id", event.ID)
+		return nil
+	}
+
+	workspaceID, err := workspaceFromSubject(msg.Subject)
+	if err != nil {
+		return err
+	}
+	createdAt, err := eventTime(event.CreatedAt, "file "+event.ID)
+	if err != nil {
+		return err
+	}
+
+	doc := FileDoc{
+		ID:          event.ID,
+		WorkspaceID: workspaceID,
+		ChannelID:   event.ChannelID,
+		UserID:      event.UserID,
+		Name:        event.Name,
+		CreatedAt:   createdAt.Unix(),
+	}.Doc()
+
+	if err := idx.service.IndexAwait(ctx, doc); err != nil {
+		return fmt.Errorf("index file %s: %w", event.ID, err)
+	}
+	idx.logger.Debug("indexed file", "id", event.ID)
+	return nil
+}
+
+type eventEnvelope struct {
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
+}
+
+// decodeEnvelope unwraps natspkg.Event and reports whether this handler has an
+// opinion about it. ok=false with a nil error means "not ours": a consumer's
+// subject filter is wider than the set of actions any one indexer cares about,
+// and an event it does not handle is a clean ack, not a failure.
+func decodeEnvelope(msg *nats.Msg, handled ...string) (eventEnvelope, bool, error) {
+	var envelope eventEnvelope
+	if err := json.Unmarshal(msg.Data, &envelope); err != nil {
+		return envelope, false, &PermanentError{Reason: "malformed event envelope on " + msg.Subject, Err: err}
+	}
+	for _, t := range handled {
+		if envelope.Type == t {
+			return envelope, true, nil
+		}
+	}
+	return envelope, false, nil
+}
+
+// workspaceFromSubject extracts the workspace id from
+// superops.{workspace_id}.{resource}.{action}.
+//
+// This is not cosmetic. Every search is filtered by `workspace_id = "..."`
+// against a canonicalised uuid, so a document indexed with an empty or
+// non-canonical workspace id can never be found again — it would be written,
+// acked, and invisible. A subject that does not carry one comes from a broken
+// publisher, not a broken network.
+func workspaceFromSubject(subject string) (string, error) {
+	parts := splitSubject(subject)
+	if len(parts) < 2 {
+		return "", &PermanentError{Reason: "event subject carries no workspace id: " + subject}
+	}
+	workspaceID, ok := canonicalUUID(parts[1])
+	if !ok {
+		return "", &PermanentError{Reason: "event subject workspace id is not a uuid: " + subject}
+	}
+	return workspaceID, nil
+}
+
+// eventTime parses an RFC3339 timestamp off an event. Sorting and the
+// created_at filter both depend on it; the zero time this used to fall back to
+// sorts every unparseable object to the very start of the index, silently.
+func eventTime(raw, what string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, &PermanentError{Reason: what + " has an unusable created_at", Err: err}
+	}
+	return t, nil
 }
 
 func splitSubject(subject string) []string {

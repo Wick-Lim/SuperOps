@@ -1,0 +1,15 @@
+{{.Data.InviterName}} has invited you to join the "{{.Data.WorkspaceName}}" workspace
+on {{.Product}} as a {{.Data.Role}}.
+
+Accept the invitation:
+
+{{.URL .Data.AcceptPath}}
+
+The link works once and expires on {{.Data.ExpiresAt.UTC.Format "2 January 2006 at 15:04 UTC"}}.
+If it has already expired, ask {{.Data.InviterName}} to send a new one.
+
+If you were not expecting this invitation you can ignore this message; nothing
+is created until the link is opened.
+
+--
+This is an automated message from {{.Product}} at {{.BaseURL}}. Please do not reply to it.

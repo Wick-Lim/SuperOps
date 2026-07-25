@@ -323,6 +323,53 @@ services:
       - ${BACKUP_DIR:-./backups}:/backup
     logging: *default-logging
 
+  # --- Dev mail catcher (optional: docker compose --profile mail up -d) ---
+  # Catches outbound mail instead of delivering it, so the invitation and
+  # configuration-test templates can be read as a real client renders them —
+  # multipart alternative, quoted-printable, the lot — which the `log` transport
+  # cannot show you.
+  #
+  # Point the app at it and restart backend + worker:
+  #   MAIL_TRANSPORT=smtp
+  #   MAIL_SMTP_HOST=mailpit
+  #   MAIL_SMTP_PORT=1025
+  #   MAIL_SMTP_TLS=none
+  #   MAIL_FROM=superops@localhost
+  # Leave MAIL_SMTP_USERNAME/PASSWORD unset: with no credentials to protect
+  # there is nothing for MAIL_SMTP_ALLOW_INSECURE_AUTH to authorise. Then read
+  # the mail at http://127.0.0.1:8025.
+  #
+  # DEVELOPMENT ONLY. It accepts everything, delivers nothing, and stores every
+  # message unauthenticated in memory. Never run this profile anywhere real —
+  # and note PUBLIC_BASE_URL stays http://localhost:8080 here, which the backend
+  # only tolerates because the links are for you, not for a recipient.
+  mailpit:
+    image: axllent/mailpit:v1.27
+    profiles: ["mail"]
+    environment:
+      # Keep the catcher from becoming a disk leak on a long-lived dev box.
+      MP_MAX_MESSAGES: "500"
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      # Web UI. Loopback like every other non-public port in this file.
+      - "127.0.0.1:8025:8025"
+      # SMTP. Published only so a backend running on the host (`go run
+      # ./cmd/superops`) can reach it; the containers use the compose network.
+      - "127.0.0.1:1025:1025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+    logging: *default-logging
+    restart: unless-stopped
+
   # --- Monitoring (optional: docker compose --profile monitoring up -d) ---
   prometheus:
     image: prom/prometheus:v3.13.1

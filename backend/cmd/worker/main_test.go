@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 )
@@ -24,6 +25,14 @@ func TestIsPermanent(t *testing.T) {
 		{"plain", errors.New("meilisearch unreachable"), false},
 		{"search permanent", &search.PermanentError{Reason: "malformed payload"}, true},
 		{"notification permanent", &notification.PermanentError{Reason: "no workspace id"}, true},
+		// The mail consumer's verdicts have to be legible here too, or a 550 from
+		// a relay would be naked five times instead of terminated once.
+		{"mail permanent", &mail.PermanentError{Reason: "550 user unknown"}, true},
+		{
+			"mail transient",
+			fmt.Errorf("smtp: dial relay: %w", errors.New("connection refused")),
+			false,
+		},
 		{
 			"wrapped permanent",
 			fmt.Errorf("index message %s: %w", "abc", &search.PermanentError{Reason: "rejected"}),

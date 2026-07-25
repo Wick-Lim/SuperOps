@@ -193,6 +193,145 @@ metrics:
   # through the ingress either way.
   token: ""
 
+# --- Single sign-on (OIDC) ----------------------------------------------------
+# Empty secretKey disables SSO entirely: the /api/v1/auth/sso/* and
+# /api/v1/workspaces/{id}/sso routes are not registered, and password login is
+# unchanged.
+#
+# The provider itself (issuer, client id, client secret, whether SSO is
+# enforced) is configured per workspace by a workspace administrator and stored
+# in Postgres — one deployment serves several organizations, so it cannot live
+# here. This is the deployment-level half.
+sso:
+  # AES-256 key sealing every workspace's OIDC client secret at rest, and the
+  # on/off switch for the whole feature. -> Secret, beside JWT_SECRET; it is
+  # never emitted into the ConfigMap.
+  #
+  #   openssl rand -hex 32
+  #
+  # Accepted as 64 hex characters, base64 of 32 bytes, or 32 raw characters; a
+  # value that is none of those fails the boot rather than being truncated.
+  # Back it up: rotating it makes every stored client secret unopenable and the
+  # only fix is re-entering each workspace's secret. For anything beyond a
+  # trial, leave it empty here and inject via External Secrets / SOPS.
+  secretKey: ""  # -> Secret
+
+  # Permit an http:// issuer and one that resolves to a loopback, private or
+  # link-local address. LOCAL TEST PROVIDER ONLY.
+  #
+  # The issuer URL is supplied by a workspace administrator — a tenant, not the
+  # cluster operator. With this on, any of them can point it at
+  # http://169.254.169.254/ and read the node's metadata service (its IAM
+  # credentials) through the API. The backend therefore REFUSES TO BOOT with
+  # this on unless PUBLIC_BASE_URL is a loopback address, so setting it in a
+  # real cluster produces a CrashLoopBackOff with an explicit error, not a
+  # quiet SSRF primitive.
+  allowInsecureIssuer: false
+
+  # Timeouts and lifetimes; the defaults are shown and all are optional.
+  # Bounds one call to the provider (discovery, JWKS, token exchange).
+  httpTimeout: "10s"
+  # How long a started sign-in stays completable.
+  authRequestTTL: "10m"
+  # Bounds the second step: the 2FA prompt or the account-link challenge.
+  pendingTTL: "5m"
+  # How long a fetched key set is served without revalidation. Rotation does not
+  # wait for it — an unknown `kid` triggers a throttled refetch.
+  jwksCacheTTL: "1h"
+  # Tolerance applied to the ID token's `exp` and `iat`.
+  clockSkew: "2m"
+
+# --- Outbound email -----------------------------------------------------------
+# Invitations are delivered by email. Left at "log" they are only written to the
+# backend log and an admin has to copy the invite_url out of the API response by
+# hand — which still works, and is the pre-existing behaviour.
+#
+# Which transport is correct is a property of the deployment, not a code
+# decision. In a cloud cluster (EKS, GKE, AKS, DOKS) outbound port 25 is blocked
+# by the provider, so `smtp` through a relay is the only thing that can work. On
+# bare metal that permits outbound 25, `smtp-direct` delivers to the recipient's
+# MX and keeps company mail off a third party.
+#
+# `smtp` covers Amazon SES, Postmark, SendGrid, Mailgun, Resend AND a corporate
+# Exchange relay — every one of them exposes authenticated SMTP, and only `host`
+# and the credentials differ. Switching providers is a values change, never a
+# code change. `resend` is not "the Resend integration"; it is the escape hatch
+# for a network where even 587/465 are blocked outbound.
+#
+# Secrets below (smtp.password, resend.apiKey, direct.dkim.privateKey) render
+# into the release Secret, not the ConfigMap. For anything beyond a trial, leave
+# them empty and inject via External Secrets / SOPS instead.
+#
+# Verify a live configuration with POST /api/v1/admin/mail/test — it sends to
+# the calling admin's own address and returns the transport's real error.
+mail:
+  # log | smtp | smtp-direct | resend
+  transport: "log"
+
+  # Envelope and header sender, and what SPF/DMARC are evaluated against.
+  # Required by the chart for every transport except "log".
+  from: ""
+  fromName: "SuperOps"
+
+  # Absolute public root of the web client. Every link in every message is built
+  # from it, so a relative or loopback value produces invitations nobody can
+  # open. Required for every transport except "log".
+  publicBaseURL: ""
+
+  productName: "SuperOps"
+
+  # Bounds one send attempt.
+  timeout: "30s"
+  # Per-IP limit on the admin mail test. Low on purpose — it triggers outbound
+  # mail, so it does not inherit the general API rate limit.
+  testPerMinute: 3
+
+  # --- transport: smtp ---
+  smtp:
+    # e.g. email-smtp.eu-west-1.amazonaws.com | smtp.postmarkapp.com |
+    #      smtp.sendgrid.net | smtp.eu.mailgun.org | smtp.resend.com
+    host: ""
+    port: 587
+    username: ""
+    password: ""  # -> Secret
+    # starttls (587, default) | implicit (465) | none.
+    # starttls REQUIRES the upgrade: a server that does not offer STARTTLS fails
+    # the send rather than silently falling back to plaintext.
+    tls: "starttls"
+    # Permit credentials over an unencrypted connection. Only for an in-cluster
+    # relay with tls: none; SMTP AUTH PLAIN is the password in base64.
+    allowInsecureAuth: false
+    # For a relay whose private CA is not in the image's trust store.
+    insecureSkipVerify: false
+    # EHLO name. Empty is fine — an authenticated relay authenticates the
+    # session instead of trusting this.
+    helo: ""
+
+  # --- transport: smtp-direct (bare metal only) ---
+  direct:
+    # REQUIRED for this transport: the public FQDN of the address this cluster
+    # egresses from. Receiving MTAs check it against that IP's PTR record.
+    helo: ""
+    port: 25
+    # DKIM signing. The transport starts without it and logs a prominent
+    # warning, but unsigned mail from an unfamiliar IP is spam to every large
+    # mailbox provider. All three must be set together, or none.
+    #   openssl genrsa -out dkim.key 2048
+    #   openssl rsa -in dkim.key -pubout -outform der | base64 -w0
+    # then publish TXT at <selector>._domainkey.<domain>:
+    #   "v=DKIM1; k=rsa; p=<base64>"
+    dkim:
+      domain: ""
+      selector: ""
+      # PEM block, verbatim (a Secret carries the newlines fine).
+      privateKey: ""  # -> Secret
+
+  # --- transport: resend ---
+  resend:
+    apiKey: ""  # -> Secret
+    # Overrides https://api.resend.com/emails. Leave empty.
+    endpoint: ""
+
 # --- Dependencies -------------------------------------------------------------
 postgresql:
   enabled: true

@@ -20,9 +20,20 @@ type Session struct {
 	RefreshTokenHash string
 	UserAgent        string
 	IPAddress        string
-	ExpiresAt        time.Time
-	CreatedAt        time.Time
+	// AuthMethod is how the session was obtained: MethodPassword or MethodSSO.
+	// Refresh re-evaluates SSO enforcement for a password session and not for
+	// an SSO one, which is only expressible because the row remembers.
+	AuthMethod string
+	ExpiresAt  time.Time
+	CreatedAt  time.Time
 }
+
+// Session authentication methods. Mirrors the CHECK constraint on
+// sessions.auth_method (migrations/014).
+const (
+	MethodPassword = "password"
+	MethodSSO      = "sso"
+)
 
 type Repository struct {
 	pool *pgxpool.Pool
@@ -33,10 +44,13 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 }
 
 func (r *Repository) CreateSession(ctx context.Context, s *Session) error {
+	if s.AuthMethod == "" {
+		s.AuthMethod = MethodPassword
+	}
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO sessions (id, user_id, refresh_token_hash, user_agent, ip_address, expires_at)
-		 VALUES ($1, $2, $3, $4, $5::inet, $6)`,
-		s.ID, s.UserID, s.RefreshTokenHash, s.UserAgent, s.IPAddress, s.ExpiresAt,
+		`INSERT INTO sessions (id, user_id, refresh_token_hash, user_agent, ip_address, expires_at, auth_method)
+		 VALUES ($1, $2, $3, $4, $5::inet, $6, $7)`,
+		s.ID, s.UserID, s.RefreshTokenHash, s.UserAgent, s.IPAddress, s.ExpiresAt, s.AuthMethod,
 	)
 	if err != nil {
 		return fmt.Errorf("create session: %w", err)
@@ -49,10 +63,10 @@ func (r *Repository) CreateSession(ctx context.Context, s *Session) error {
 func (r *Repository) GetSessionByToken(ctx context.Context, refreshToken string) (*Session, error) {
 	s := &Session{}
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, user_id, refresh_token_hash, user_agent, COALESCE(host(ip_address),''), expires_at, created_at
+		`SELECT id, user_id, refresh_token_hash, user_agent, COALESCE(host(ip_address),''), auth_method, expires_at, created_at
 		 FROM sessions WHERE refresh_token_hash = $1`,
 		crypto.HashToken(refreshToken),
-	).Scan(&s.ID, &s.UserID, &s.RefreshTokenHash, &s.UserAgent, &s.IPAddress, &s.ExpiresAt, &s.CreatedAt)
+	).Scan(&s.ID, &s.UserID, &s.RefreshTokenHash, &s.UserAgent, &s.IPAddress, &s.AuthMethod, &s.ExpiresAt, &s.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
