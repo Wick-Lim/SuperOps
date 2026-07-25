@@ -1,0 +1,206 @@
+package workflow
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+)
+
+// Action performs one step's side effect.
+//
+// An interface per capability rather than one fat one, so a deployment without
+// a chat surface simply has no post_message action and a workflow that uses it
+// is REJECTED at save time rather than failing at run time.
+type Action interface {
+	Kind() string
+	// Perform runs the effect. Its error is the run's error; a nil error with
+	// a result is a success worth recording.
+	Perform(ctx context.Context, run *Run, config map[string]any) (any, error)
+}
+
+// Executor runs a claimed run's steps in order.
+type Executor struct {
+	repo    *Repository
+	actions map[string]Action
+	logger  *slog.Logger
+}
+
+func NewExecutor(repo *Repository, logger *slog.Logger, actions ...Action) *Executor {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	byKind := make(map[string]Action, len(actions))
+	for _, a := range actions {
+		byKind[a.Kind()] = a
+	}
+	return &Executor{repo: repo, actions: byKind, logger: logger}
+}
+
+// Run executes every step, in order, stopping at the first failure.
+//
+// STOPPING IS THE RIGHT ANSWER. A workflow is a sequence somebody wrote as a
+// sequence: continuing past a failed step runs the later ones against a state
+// the author never anticipated, and "notify the customer" after "check the
+// customer exists" failed is worse than doing nothing.
+//
+// Every step claims its effect FIRST. A run that is retried after a crash skips
+// the steps that already ran, which is what makes the worker free to nak
+// whenever it is unsure.
+func (e *Executor) Run(ctx context.Context, run *Run, steps []Step) error {
+	payload := map[string]any{}
+	if len(run.Payload) > 0 {
+		if err := json.Unmarshal(run.Payload, &payload); err != nil {
+			// A payload we cannot read is a run we cannot execute, and it will
+			// never become readable. Fail it permanently rather than retrying
+			// forever.
+			_ = e.repo.FinishRun(ctx, run.ID, "failed", "unreadable trigger payload")
+			return nil
+		}
+	}
+
+	for i, step := range steps {
+		action, ok := e.actions[step.Kind]
+		if !ok {
+			// A step whose action this deployment does not have. Recorded as
+			// skipped rather than failed: the workflow is not wrong, this
+			// deployment simply cannot do it, and failing the run would hide
+			// the steps that CAN run.
+			_ = e.repo.FinishStep(ctx, run.ID, i, step.Kind, "skipped",
+				"no action registered for this step kind", nil)
+			continue
+		}
+
+		fresh, err := e.repo.ClaimEffect(ctx, run.ID, i, step.Kind)
+		if err != nil {
+			return fmt.Errorf("claim effect for step %d: %w", i, err)
+		}
+		if !fresh {
+			// A previous delivery already performed this. Skipping is the
+			// entire point of the effects table.
+			e.logger.Debug("workflow step already performed", "run_id", run.ID, "step", i)
+			_ = e.repo.FinishStep(ctx, run.ID, i, step.Kind, "succeeded", "",
+				map[string]any{"deduplicated": true})
+			continue
+		}
+
+		result, err := action.Perform(ctx, run, mergeConfig(step.Config, payload))
+		if err != nil {
+			_ = e.repo.FinishStep(ctx, run.ID, i, step.Kind, "failed", err.Error(), nil)
+			_ = e.repo.FinishRun(ctx, run.ID, "failed",
+				fmt.Sprintf("step %d (%s): %v", i, step.Kind, err))
+			return nil
+		}
+		e.repo.RecordEffectResult(ctx, run.ID, i, result)
+		_ = e.repo.FinishStep(ctx, run.ID, i, step.Kind, "succeeded", "", result)
+	}
+
+	return e.repo.FinishRun(ctx, run.ID, "succeeded", "")
+}
+
+// mergeConfig substitutes {{event.field}} references in a step's string values.
+//
+// Deliberately the smallest template that is useful: top-level fields of the
+// triggering event, by exact name, with no expressions. A template language
+// here would need its own parser, its own error reporting and its own escaping
+// story — and an escaping bug in a template that renders into a chat message is
+// a content-injection bug.
+func mergeConfig(config map[string]any, payload map[string]any) map[string]any {
+	out := make(map[string]any, len(config))
+	for k, v := range config {
+		s, ok := v.(string)
+		if !ok {
+			out[k] = v
+			continue
+		}
+		for field, value := range payload {
+			token := "{{event." + field + "}}"
+			if strings.Contains(s, token) {
+				s = strings.ReplaceAll(s, token, fmt.Sprint(value))
+			}
+		}
+		// An unresolved reference is left VISIBLE rather than blanked. A
+		// message reading "Hi {{event.name}}" tells the author exactly what is
+		// wrong; one reading "Hi " tells them nothing.
+		out[k] = s
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+// MessagePoster is the chat surface's half of post_message.
+type MessagePoster interface {
+	PostAs(ctx context.Context, workspaceID, channelID, body string) (string, error)
+}
+
+type postMessageAction struct{ poster MessagePoster }
+
+func NewPostMessageAction(p MessagePoster) Action { return postMessageAction{poster: p} }
+
+func (postMessageAction) Kind() string { return StepPostMessage }
+
+func (a postMessageAction) Perform(ctx context.Context, run *Run, config map[string]any) (any, error) {
+	channelID, _ := config["channel_id"].(string)
+	body, _ := config["body"].(string)
+	if channelID == "" || strings.TrimSpace(body) == "" {
+		return nil, fmt.Errorf("post_message needs a channel_id and a body")
+	}
+	id, err := a.poster.PostAs(ctx, run.WorkspaceID, channelID, body)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"message_id": id}, nil
+}
+
+// Notifier is the inbox's half of notify.
+type Notifier interface {
+	NotifyUser(ctx context.Context, workspaceID, userID, title, body string) error
+}
+
+type notifyAction struct{ notifier Notifier }
+
+func NewNotifyAction(n Notifier) Action { return notifyAction{notifier: n} }
+
+func (notifyAction) Kind() string { return StepNotify }
+
+func (a notifyAction) Perform(ctx context.Context, run *Run, config map[string]any) (any, error) {
+	userID, _ := config["user_id"].(string)
+	title, _ := config["title"].(string)
+	body, _ := config["body"].(string)
+	if userID == "" || strings.TrimSpace(title) == "" {
+		return nil, fmt.Errorf("notify needs a user_id and a title")
+	}
+	if err := a.notifier.NotifyUser(ctx, run.WorkspaceID, userID, title, body); err != nil {
+		return nil, err
+	}
+	return map[string]any{"notified": userID}, nil
+}
+
+// Commenter is the comment surface's half of add_comment.
+type Commenter interface {
+	CommentAs(ctx context.Context, workspaceID, objectType, objectID, body string) (string, error)
+}
+
+type addCommentAction struct{ commenter Commenter }
+
+func NewAddCommentAction(c Commenter) Action { return addCommentAction{commenter: c} }
+
+func (addCommentAction) Kind() string { return StepAddComment }
+
+func (a addCommentAction) Perform(ctx context.Context, run *Run, config map[string]any) (any, error) {
+	objectType, _ := config["object_type"].(string)
+	objectID, _ := config["object_id"].(string)
+	body, _ := config["body"].(string)
+	if objectType == "" || objectID == "" || strings.TrimSpace(body) == "" {
+		return nil, fmt.Errorf("add_comment needs an object_type, an object_id and a body")
+	}
+	id, err := a.commenter.CommentAs(ctx, run.WorkspaceID, objectType, objectID, body)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"comment_id": id}, nil
+}
