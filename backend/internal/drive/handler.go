@@ -84,6 +84,17 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	// because docs, spreadsheets and designs need the identical thing and three
 	// implementations of it is the failure the registry exists to prevent.
 	mux.Handle("POST /api/v1/drive/files/{file_id}/projection", authMw(http.HandlerFunc(h.PutProjection)))
+	// Embeds resolve PER CALLER. An embed node carries {ref_type, ref_id} and
+	// nothing else, so a document shared with somebody who cannot read its
+	// targets renders placeholders rather than leaking their names.
+	mux.Handle("POST /api/v1/drive/files/{file_id}/refs/resolve", authMw(http.HandlerFunc(h.ResolveRefs)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}/backlinks", authMw(http.HandlerFunc(h.ListFileBacklinks)))
+	mux.Handle("GET /api/v1/drive/refs/{ref_type}/{ref_id}/files", authMw(http.HandlerFunc(h.ListBacklinks)))
+	// The anchor half of a comment on a range. The comment itself is
+	// internal/comment's, unchanged — see ruling 7.
+	mux.Handle("PUT /api/v1/drive/files/{file_id}/comments/{comment_id}/anchor",
+		authMw(http.HandlerFunc(h.PutAnchor)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}/anchors", authMw(http.HandlerFunc(h.ListAnchors)))
 
 	mux.Handle("GET /api/v1/drive/{object_type}/{object_id}/shares", authMw(http.HandlerFunc(h.ListShares)))
 	mux.Handle("PUT /api/v1/drive/{object_type}/{object_id}/shares", authMw(http.HandlerFunc(h.PutShare)))

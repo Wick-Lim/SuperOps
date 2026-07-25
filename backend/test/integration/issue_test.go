@@ -5,6 +5,8 @@ package integration
 import (
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -363,8 +365,28 @@ func TestIssuesAreCommentableWithNoChangeToTheCommentSurface(t *testing.T) {
 // CHECK.
 var keySeq atomic.Int64
 
+// uniqueKey mints a project key that is unique across RUNS, not merely within
+// one.
+//
+// It used to be `T<nanos%100000><n>`, which has 100 µs of resolution and resets
+// n every run — and the database this suite runs against persists between runs,
+// so as projects accumulate a fresh key eventually lands on one that already
+// exists and the test fails with PROJECT_KEY_TAKEN. That is a flake in the
+// worst place: an authorization test that fails for an unrelated reason is one
+// somebody learns to re-run rather than read.
+//
+// The key shape is `^[A-Z][A-Z0-9]{1,9}$` — ten characters, and no lowercase —
+// so there is no room for a uuid. Base-36 of the full nanosecond clock is 9
+// digits until the year 2170 and gives a distinct key for every 1 ns, with the
+// counter making concurrent calls within the same nanosecond distinct too.
 func uniqueKey(t *testing.T) string {
 	t.Helper()
 	n := keySeq.Add(1)
-	return fmt.Sprintf("T%d%d", time.Now().UnixNano()%100000, n)
+	// 8 base-36 digits of the clock (~10 minutes of unique wrap) plus one of
+	// the counter keeps it inside the 10-character ceiling.
+	clock := strings.ToUpper(strconv.FormatInt(time.Now().UnixNano()%int64(36*36*36*36*36*36*36*36), 36))
+	for len(clock) < 8 {
+		clock = "0" + clock
+	}
+	return "T" + clock + strings.ToUpper(strconv.FormatInt(n%36, 36))
 }
