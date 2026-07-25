@@ -23,6 +23,8 @@ import NotificationsScreen from '../screens/NotificationsScreen'
 import NewChannelScreen from '../screens/NewChannelScreen'
 import NewDMScreen from '../screens/NewDMScreen'
 import MembersScreen from '../screens/MembersScreen'
+import BoardScreen from '../screens/BoardScreen'
+import IssueDetailScreen from '../screens/IssueDetailScreen'
 import DriveScreen from '../screens/DriveScreen'
 import DriveFileScreen from '../screens/DriveFileScreen'
 import DriveTrashScreen from '../screens/DriveTrashScreen'
@@ -55,6 +57,11 @@ export type RootStackParamList = {
    * by pushing a route, so there is no folderId here: a deep stack of folders
    * would make "back" mean "up one folder" in a way the breadcrumb already
    * does better. */
+  /** Work tracking. The board navigates between projects within itself rather
+   * than pushing a route: a stack of projects would make "back" mean "the
+   * project I was looking at before", which the project bar already does. */
+  Board: { projectId?: string } | undefined
+  IssueDetail: { issueId: string }
   Drive: undefined
   DriveFile: { fileId: string }
   DriveTrash: undefined
@@ -311,6 +318,8 @@ export default function AppNavigator() {
       <Stack.Screen name="Pins" component={PinnedMessagesScreen} />
       <Stack.Screen name="Scheduled" component={ScheduledMessagesScreen} />
       <Stack.Screen name="Bookmarks" component={BookmarksScreen} />
+      <Stack.Screen name="Board" component={BoardScreen} />
+      <Stack.Screen name="IssueDetail" component={IssueDetailScreen} />
       <Stack.Screen name="Drive" component={DriveScreen} />
       <Stack.Screen name="DriveFile" component={DriveFileScreen} />
       <Stack.Screen name="DriveTrash" component={DriveTrashScreen} />
