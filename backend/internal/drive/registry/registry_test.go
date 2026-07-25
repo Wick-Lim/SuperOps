@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 
@@ -17,6 +18,10 @@ func collabKind(t string) Kind {
 		DisplayName: strings.ToUpper(t[:1]) + t[1:],
 		Storage:     StorageCollab,
 		New:         func(context.Context, pgx.Tx, NewRequest) error { return nil },
+		// Every collab kind in the product sets this, so the golden literal
+		// below carries it as true rather than testing a shape no registered
+		// kind has.
+		ClientProjected: true,
 	}
 }
 
@@ -190,7 +195,8 @@ func TestRegistryDescriptorsAreAStableContract(t *testing.T) {
     "mime_types": [],
     "creatable": false,
     "versioned": true,
-    "previewable": false
+    "previewable": false,
+    "client_projected": false
   },
   {
     "type": "document",
@@ -200,7 +206,8 @@ func TestRegistryDescriptorsAreAStableContract(t *testing.T) {
     "mime_types": [],
     "creatable": true,
     "versioned": false,
-    "previewable": false
+    "previewable": false,
+    "client_projected": true
   }
 ]`
 	if string(got) != want {
@@ -218,6 +225,10 @@ func StubDocumentForTest() Kind {
 		DisplayName: "Document",
 		Storage:     StorageCollab,
 		New:         func(context.Context, pgx.Tx, NewRequest) error { return nil },
+		// Every collab kind in the product sets this, so the golden literal
+		// below carries it as true rather than testing a shape no registered
+		// kind has.
+		ClientProjected: true,
 	}
 }
 
@@ -231,4 +242,42 @@ func TestPlainFileIsNotCreatable(t *testing.T) {
 				"which produces an empty object nothing can fill")
 		}
 	}
+}
+
+// The two refusals that make ONE projection mechanism a registration-time
+// error rather than a review comment.
+func TestProjectionRefusals(t *testing.T) {
+	t.Run("a collab kind may not implement Text", func(t *testing.T) {
+		k := StubDocumentForTest()
+		k.Text = func(context.Context, io.Reader) (string, error) { return "", nil }
+		err := New().Register(k)
+		if err == nil {
+			t.Fatal("registered a collab kind with a Text extractor; there is no byte stream " +
+				"that IS a CRDT document, so this could only be the Go-side Yjs reader " +
+				"migration 015 refuses")
+		}
+		if !strings.Contains(err.Error(), "ClientProjected") {
+			t.Errorf("the error does not point at the alternative: %v", err)
+		}
+	})
+
+	t.Run("a blob kind may not be client-projected", func(t *testing.T) {
+		err := New().Register(Kind{
+			Type:            "report",
+			DisplayName:     "Report",
+			Storage:         StorageBlob,
+			ClientProjected: true,
+		})
+		if err == nil {
+			t.Fatal("registered a blob kind as client-projected; its bytes are on disk, so " +
+				"trusting a client's description of them would let the last caller with " +
+				"write capability decide what the search index says about it")
+		}
+	})
+
+	t.Run("collab plus ClientProjected is the shipped shape", func(t *testing.T) {
+		if err := New().Register(StubDocumentForTest()); err != nil {
+			t.Fatalf("the shape every editor uses was refused: %v", err)
+		}
+	})
 }

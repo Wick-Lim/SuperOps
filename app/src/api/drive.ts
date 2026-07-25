@@ -76,6 +76,15 @@ export interface RegistryKind {
   creatable: boolean
   versioned: boolean
   previewable: boolean
+  /**
+   * Whether this type's searchable body comes from the CLIENT.
+   *
+   * The server cannot read a CRDT document, so the editor that has it in memory
+   * renders it to text and posts that. The flag is on the wire — rather than
+   * each editor deciding for itself — because three editors deciding
+   * independently is exactly how you end up with three projection pipelines.
+   */
+  client_projected: boolean
 }
 
 export interface DriveVersion {

@@ -33,6 +33,7 @@ describe('creatableKinds', () => {
       creatable: false,
       versioned: true,
       previewable: false,
+      client_projected: false,
     },
     {
       type: 'document',
@@ -43,6 +44,7 @@ describe('creatableKinds', () => {
       creatable: true,
       versioned: false,
       previewable: false,
+      client_projected: true,
     },
   ]
 
@@ -85,6 +87,7 @@ describe('driveStore', () => {
       creatable: true,
       versioned: false,
       previewable: false,
+      client_projected: true,
     }
     useDriveStore.getState().setRegistry([kind])
     useDriveStore.getState().setRoot('root-1')

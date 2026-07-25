@@ -153,6 +153,27 @@ type Kind struct {
 	// be silently discarded by the next merge, which is worse than refusing —
 	// so the route answers 409 rather than accepting bytes it will drop.
 	Versioned bool
+
+	// ClientProjected reports that this kind's indexable body is PUBLISHED BY
+	// THE CLIENT that already has the object in memory, and stored as derived,
+	// non-authoritative state.
+	//
+	// It is the collab half of ONE projection mechanism; Text is the blob half,
+	// and they are mutually exclusive by construction. A StorageCollab object
+	// has no byte stream, so there is no io.Reader to hand Text — implementing
+	// it would require a Go-side Yjs reader, which migration 015's header
+	// refuses for the same reason it refuses a server-side merge: a Go
+	// reconstruction that disagreed with the client's would be a corruption bug
+	// debuggable from neither side.
+	//
+	// Every editor sets this and ships one client-side extractor. None of them
+	// adds a table, a route or a migration — that is what makes the registry
+	// real rather than decorative, and it is why the refusals below are
+	// registration-time errors instead of review comments.
+	//
+	// The drop test for any use of a projection: would corrupting it lose a
+	// user's writing? If yes, the design is wrong.
+	ClientProjected bool
 }
 
 // validate is what Register enforces. Separate so a test can state the rules.
@@ -176,6 +197,23 @@ func (k Kind) validate() error {
 		return fmt.Errorf("registry: kind %q is collab-backed and Versioned; a new version "+
 			"posted to a CRDT-backed object is silently discarded by the next merge, so the "+
 			"route must refuse it rather than accept it", k.Type)
+	}
+	if k.Storage == StorageCollab && k.Text != nil {
+		// Text takes an io.Reader over the stored object. A collab object's
+		// bytes are an append-only log of opaque CRDT updates, so the only way
+		// to implement this is a Go-side Yjs reader — which is the thing
+		// migration 015 refuses. Its body comes from ClientProjected.
+		return fmt.Errorf("registry: kind %q is collab-backed and implements Text; there is no "+
+			"byte stream that IS a CRDT document, so this could only be a Go-side Yjs reader — "+
+			"set ClientProjected instead", k.Type)
+	}
+	if k.ClientProjected && k.Storage != StorageCollab {
+		// A blob type's bytes are on disk and the server can read them. Trusting
+		// a client to describe them instead would make the search index say
+		// whatever the last caller with write capability claimed.
+		return fmt.Errorf("registry: kind %q sets ClientProjected but is not collab-backed; "+
+			"a blob type's bytes are on disk, so it extracts with Text rather than trusting "+
+			"a client's description of them", k.Type)
 	}
 	if k.Storage == StorageCollab && k.New == nil {
 		return fmt.Errorf("registry: kind %q is collab-backed but has no New; "+
@@ -329,6 +367,11 @@ type Descriptor struct {
 	// client uses it to decide between a grid and a list, not to decide whether
 	// to request one.
 	Previewable bool `json:"previewable"`
+	// ClientProjected tells the client to run its extractor for this type and
+	// POST the result. Without it on the wire each editor would decide for
+	// itself whether to project, which is the divergence the field exists to
+	// prevent.
+	ClientProjected bool `json:"client_projected"`
 }
 
 // Descriptors renders All() for the API.
@@ -353,9 +396,10 @@ func (r *Registry) Descriptors() []Descriptor {
 			MimeTypes:   mimes,
 			// A plain file has nothing to create: "New File" would produce an
 			// empty object with no way to put bytes in it except upload.
-			Creatable:   k.New != nil,
-			Versioned:   k.Versioned,
-			Previewable: k.Thumb != nil,
+			Creatable:       k.New != nil,
+			Versioned:       k.Versioned,
+			Previewable:     k.Thumb != nil,
+			ClientProjected: k.ClientProjected,
 		})
 	}
 	return out
