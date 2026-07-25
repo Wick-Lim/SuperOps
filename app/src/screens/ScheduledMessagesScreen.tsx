@@ -7,7 +7,15 @@ import { useUserStore } from '../stores/userStore'
 import { errorMessage } from '../api/client'
 import type { Message } from '../lib/types'
 import MessageRow from './internal/MessageRow'
-import { EmptyState, ErrorState, ListFooter, LoadingState, ScreenHeader } from './internal/ui'
+import {
+  CONTENT_MAX_WIDTH,
+  EmptyState,
+  ErrorState,
+  ListFooter,
+  LoadingState,
+  ScreenHeader,
+  contentColumn,
+} from './internal/ui'
 
 const PAGE_SIZE = 30
 
@@ -101,6 +109,7 @@ export default function ScheduledMessagesScreen({ navigation, route }: { navigat
         title="Scheduled"
         subtitle={channel?.name ? `#${channel.name}` : undefined}
         onBack={() => navigation.goBack()}
+        maxWidth={CONTENT_MAX_WIDTH}
       />
       {loading ? (
         <LoadingState label="Loading scheduled messages" />
@@ -110,6 +119,9 @@ export default function ScheduledMessagesScreen({ navigation, route }: { navigat
         <FlatList
           data={items}
           keyExtractor={(m) => m.id}
+          // Message text is prose: it stops at the reading measure and centres
+          // instead of running the width of a monitor.
+          contentContainerStyle={contentColumn()}
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={() => load('refresh')} tintColor={theme.accent} />
           }

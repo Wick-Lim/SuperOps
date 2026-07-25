@@ -13,7 +13,7 @@ import { usePushNotifications } from '../lib/push'
 import { navigationRef } from './navigationRef'
 import { API_BASE_URL } from '../config'
 import { theme } from '../lib/theme'
-import { MIN_TOUCH } from '../components/a11y'
+import { useResponsive } from '../lib/responsive'
 import LoginScreen from '../screens/LoginScreen'
 import InviteScreen from '../screens/InviteScreen'
 import OnboardingScreen from '../screens/OnboardingScreen'
@@ -123,6 +123,10 @@ type Boot =
   | { status: 'ready'; route: 'Workspace' | 'Onboarding' }
 
 function BootstrapView({ boot, onRetry }: { boot: Boot; onRetry: () => void }) {
+  // The only pre-shell screen that renders prose. Uncapped, its error message
+  // ran the full width of the window; `maxWidth` is the whole fix, and the
+  // pointer tiers tighten the buttons with everything else.
+  const { minTouch } = useResponsive()
   return (
     <View
       style={{
@@ -132,6 +136,9 @@ function BootstrapView({ boot, onRetry }: { boot: Boot; onRetry: () => void }) {
         justifyContent: 'center',
         padding: 32,
         gap: 16,
+        maxWidth: 480,
+        alignSelf: 'center',
+        width: '100%',
       }}
     >
       {boot.status === 'error' ? (
@@ -151,7 +158,7 @@ function BootstrapView({ boot, onRetry }: { boot: Boot; onRetry: () => void }) {
               backgroundColor: theme.primary,
               borderRadius: 12,
               paddingHorizontal: 24,
-              minHeight: MIN_TOUCH,
+              minHeight: minTouch,
               justifyContent: 'center',
             }}
           >
@@ -166,7 +173,7 @@ function BootstrapView({ boot, onRetry }: { boot: Boot; onRetry: () => void }) {
             }}
             accessibilityRole="button"
             accessibilityLabel="Sign out"
-            style={{ paddingHorizontal: 24, minHeight: MIN_TOUCH, justifyContent: 'center' }}
+            style={{ paddingHorizontal: 24, minHeight: minTouch, justifyContent: 'center' }}
           >
             <Text style={{ color: theme.textMuted, fontWeight: '600' }}>Sign out</Text>
           </Pressable>

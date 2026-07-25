@@ -9,7 +9,8 @@ import { useWorkspaceStore } from '../stores/workspaceStore'
 import { useChannelStore } from '../stores/channelStore'
 import { useUserStore } from '../stores/userStore'
 import { errorMessage } from '../api/client'
-import { MIN_TOUCH, ScreenHeader } from './internal/ui'
+import { useResponsive } from '../lib/responsive'
+import { CONTENT_MAX_WIDTH, ContentColumn, ScreenHeader, contentColumn } from './internal/ui'
 
 function initial(u: PublicUser): string {
   return (u.full_name || u.username || '?').trim().charAt(0).toUpperCase() || '?'
@@ -21,6 +22,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
   const addChannel = useChannelStore((s) => s.addChannel)
   const setActiveChannel = useChannelStore((s) => s.setActiveChannel)
   const setUser = useUserStore((s) => s.setUser)
+  const { tier, gutter, minTouch } = useResponsive()
 
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<PublicUser[]>([])
@@ -94,6 +96,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
         title="New message"
         backLabel="Cancel"
         onBack={() => navigation.goBack()}
+        maxWidth={CONTENT_MAX_WIDTH}
         right={
           <Pressable
             onPress={handleStart}
@@ -102,7 +105,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
             accessibilityLabel="Start conversation"
             accessibilityState={{ disabled: selected.length === 0 || starting, busy: starting }}
             hitSlop={8}
-            style={{ minHeight: MIN_TOUCH, minWidth: MIN_TOUCH, alignItems: 'center', justifyContent: 'center' }}
+            style={{ minHeight: minTouch, minWidth: minTouch, alignItems: 'center', justifyContent: 'center' }}
           >
             <Text
               style={{
@@ -121,9 +124,10 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
       {selected.length > 0 ? (
         <View
           style={{
+            ...contentColumn(),
             flexDirection: 'row',
             flexWrap: 'wrap',
-            paddingHorizontal: 12,
+            paddingHorizontal: gutter,
             paddingTop: 12,
             gap: 8,
           }}
@@ -168,7 +172,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
       ) : null}
 
       {/* Search input */}
-      <View style={{ paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8 }}>
+      <ContentColumn style={{ paddingTop: 12, paddingBottom: 8 }}>
         <TextInput
           value={query}
           onChangeText={setQuery}
@@ -188,7 +192,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
             fontSize: 15,
           }}
         />
-      </View>
+      </ContentColumn>
 
       {/* Results */}
       {searching ? (
@@ -204,6 +208,7 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
           data={results}
           keyExtractor={(u) => u.id}
           keyboardShouldPersistTaps="handled"
+          contentContainerStyle={contentColumn()}
           ListEmptyComponent={
             query.trim() ? (
               <Text style={{ color: theme.textMuted, fontSize: 14, textAlign: 'center', paddingTop: 32 }}>
@@ -226,9 +231,9 @@ export default function NewDMScreen({ navigation }: { navigation: any; route: an
                 style={{
                   flexDirection: 'row',
                   alignItems: 'center',
-                  paddingHorizontal: 16,
-                  paddingVertical: 12,
-                  minHeight: MIN_TOUCH,
+                  paddingHorizontal: gutter,
+                  paddingVertical: tier === 'compact' ? 12 : 8,
+                  minHeight: minTouch,
                   borderBottomWidth: 1,
                   borderBottomColor: theme.border,
                 }}

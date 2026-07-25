@@ -16,7 +16,8 @@ import { fileApi, type PickedFile, type UploadedFile } from '../../api/files'
 import { errorMessage } from '../../api/client'
 import { wsManager } from '../../lib/websocket'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
-import { MIN_TOUCH, touchSlop } from '../a11y'
+import { space, useResponsive } from '../../lib/responsive'
+import { touchSlop } from '../a11y'
 
 /** A file the user picked but that has not been sent to the server yet. */
 interface StagedFile {
@@ -46,6 +47,7 @@ export default function MessageInput({
   const [staged, setStaged] = useState<StagedFile[]>([])
   const [sending, setSending] = useState(false)
   const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace)
+  const { tier, minTouch } = useResponsive()
   const lastTypingRef = useRef(0)
   const typingActiveRef = useRef(false)
 
@@ -132,13 +134,17 @@ export default function MessageInput({
   }
 
   /**
-   * Web/hardware-keyboard shortcut only.
+   * Enter sends, Shift+Enter inserts a newline — the expectation with a physical
+   * keyboard, and the reason a chat composer feels wrong on a desktop without it.
    *
-   * `onSubmitEditing` on a multiline TextInput does not fire on Android — Enter
-   * inserts a newline — so it was never a dependable send path and is gone. The
-   * Send button is the contract on every platform; this just restores
-   * Enter-to-send where the key event is real and cancellable.
+   * Gated on the tier, not just the platform: a phone-width browser window is
+   * still a thumb-driven layout with an on-screen keyboard whose Enter key is a
+   * newline, and `onSubmitEditing` on a multiline TextInput does not fire on
+   * Android at all. Below `medium` the Send button stays the only send path,
+   * exactly as before.
    */
+  const enterSends = Platform.OS === 'web' && tier !== 'compact'
+
   const handleKeyPress = (e: NativeSyntheticEvent<TextInputKeyPressEventData>) => {
     const ne = e.nativeEvent as TextInputKeyPressEventData & { shiftKey?: boolean }
     if (ne.key !== 'Enter' || ne.shiftKey) return
@@ -195,8 +201,8 @@ export default function MessageInput({
           accessibilityLabel="Attach a file"
           accessibilityState={{ disabled: sending }}
           style={{
-            width: MIN_TOUCH,
-            height: MIN_TOUCH,
+            width: minTouch,
+            height: minTouch,
             borderRadius: 12,
             alignItems: 'center',
             justifyContent: 'center',
@@ -219,7 +225,7 @@ export default function MessageInput({
           accessibilityLabel={placeholder ?? `Message ${channelName || 'channel'}`}
           multiline
           submitBehavior="newline"
-          onKeyPress={Platform.OS === 'web' ? handleKeyPress : undefined}
+          onKeyPress={enterSends ? handleKeyPress : undefined}
           style={{
             flex: 1,
             backgroundColor: theme.surface,
@@ -227,10 +233,10 @@ export default function MessageInput({
             borderColor: theme.borderStrong,
             borderRadius: 12,
             paddingHorizontal: 14,
-            paddingVertical: 10,
+            paddingVertical: 9,
             color: theme.text,
             fontSize: 15,
-            minHeight: MIN_TOUCH,
+            minHeight: minTouch,
             maxHeight: 120,
           }}
         />
@@ -244,9 +250,9 @@ export default function MessageInput({
           style={{
             backgroundColor: canSend ? theme.primary : theme.surfaceAlt,
             borderRadius: 12,
-            paddingHorizontal: 16,
-            minWidth: 72,
-            minHeight: MIN_TOUCH,
+            paddingHorizontal: enterSends ? 14 : 16,
+            minWidth: enterSends ? 60 : 72,
+            minHeight: minTouch,
             alignItems: 'center',
             justifyContent: 'center',
           }}
@@ -258,6 +264,25 @@ export default function MessageInput({
           )}
         </Pressable>
       </View>
+
+      {/* A shortcut nobody is told about does not exist. Shown while there is
+          something to send, but the row is always laid out where the shortcut is
+          bound: appearing on the first keystroke would shove the whole
+          conversation up 19px, and sending would drop it back down again. */}
+      {enterSends && (
+        <View
+          style={{
+            paddingHorizontal: space.md,
+            paddingBottom: 6,
+            marginTop: -4,
+            opacity: content ? 1 : 0,
+          }}
+        >
+          <Text style={{ color: theme.textDim, fontSize: 11 }}>
+            Enter to send · Shift+Enter for a new line
+          </Text>
+        </View>
+      )}
     </View>
   )
 }

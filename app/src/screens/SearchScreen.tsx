@@ -20,7 +20,8 @@ import { useAuthStore } from '../stores/authStore'
 import { useUserStore, displayName } from '../stores/userStore'
 import { errorMessage } from '../api/client'
 import type { PublicUser } from '../lib/types'
-import { Button, Chip, EmptyState, MIN_TOUCH, ScreenHeader } from './internal/ui'
+import { useResponsive } from '../lib/responsive'
+import { Button, Chip, EmptyState, ScreenHeader, contentColumn } from './internal/ui'
 
 /** The backend caps at 100; step up rather than paginate — search has no cursor. */
 const LIMIT_STEPS = [20, 50, 100]
@@ -37,6 +38,15 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
   const users = useUserStore((s) => s.users)
 
   const me = useAuthStore((s) => s.user)
+  const { tier, gutter, minTouch } = useResponsive()
+  /**
+   * `channel` and `from` have always been in the API and were only ever a tap
+   * away behind a toggle, because a phone has no room to keep them on screen.
+   * A desktop does: the filters become a rail that stays visible next to the
+   * results, so the toggle (and the guessing about what is currently applied)
+   * is what the extra width removes.
+   */
+  const filterRail = tier !== 'compact'
 
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<SearchHit[]>([])
@@ -170,9 +180,9 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
       style={{
         flexDirection: 'row',
         gap: 10,
-        paddingHorizontal: 16,
-        paddingVertical: 12,
-        minHeight: MIN_TOUCH,
+        paddingHorizontal: gutter,
+        paddingVertical: tier === 'compact' ? 12 : 9,
+        minHeight: minTouch,
         borderBottomWidth: 1,
         borderBottomColor: theme.border,
         opacity: opening === item.id ? 0.5 : 1,
@@ -209,180 +219,243 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
     </Pressable>
   )
 
+  const channelChips = [
+    <Chip key="all" label="All" selected={!channelFilter} onPress={() => setChannelFilter(null)} />,
+    ...searchableChannels.map((c) => (
+      <Chip
+        key={c.id}
+        label={c.name || 'dm'}
+        selected={channelFilter === c.id}
+        onPress={() => setChannelFilter(channelFilter === c.id ? null : c.id)}
+        accessibilityLabel={`Only in ${c.name || 'this direct message'}`}
+      />
+    )),
+  ]
+
+  const peopleChips = people.map((p) => (
+    <Chip
+      key={p.id}
+      label={p.full_name || p.username}
+      selected={fromUser?.id === p.id}
+      onPress={() => {
+        setFromUser(p)
+        setPeopleQuery('')
+        setPeople([])
+      }}
+    />
+  ))
+
+  /**
+   * `rail` chips wrap down a narrow column; on a phone the same chips scroll
+   * sideways, because a wrapped list of every channel would push the results
+   * off the screen.
+   */
+  const chipGroup = (children: React.ReactNode, rail: boolean, paddingTop = 0) =>
+    rail ? (
+      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingTop }}>{children}</View>
+    ) : (
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={{ gap: 8, paddingTop, paddingBottom: 4 }}
+      >
+        {children}
+      </ScrollView>
+    )
+
+  const filters = (rail: boolean) => (
+    <View>
+      <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 6 }}>Channel</Text>
+      {chipGroup(channelChips, rail)}
+
+      <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 12, marginBottom: 6 }}>From</Text>
+      <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <Chip label="Anyone" selected={!fromUser} onPress={() => setFromUser(null)} />
+        {me ? (
+          <Chip
+            label="Me"
+            selected={fromUser?.id === me.id}
+            onPress={() =>
+              setFromUser(
+                fromUser?.id === me.id
+                  ? null
+                  : {
+                      id: me.id,
+                      username: me.username,
+                      full_name: me.full_name,
+                      avatar_url: me.avatar_url,
+                      status_text: me.status_text,
+                      status_emoji: me.status_emoji,
+                      is_bot: me.is_bot,
+                    },
+              )
+            }
+          />
+        ) : null}
+        {fromUser && fromUser.id !== me?.id ? (
+          <Chip label={fromUser.full_name || fromUser.username} selected onPress={() => setFromUser(null)} />
+        ) : null}
+      </View>
+
+      <TextInput
+        value={peopleQuery}
+        onChangeText={setPeopleQuery}
+        placeholder="Find a person…"
+        placeholderTextColor={theme.textMuted}
+        autoCapitalize="none"
+        accessibilityLabel="Filter by author"
+        style={{
+          marginTop: 8,
+          backgroundColor: theme.surface,
+          borderWidth: 1,
+          borderColor: theme.borderStrong,
+          borderRadius: 10,
+          paddingHorizontal: 12,
+          paddingVertical: rail ? 8 : 10,
+          minHeight: minTouch,
+          color: theme.text,
+          fontSize: 14,
+        }}
+      />
+      {people.length > 0 ? chipGroup(peopleChips, rail, 8) : null}
+
+      <View style={{ marginTop: 12 }}>
+        <Button label="Apply filters" onPress={() => runSearch(LIMIT_STEPS[0])} />
+      </View>
+    </View>
+  )
+
+  const searchField = (
+    <TextInput
+      value={query}
+      onChangeText={setQuery}
+      onSubmitEditing={() => runSearch(LIMIT_STEPS[0])}
+      returnKeyType="search"
+      autoFocus
+      placeholder="Search messages..."
+      placeholderTextColor={theme.textMuted}
+      accessibilityLabel="Search messages"
+      style={{
+        backgroundColor: theme.surface,
+        borderWidth: 1,
+        borderColor: theme.borderStrong,
+        borderRadius: 12,
+        paddingHorizontal: 14,
+        paddingVertical: filterRail ? 9 : 12,
+        minHeight: minTouch,
+        color: theme.text,
+        fontSize: 15,
+      }}
+    />
+  )
+
+  const resultCount =
+    searched && !loading ? (
+      <Text
+        accessibilityRole="text"
+        style={{ color: theme.textMuted, fontSize: 12, paddingHorizontal: gutter, paddingVertical: 8 }}
+      >
+        Showing {hits.length} of about {total} {total === 1 ? 'result' : 'results'}
+      </Text>
+    ) : null
+
+  const results = loading ? (
+    <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+      <ActivityIndicator color={theme.accent} accessibilityLabel="Searching" />
+    </View>
+  ) : (
+    <FlatList
+      data={hits}
+      keyExtractor={(item) => item.id}
+      renderItem={renderHit}
+      keyboardShouldPersistTaps="handled"
+      // A hit is a quoted message: prose, so it stops at the reading measure.
+      contentContainerStyle={contentColumn()}
+      ListEmptyComponent={
+        <EmptyState
+          title={searched ? 'No messages found' : 'Search your workspace'}
+          body={
+            searched
+              ? 'Try fewer words, or clear the channel and author filters.'
+              : 'Results only include channels you can read.'
+          }
+        />
+      }
+      ListFooterComponent={
+        canShowMore ? (
+          <View style={{ padding: 16, alignItems: filterRail ? 'center' : 'stretch' }}>
+            <View style={{ minWidth: filterRail ? 220 : undefined }}>
+              <Button
+                label={`Show more (up to ${nextLimit})`}
+                onPress={() => runSearch(nextLimit as number)}
+                variant="ghost"
+              />
+            </View>
+          </View>
+        ) : null
+      }
+    />
+  )
+
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
       <ScreenHeader
         title="Search"
         onBack={() => navigation.goBack()}
         right={
-          <Pressable
-            onPress={() => setShowFilters((v) => !v)}
-            accessibilityRole="button"
-            accessibilityLabel={activeFilterCount ? `Filters, ${activeFilterCount} active` : 'Filters'}
-            accessibilityState={{ expanded: showFilters }}
-            hitSlop={8}
-            style={{ minHeight: MIN_TOUCH, minWidth: MIN_TOUCH, alignItems: 'center', justifyContent: 'center' }}
-          >
-            <Text style={{ color: theme.accent, fontSize: 14 }}>
-              Filters{activeFilterCount ? ` (${activeFilterCount})` : ''}
-            </Text>
-          </Pressable>
+          // The rail already shows what is applied, so the toggle is redundant.
+          filterRail ? undefined : (
+            <Pressable
+              onPress={() => setShowFilters((v) => !v)}
+              accessibilityRole="button"
+              accessibilityLabel={activeFilterCount ? `Filters, ${activeFilterCount} active` : 'Filters'}
+              accessibilityState={{ expanded: showFilters }}
+              hitSlop={8}
+              style={{ minHeight: minTouch, minWidth: minTouch, alignItems: 'center', justifyContent: 'center' }}
+            >
+              <Text style={{ color: theme.accent, fontSize: 14 }}>
+                Filters{activeFilterCount ? ` (${activeFilterCount})` : ''}
+              </Text>
+            </Pressable>
+          )
         }
       />
 
-      <View style={{ paddingHorizontal: 16, paddingTop: 12 }}>
-        <TextInput
-          value={query}
-          onChangeText={setQuery}
-          onSubmitEditing={() => runSearch(LIMIT_STEPS[0])}
-          returnKeyType="search"
-          autoFocus
-          placeholder="Search messages..."
-          placeholderTextColor={theme.textMuted}
-          accessibilityLabel="Search messages"
-          style={{
-            backgroundColor: theme.surface,
-            borderWidth: 1,
-            borderColor: theme.borderStrong,
-            borderRadius: 12,
-            paddingHorizontal: 14,
-            paddingVertical: 12,
-            minHeight: MIN_TOUCH,
-            color: theme.text,
-            fontSize: 15,
-          }}
-        />
-      </View>
-
-      {showFilters ? (
-        <View style={{ paddingHorizontal: 16, paddingTop: 12 }}>
-          <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 6 }}>Channel</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingBottom: 4 }}>
-            <Chip label="All" selected={!channelFilter} onPress={() => setChannelFilter(null)} />
-            {searchableChannels.map((c) => (
-              <Chip
-                key={c.id}
-                label={c.name || 'dm'}
-                selected={channelFilter === c.id}
-                onPress={() => setChannelFilter(channelFilter === c.id ? null : c.id)}
-                accessibilityLabel={`Only in ${c.name || 'this direct message'}`}
-              />
-            ))}
-          </ScrollView>
-
-          <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 12, marginBottom: 6 }}>From</Text>
-          <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            <Chip label="Anyone" selected={!fromUser} onPress={() => setFromUser(null)} />
-            {me ? (
-              <Chip
-                label="Me"
-                selected={fromUser?.id === me.id}
-                onPress={() =>
-                  setFromUser(
-                    fromUser?.id === me.id
-                      ? null
-                      : {
-                          id: me.id,
-                          username: me.username,
-                          full_name: me.full_name,
-                          avatar_url: me.avatar_url,
-                          status_text: me.status_text,
-                          status_emoji: me.status_emoji,
-                          is_bot: me.is_bot,
-                        },
-                  )
-                }
-              />
-            ) : null}
-            {fromUser && fromUser.id !== me?.id ? (
-              <Chip label={fromUser.full_name || fromUser.username} selected onPress={() => setFromUser(null)} />
-            ) : null}
-          </View>
-
-          <TextInput
-            value={peopleQuery}
-            onChangeText={setPeopleQuery}
-            placeholder="Find a person…"
-            placeholderTextColor={theme.textMuted}
-            autoCapitalize="none"
-            accessibilityLabel="Filter by author"
-            style={{
-              marginTop: 8,
-              backgroundColor: theme.surface,
-              borderWidth: 1,
-              borderColor: theme.borderStrong,
-              borderRadius: 10,
-              paddingHorizontal: 12,
-              paddingVertical: 10,
-              minHeight: MIN_TOUCH,
-              color: theme.text,
-              fontSize: 14,
-            }}
-          />
-          {people.length > 0 ? (
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingTop: 8 }}>
-              {people.map((p) => (
-                <Chip
-                  key={p.id}
-                  label={p.full_name || p.username}
-                  selected={fromUser?.id === p.id}
-                  onPress={() => {
-                    setFromUser(p)
-                    setPeopleQuery('')
-                    setPeople([])
-                  }}
-                />
-              ))}
+      {filterRail ? (
+        <View style={{ flex: 1, flexDirection: 'row' }}>
+          <View style={{ width: 268, borderRightWidth: 1, borderRightColor: theme.border }}>
+            <ScrollView contentContainerStyle={{ padding: gutter }} keyboardShouldPersistTaps="handled">
+              <Text
+                accessibilityRole="header"
+                style={{
+                  color: theme.textMuted,
+                  fontSize: 11,
+                  fontWeight: '700',
+                  letterSpacing: 1,
+                  marginBottom: 12,
+                }}
+              >
+                FILTERS
+              </Text>
+              {filters(true)}
             </ScrollView>
-          ) : null}
-
-          <View style={{ marginTop: 12 }}>
-            <Button label="Apply filters" onPress={() => runSearch(LIMIT_STEPS[0])} />
           </View>
-        </View>
-      ) : null}
 
-      {searched && !loading ? (
-        <Text
-          accessibilityRole="text"
-          style={{ color: theme.textMuted, fontSize: 12, paddingHorizontal: 16, paddingVertical: 8 }}
-        >
-          Showing {hits.length} of about {total} {total === 1 ? 'result' : 'results'}
-        </Text>
-      ) : null}
-
-      {loading ? (
-        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-          <ActivityIndicator color={theme.accent} accessibilityLabel="Searching" />
+          <View style={{ flex: 1 }}>
+            <View style={{ ...contentColumn(), paddingHorizontal: gutter, paddingTop: 12 }}>{searchField}</View>
+            <View style={contentColumn()}>{resultCount}</View>
+            {results}
+          </View>
         </View>
       ) : (
-        <FlatList
-          data={hits}
-          keyExtractor={(item) => item.id}
-          renderItem={renderHit}
-          keyboardShouldPersistTaps="handled"
-          ListEmptyComponent={
-            <EmptyState
-              title={searched ? 'No messages found' : 'Search your workspace'}
-              body={
-                searched
-                  ? 'Try fewer words, or clear the channel and author filters.'
-                  : 'Results only include channels you can read.'
-              }
-            />
-          }
-          ListFooterComponent={
-            canShowMore ? (
-              <View style={{ padding: 16 }}>
-                <Button
-                  label={`Show more (up to ${nextLimit})`}
-                  onPress={() => runSearch(nextLimit as number)}
-                  variant="ghost"
-                />
-              </View>
-            ) : null
-          }
-        />
+        <>
+          <View style={{ paddingHorizontal: gutter, paddingTop: 12 }}>{searchField}</View>
+          {showFilters ? (
+            <View style={{ paddingHorizontal: gutter, paddingTop: 12 }}>{filters(false)}</View>
+          ) : null}
+          {resultCount}
+          {results}
+        </>
       )}
     </SafeAreaView>
   )

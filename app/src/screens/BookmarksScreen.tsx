@@ -9,7 +9,15 @@ import { useUserStore } from '../stores/userStore'
 import { errorMessage } from '../api/client'
 import type { Bookmark } from '../lib/types'
 import MessageRow from './internal/MessageRow'
-import { EmptyState, ErrorState, ListFooter, LoadingState, ScreenHeader } from './internal/ui'
+import {
+  CONTENT_MAX_WIDTH,
+  EmptyState,
+  ErrorState,
+  ListFooter,
+  LoadingState,
+  ScreenHeader,
+  contentColumn,
+} from './internal/ui'
 
 const PAGE_SIZE = 30
 
@@ -98,7 +106,7 @@ export default function BookmarksScreen({ navigation }: { navigation: any; route
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-      <ScreenHeader title="Bookmarks" onBack={() => navigation.goBack()} />
+      <ScreenHeader title="Bookmarks" onBack={() => navigation.goBack()} maxWidth={CONTENT_MAX_WIDTH} />
       {loading ? (
         <LoadingState label="Loading bookmarks" />
       ) : error ? (
@@ -107,6 +115,9 @@ export default function BookmarksScreen({ navigation }: { navigation: any; route
         <FlatList
           data={items}
           keyExtractor={(b) => b.message.id}
+          // A saved message is prose: capped at the reading measure and centred,
+          // rather than one 1600px line per bookmark.
+          contentContainerStyle={contentColumn()}
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={() => load('refresh')} tintColor={theme.accent} />
           }

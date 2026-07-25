@@ -21,18 +21,38 @@ import { useUiStore } from '../stores/uiStore'
 import { useUserStore, displayName } from '../stores/userStore'
 import { errorMessage } from '../api/client'
 import { useWorkspaceRole } from './internal/useWorkspaceRole'
+import { useResponsive } from '../lib/responsive'
 import {
   Chip,
+  type Column,
   EmptyState,
   ErrorState,
   LoadingState,
-  MIN_TOUCH,
   ScreenHeader,
+  TABLE_MAX_WIDTH,
+  TableHeader,
+  cell,
+  contentColumn,
 } from './internal/ui'
 
 function roleLabel(role: string): string {
   if (!role) return ''
   return role.charAt(0).toUpperCase() + role.slice(1)
+}
+
+/**
+ * The roster is a table pretending to be a phone list: every row carries the
+ * same four facts. Once there is width for columns, presence and role stop
+ * being a second line under the name and become fields you can scan down.
+ */
+function memberColumns(canManage: boolean): Column[] {
+  const cols: Column[] = [
+    { key: 'member', label: 'Member', flex: 1 },
+    { key: 'status', label: 'Status', width: 96 },
+    { key: 'role', label: 'Role', width: 88 },
+  ]
+  if (canManage) cols.push({ key: 'actions', label: '', width: 76, align: 'right' })
+  return cols
 }
 
 export default function MembersScreen({ navigation, route }: { navigation: any; route: any }) {
@@ -45,6 +65,8 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
   // too; this screen used to keep its own copy and never updated.
   const presence = useUiStore((s) => s.presence)
   const { isAdmin: workspaceIsAdmin } = useWorkspaceRole()
+  const { tier, gutter, minTouch } = useResponsive()
+  const table = tier !== 'compact'
 
   const [members, setMembers] = useState<ChannelMemberView[]>([])
   const [loading, setLoading] = useState(true)
@@ -62,6 +84,7 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
   // Mirrors backend `canAdministerChannel`: channel admin OR workspace admin.
   // DMs have a fixed roster; the backend answers 409 CANNOT_MODIFY_DM.
   const canManage = !isDM && (myMembership?.role === 'admin' || workspaceIsAdmin)
+  const columns = useMemo(() => memberColumns(canManage), [canManage])
 
   const load = useCallback(
     async (mode: 'initial' | 'refresh' = 'initial') => {
@@ -161,53 +184,128 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
 
   const memberIds = useMemo(() => new Set(members.map((m) => m.user_id)), [members])
 
+  /** Avatar with its presence dot; smaller once rows are a table. */
+  const avatar = (userId: string, name: string, dotColor: string, size: number) => (
+    <View>
+      <View
+        style={{
+          width: size,
+          height: size,
+          borderRadius: size / 2,
+          backgroundColor: avatarColor(userId),
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}
+      >
+        <Text style={{ color: '#fff', fontWeight: '700', fontSize: size < 34 ? 12 : 15 }}>
+          {(name || '?').charAt(0).toUpperCase()}
+        </Text>
+      </View>
+      <View
+        style={{
+          position: 'absolute',
+          right: -1,
+          bottom: -1,
+          width: 13,
+          height: 13,
+          borderRadius: 7,
+          backgroundColor: dotColor,
+          borderWidth: 2,
+          borderColor: theme.bg,
+        }}
+      />
+    </View>
+  )
+
+  const removeButton = (m: ChannelMemberView, name: string) => (
+    <Pressable
+      onPress={() => removeMember(m)}
+      disabled={busyUserId === m.user_id}
+      accessibilityRole="button"
+      accessibilityLabel={`Remove ${name} from the channel`}
+      hitSlop={8}
+      style={{
+        minHeight: minTouch,
+        minWidth: minTouch,
+        alignItems: 'flex-end',
+        justifyContent: 'center',
+        opacity: busyUserId === m.user_id ? 0.5 : 1,
+      }}
+    >
+      <Text style={{ color: theme.danger, fontSize: 13, fontWeight: '600' }}>Remove</Text>
+    </Pressable>
+  )
+
+  const roleBadge = (role: string) => (
+    <View
+      style={{
+        paddingHorizontal: 10,
+        paddingVertical: 4,
+        borderRadius: 6,
+        backgroundColor: theme.surfaceAlt,
+      }}
+    >
+      <Text style={{ color: theme.textMuted, fontSize: 12, fontWeight: '600' }}>{roleLabel(role)}</Text>
+    </View>
+  )
+
   const renderMember = ({ item: m }: { item: ChannelMemberView }) => {
     const name = displayName(users, m.user_id)
     const status: PresenceStatus = presence[m.user_id] ?? 'offline'
     const dotColor = presenceColor[status] ?? presenceColor.offline
+    const label = `${name}, ${status}${m.role ? `, ${roleLabel(m.role)}` : ''}`
+
+    if (table) {
+      return (
+        <View
+          accessible
+          accessibilityLabel={label}
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 12,
+            paddingHorizontal: gutter,
+            paddingVertical: 6,
+            minHeight: minTouch,
+            borderBottomWidth: 1,
+            borderBottomColor: theme.border,
+          }}
+        >
+          <View style={{ ...cell(columns[0]), flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            {avatar(m.user_id, name, dotColor, 28)}
+            <Text style={{ color: theme.body, fontSize: 15, fontWeight: '500' }} numberOfLines={1}>
+              {name}
+              {m.user_id === me?.id ? ' (you)' : ''}
+            </Text>
+          </View>
+          <View style={cell(columns[1])}>
+            <Text style={{ color: theme.textMuted, fontSize: 13, textTransform: 'capitalize' }}>{status}</Text>
+          </View>
+          <View style={cell(columns[2])}>{m.role ? roleBadge(m.role) : null}</View>
+          {canManage ? (
+            <View style={cell(columns[3])}>
+              {m.user_id !== me?.id ? removeButton(m, name) : null}
+            </View>
+          ) : null}
+        </View>
+      )
+    }
+
     return (
       <View
         accessible
-        accessibilityLabel={`${name}, ${status}${m.role ? `, ${roleLabel(m.role)}` : ''}`}
+        accessibilityLabel={label}
         style={{
           flexDirection: 'row',
           alignItems: 'center',
-          paddingHorizontal: 16,
+          paddingHorizontal: gutter,
           paddingVertical: 12,
-          minHeight: MIN_TOUCH,
+          minHeight: minTouch,
           borderBottomWidth: 1,
           borderBottomColor: theme.border,
         }}
       >
-        <View style={{ marginRight: 12 }}>
-          <View
-            style={{
-              width: 40,
-              height: 40,
-              borderRadius: 20,
-              backgroundColor: avatarColor(m.user_id),
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>
-              {(name || '?').charAt(0).toUpperCase()}
-            </Text>
-          </View>
-          <View
-            style={{
-              position: 'absolute',
-              right: -1,
-              bottom: -1,
-              width: 13,
-              height: 13,
-              borderRadius: 7,
-              backgroundColor: dotColor,
-              borderWidth: 2,
-              borderColor: theme.bg,
-            }}
-          />
-        </View>
+        <View style={{ marginRight: 12 }}>{avatar(m.user_id, name, dotColor, 40)}</View>
         <View style={{ flex: 1 }}>
           <Text style={{ color: theme.body, fontSize: 15, fontWeight: '500' }}>
             {name}
@@ -218,36 +316,9 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
           </Text>
         </View>
         {m.role ? (
-          <View
-            style={{
-              paddingHorizontal: 10,
-              paddingVertical: 4,
-              borderRadius: 6,
-              backgroundColor: theme.surfaceAlt,
-              marginRight: canManage && m.user_id !== me?.id ? 8 : 0,
-            }}
-          >
-            <Text style={{ color: theme.textMuted, fontSize: 12, fontWeight: '600' }}>{roleLabel(m.role)}</Text>
-          </View>
+          <View style={{ marginRight: canManage && m.user_id !== me?.id ? 8 : 0 }}>{roleBadge(m.role)}</View>
         ) : null}
-        {canManage && m.user_id !== me?.id ? (
-          <Pressable
-            onPress={() => removeMember(m)}
-            disabled={busyUserId === m.user_id}
-            accessibilityRole="button"
-            accessibilityLabel={`Remove ${name} from the channel`}
-            hitSlop={8}
-            style={{
-              minHeight: MIN_TOUCH,
-              minWidth: MIN_TOUCH,
-              alignItems: 'center',
-              justifyContent: 'center',
-              opacity: busyUserId === m.user_id ? 0.5 : 1,
-            }}
-          >
-            <Text style={{ color: theme.danger, fontSize: 13, fontWeight: '600' }}>Remove</Text>
-          </Pressable>
-        ) : null}
+        {canManage && m.user_id !== me?.id ? removeButton(m, name) : null}
       </View>
     )
   }
@@ -258,6 +329,7 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
         title={`Members${members.length ? ` (${members.length})` : ''}`}
         subtitle={channel?.name ? `#${channel.name}` : undefined}
         onBack={() => navigation.goBack()}
+        maxWidth={TABLE_MAX_WIDTH}
         right={
           canManage ? (
             <Pressable
@@ -266,7 +338,7 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
               accessibilityLabel={adding ? 'Close add member' : 'Add member'}
               accessibilityState={{ expanded: adding }}
               hitSlop={8}
-              style={{ minHeight: MIN_TOUCH, minWidth: MIN_TOUCH, alignItems: 'center', justifyContent: 'center' }}
+              style={{ minHeight: minTouch, minWidth: minTouch, alignItems: 'center', justifyContent: 'center' }}
             >
               <Text style={{ color: theme.accent, fontSize: 14, fontWeight: '600' }}>{adding ? 'Done' : 'Add'}</Text>
             </Pressable>
@@ -275,7 +347,14 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
       />
 
       {adding && canManage ? (
-        <View style={{ paddingHorizontal: 16, paddingTop: 12, paddingBottom: 4 }}>
+        <View
+          style={{
+            ...contentColumn(TABLE_MAX_WIDTH),
+            paddingHorizontal: gutter,
+            paddingTop: 12,
+            paddingBottom: 4,
+          }}
+        >
           <TextInput
             value={query}
             onChangeText={setQuery}
@@ -290,8 +369,8 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
               borderColor: theme.borderStrong,
               borderRadius: 12,
               paddingHorizontal: 14,
-              paddingVertical: 12,
-              minHeight: MIN_TOUCH,
+              paddingVertical: table ? 9 : 12,
+              minHeight: minTouch,
               color: theme.text,
               fontSize: 15,
             }}
@@ -321,6 +400,9 @@ export default function MembersScreen({ navigation, route }: { navigation: any; 
           data={members}
           keyExtractor={(m) => m.user_id}
           renderItem={renderMember}
+          contentContainerStyle={contentColumn(TABLE_MAX_WIDTH)}
+          // Column labels only mean something where there are columns.
+          ListHeaderComponent={table && members.length > 0 ? <TableHeader columns={columns} /> : null}
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={() => load('refresh')} tintColor={theme.accent} />
           }

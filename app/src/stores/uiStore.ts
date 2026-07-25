@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { PresenceStatus } from '../lib/types'
+import type { Message, PresenceStatus } from '../lib/types'
 
 /**
  * Realtime connection state, mirrored out of `WebSocketManager` so any component
@@ -21,6 +21,17 @@ interface UiState {
   /** Last WS `error` frame code, cleared on the next successful connect. */
   connectionError: string | null
 
+  /**
+   * The thread currently open, if any.
+   *
+   * This lives in the store rather than inside ChannelView because the layout
+   * that owns it depends on the viewport: a wide window renders it as a third
+   * pane beside the conversation, a medium one overlays it, and a phone shows
+   * it full screen. Only the shell knows which, so the shell has to be able to
+   * see that a thread is open — a `useState` inside ChannelView cannot tell it.
+   */
+  activeThread: { channelId: string; parent: Message } | null
+
   setPresence: (map: Record<string, PresenceStatus>) => void
   setUserPresence: (userId: string, status: PresenceStatus) => void
   setTyping: (channelId: string, userIds: string[]) => void
@@ -29,6 +40,8 @@ interface UiState {
   clearTyping: (channelId?: string) => void
   setUnread: (n: number) => void
   setConnection: (status: ConnectionStatus, error?: string | null) => void
+  openThread: (channelId: string, parent: Message) => void
+  closeThread: () => void
 }
 
 export const useUiStore = create<UiState>()((set) => ({
@@ -37,6 +50,7 @@ export const useUiStore = create<UiState>()((set) => ({
   unreadNotifications: 0,
   connection: 'idle',
   connectionError: null,
+  activeThread: null,
 
   setPresence: (map) => set({ presence: map }),
   setUserPresence: (userId, status) =>
@@ -74,4 +88,11 @@ export const useUiStore = create<UiState>()((set) => ({
     set((s) =>
       s.connection === status && s.connectionError === error ? s : { connection: status, connectionError: error },
     ),
+
+  openThread: (channelId, parent) =>
+    set((s) =>
+      s.activeThread?.parent.id === parent.id ? s : { activeThread: { channelId, parent } },
+    ),
+
+  closeThread: () => set((s) => (s.activeThread === null ? s : { activeThread: null })),
 }))

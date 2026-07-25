@@ -8,11 +8,16 @@ import { useAuthStore } from '../../stores/authStore'
 import { useMessageStore } from '../../stores/messageStore'
 import type { CustomEmoji } from '../../api/emoji'
 import { customEmojiUrl, findCustomEmoji } from './customEmoji'
+import { anchorFrom, type Anchor } from './anchor'
 import { touchSlop } from '../a11y'
 
 interface Props {
   message: Message
-  onAddReaction?: (message: Message) => void
+  /**
+   * `anchor` is where the press landed, so a pointer-driven picker can open
+   * beside the ＋ instead of sliding up from the bottom of the window.
+   */
+  onAddReaction?: (message: Message, anchor?: Anchor) => void
   /**
    * Overrides the default store-backed toggle. Thread replies are not in
    * `messageStore` (the channel list excludes them server-side), so
@@ -116,7 +121,7 @@ function ReactionBarBase({ message, onAddReaction, onToggle, customEmoji = NO_EM
 
       {onAddReaction && (
         <Pressable
-          onPress={() => onAddReaction(message)}
+          onPress={(e) => onAddReaction(message, anchorFrom(e))}
           hitSlop={touchSlop(28)}
           accessibilityRole="button"
           accessibilityLabel="Add reaction"

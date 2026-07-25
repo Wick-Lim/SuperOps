@@ -19,7 +19,8 @@ import { errorMessage } from '../api/client'
 import type { PresenceStatus } from '../lib/types'
 import QrCode from './internal/QrCode'
 import { useWorkspaceRole } from './internal/useWorkspaceRole'
-import { Button, Chip, Field, MIN_TOUCH, ScreenHeader, Section } from './internal/ui'
+import { useResponsive } from '../lib/responsive'
+import { Button, Chip, CONTENT_MAX_WIDTH, Field, ScreenHeader, Section, contentColumn } from './internal/ui'
 
 const PRESENCE_OPTIONS: Array<{ key: PresenceStatus; label: string }> = [
   { key: 'online', label: 'Active' },
@@ -28,12 +29,13 @@ const PRESENCE_OPTIONS: Array<{ key: PresenceStatus; label: string }> = [
 ]
 
 function NavRow({ label, detail, onPress }: { label: string; detail?: string; onPress: () => void }) {
+  const { minTouch } = useResponsive()
   return (
     <Pressable
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={detail ? `${label}, ${detail}` : label}
-      style={{ flexDirection: 'row', alignItems: 'center', minHeight: MIN_TOUCH, paddingVertical: 10 }}
+      style={{ flexDirection: 'row', alignItems: 'center', minHeight: minTouch, paddingVertical: 10 }}
     >
       <Text style={{ color: theme.body, fontSize: 15, flex: 1 }}>{label}</Text>
       {detail ? <Text style={{ color: theme.textMuted, fontSize: 13, marginRight: 6 }}>{detail}</Text> : null}
@@ -46,6 +48,12 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
   const user = useAuthStore((s) => s.user)
   const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace)
   const presence = useUiStore((s) => s.presence)
+  const { tier, gutter } = useResponsive()
+  // Paired actions stack under a thumb and sit side by side once there is room.
+  const actionRow = {
+    flexDirection: (tier === 'compact' ? 'column' : 'row') as 'column' | 'row',
+    gap: tier === 'compact' ? 8 : 12,
+  }
 
   // Profile
   const [fullName, setFullName] = useState(user?.full_name ?? '')
@@ -234,9 +242,13 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-      <ScreenHeader title="Settings" onBack={() => navigation.goBack()} />
+      <ScreenHeader title="Settings" onBack={() => navigation.goBack()} maxWidth={CONTENT_MAX_WIDTH} />
 
-      <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 48 }}>
+      {/* One column, capped at the reading measure. These are three-field forms:
+          spreading them into columns on a monitor would be worse, not better. */}
+      <ScrollView
+        contentContainerStyle={{ ...contentColumn(), paddingHorizontal: gutter, paddingTop: 16, paddingBottom: 48 }}
+      >
         {/* Account identity */}
         <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 28 }}>
           <View
@@ -296,7 +308,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
             placeholder="Your name"
             autoCapitalize="words"
           />
-          <Button label="Save profile" onPress={saveProfile} loading={savingProfile} />
+          <Button label="Save profile" onPress={saveProfile} loading={savingProfile} inline />
         </Section>
 
         {/* Custom status */}
@@ -310,9 +322,10 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
             autoCapitalize="sentences"
             maxLength={100}
           />
-          <Button label="Save status" onPress={saveStatus} loading={savingStatus} />
-          <View style={{ height: 8 }} />
-          <Button label="Clear status" onPress={clearStatus} variant="ghost" />
+          <View style={actionRow}>
+            <Button label="Save status" onPress={saveStatus} loading={savingStatus} inline />
+            <Button label="Clear status" onPress={clearStatus} variant="ghost" inline />
+          </View>
         </Section>
 
         {/* Saved items / admin */}
@@ -343,7 +356,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
             secureTextEntry
             placeholder="At least 8 characters"
           />
-          <Button label="Update password" onPress={changePassword} loading={changingPw} />
+          <Button label="Update password" onPress={changePassword} loading={changingPw} inline />
         </Section>
 
         {/* Two-factor auth */}
@@ -379,7 +392,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
                 ))}
               </View>
               <View style={{ height: 12 }} />
-              <Button label="I saved my codes" onPress={() => setBackupCodes(null)} variant="ghost" />
+              <Button label="I saved my codes" onPress={() => setBackupCodes(null)} variant="ghost" inline />
             </View>
           ) : totpEnabled ? (
             <View>
@@ -397,7 +410,7 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
                 keyboardType="number-pad"
                 maxLength={6}
               />
-              <Button label="Disable 2FA" onPress={disableTotp} loading={totpLoading} variant="danger" />
+              <Button label="Disable 2FA" onPress={disableTotp} loading={totpLoading} variant="danger" inline />
             </View>
           ) : setupSecret !== null ? (
             <View>
@@ -440,21 +453,22 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
                 keyboardType="number-pad"
                 maxLength={6}
               />
-              <Button label="Verify & enable" onPress={verifyTotp} loading={totpLoading} />
-              <View style={{ height: 8 }} />
-              <Button label="Cancel" onPress={cancelTotpSetup} variant="ghost" />
+              <View style={actionRow}>
+                <Button label="Verify & enable" onPress={verifyTotp} loading={totpLoading} inline />
+                <Button label="Cancel" onPress={cancelTotpSetup} variant="ghost" inline />
+              </View>
             </View>
           ) : (
             <View>
               <Text style={{ color: theme.textMuted, fontSize: 13, marginBottom: 12 }}>
                 Add an extra layer of security by requiring a code from an authenticator app when you sign in.
               </Text>
-              <Button label="Enable 2FA" onPress={startTotpSetup} loading={totpLoading} />
+              <Button label="Enable 2FA" onPress={startTotpSetup} loading={totpLoading} inline />
             </View>
           )}
         </Section>
 
-        <Button label="Log out" onPress={confirmLogout} variant="danger" />
+        <Button label="Log out" onPress={confirmLogout} variant="danger" inline />
       </ScrollView>
     </SafeAreaView>
   )

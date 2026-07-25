@@ -21,22 +21,30 @@ import { useUiStore } from '../../stores/uiStore'
 import { useChannelStore } from '../../stores/channelStore'
 import { useUserStore, displayName } from '../../stores/userStore'
 import { theme } from '../../lib/theme'
+import { space, useResponsive } from '../../lib/responsive'
 import type { Channel, FileRef, Message } from '../../lib/types'
 import MessageList from '../message/MessageList'
 import MessageInput from '../message/MessageInput'
 import EmojiPicker from '../message/EmojiPicker'
-import ThreadView from '../message/ThreadView'
 import AttachmentViewer from '../message/AttachmentViewer'
 import ActionSheet, { type SheetAction } from '../ActionSheet'
 import type { SendState } from '../message/MessageItem'
+import type { Anchor } from '../message/anchor'
 import { newTempId, optimisticMessage, type OutboxEntry } from '../message/outbox'
 import { useCustomEmoji } from '../message/customEmoji'
-import { MIN_TOUCH, announce, useModalFocus } from '../a11y'
+import { announce, useModalFocus } from '../a11y'
 
 interface Props {
   channel: Channel
+  /** Only reachable below `medium`; a fixed sidebar is its own way back. */
   onBack: () => void
   onOpenMembers?: () => void
+  /**
+   * Whether to offer a way back to the channel list. Defaults to "only when the
+   * list is not already on screen", so a shell that knows better can override it
+   * but does not have to.
+   */
+  showBack?: boolean
 }
 
 const EMPTY: Message[] = []
@@ -45,7 +53,7 @@ const NO_TYPING: string[] = []
 /** DM participant ids by channel, so reopening a DM costs no extra request. */
 const dmMembers = new Map<string, string[]>()
 
-export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
+export default function ChannelView({ channel, onBack, onOpenMembers, showBack }: Props) {
   const currentMessages = useMessageStore((s) => s.messages[channel.id] ?? EMPTY)
   const setMessages = useMessageStore((s) => s.setMessages)
   const prependMessages = useMessageStore((s) => s.prependMessages)
@@ -55,6 +63,10 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
   const users = useUserStore((s) => s.users)
   const ensureUsers = useUserStore((s) => s.ensureUsers)
   const customEmoji = useCustomEmoji()
+  const { minTouch, gutter, twoPane } = useResponsive()
+  const backVisible = showBack ?? !twoPane
+  /** A phone header has room for the name or the topic, not both. */
+  const showTopic = twoPane && !!channel.topic
 
   const [loadingMore, setLoadingMore] = useState(false)
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
@@ -64,10 +76,10 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
 
   const [actionTarget, setActionTarget] = useState<Message | null>(null)
   const [emojiTarget, setEmojiTarget] = useState<Message | null>(null)
+  const [emojiAnchor, setEmojiAnchor] = useState<Anchor | null>(null)
   const [editTarget, setEditTarget] = useState<Message | null>(null)
   const [editText, setEditText] = useState('')
   const [forwardTarget, setForwardTarget] = useState<Message | null>(null)
-  const [threadRoot, setThreadRoot] = useState<Message | null>(null)
   const [viewerFile, setViewerFile] = useState<FileRef | null>(null)
   const [dmIds, setDmIds] = useState<string[]>(() => dmMembers.get(channel.id) ?? [])
 
@@ -98,6 +110,10 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
     // Otherwise switching channels announces that channel's newest message as
     // if it had just arrived.
     lastAnnouncedRef.current = null
+    // The thread lives in the shell now, so it outlives this component unless
+    // somebody closes it: switching channels with a thread open would otherwise
+    // leave another channel's replies pinned beside the new conversation.
+    useUiStore.getState().closeThread()
   }, [channel.id])
 
   useEffect(() => {
@@ -346,8 +362,20 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
     )
   }, [])
 
-  const openThread = useCallback((m: Message) => setThreadRoot(m), [])
-  const addReaction = useCallback((m: Message) => setEmojiTarget(m), [])
+  /**
+   * The thread is handed to the shell rather than opened here. Whether it is a
+   * third column, a sheet over the conversation or a full screen depends on the
+   * viewport, and this component cannot see the viewport it is placed in.
+   */
+  const openThread = useCallback(
+    (m: Message) => useUiStore.getState().openThread(channel.id, m),
+    [channel.id],
+  )
+
+  const addReaction = useCallback((m: Message, anchor?: Anchor) => {
+    setEmojiTarget(m)
+    setEmojiAnchor(anchor ?? null)
+  }, [])
 
   // Six Alert buttons silently collapsed to three on Android, which is why
   // Forward/Edit/Delete were unreachable there. This is a sheet instead.
@@ -358,8 +386,21 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
     if (!m) return []
     const isOwn = m.user_id === currentUserId
     const list: SheetAction[] = [
-      { key: 'react', label: 'Add reaction', icon: '😀', onPress: () => setEmojiTarget(m) },
-      { key: 'thread', label: 'Reply in thread', icon: '💬', onPress: () => setThreadRoot(m) },
+      {
+        key: 'react',
+        label: 'Add reaction',
+        icon: '😀',
+        onPress: () => {
+          setEmojiTarget(m)
+          setEmojiAnchor(null)
+        },
+      },
+      {
+        key: 'thread',
+        label: 'Reply in thread',
+        icon: '💬',
+        onPress: () => useUiStore.getState().openThread(channel.id, m),
+      },
       {
         key: 'pin',
         label: m.is_pinned ? 'Unpin from channel' : 'Pin to channel',
@@ -388,7 +429,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
       })
     }
     return list
-  }, [actionTarget, currentUserId, doBookmark, doDelete, doPin])
+  }, [actionTarget, channel.id, currentUserId, doBookmark, doDelete, doPin])
 
   // --- derived view state --------------------------------------------------
 
@@ -425,8 +466,9 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
       {/* Header */}
       <View
         style={{
-          height: 56,
-          paddingHorizontal: 8,
+          height: twoPane ? 52 : 56,
+          paddingLeft: backVisible ? space.sm : gutter,
+          paddingRight: twoPane ? space.md : space.sm,
           flexDirection: 'row',
           alignItems: 'center',
           borderBottomWidth: 1,
@@ -434,35 +476,62 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
           backgroundColor: theme.bg,
         }}
       >
-        <Pressable
-          onPress={onBack}
-          accessibilityRole="button"
-          accessibilityLabel="Back to channel list"
-          style={{
-            width: MIN_TOUCH,
-            height: MIN_TOUCH,
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}
-        >
-          <Text style={{ color: theme.textMuted, fontSize: 20 }}>←</Text>
-        </Pressable>
+        {/* The back button exists to reach a channel list that is not on screen.
+            With the sidebar pinned beside this pane it points at something the
+            user is already looking at, so it goes. */}
+        {backVisible && (
+          <Pressable
+            onPress={onBack}
+            accessibilityRole="button"
+            accessibilityLabel="Back to channel list"
+            style={{
+              width: minTouch,
+              height: minTouch,
+              alignItems: 'center',
+              justifyContent: 'center',
+            }}
+          >
+            <Text style={{ color: theme.textMuted, fontSize: 20 }}>←</Text>
+          </Pressable>
+        )}
         <Text style={{ color: theme.textMuted, marginRight: 4 }}>{isDM ? '💬' : '#'}</Text>
         <Text
           accessibilityRole="header"
-          style={{ color: theme.text, fontWeight: '600', fontSize: 16, flex: 1 }}
+          // Shrinks rather than grows: the topic beside it takes the slack, and
+          // without this a long channel name would push the header controls off
+          // the right edge instead of truncating.
+          style={{ color: theme.text, fontWeight: '600', fontSize: 16, flexShrink: 1 }}
           numberOfLines={1}
         >
           {title}
         </Text>
+        {/* The topic is the first thing a phone has to drop and the first thing
+            a wide header has room for. */}
+        {showTopic ? (
+          <>
+            <View
+              style={{
+                width: 1,
+                height: 16,
+                marginHorizontal: space.md,
+                backgroundColor: theme.borderStrong,
+              }}
+            />
+            <Text style={{ color: theme.textMuted, fontSize: 13, flex: 1 }} numberOfLines={1}>
+              {channel.topic}
+            </Text>
+          </>
+        ) : (
+          <View style={{ flex: 1 }} />
+        )}
         {onOpenMembers && (
           <Pressable
             onPress={onOpenMembers}
             accessibilityRole="button"
             accessibilityLabel="Channel members"
             style={{
-              width: MIN_TOUCH,
-              height: MIN_TOUCH,
+              width: minTouch,
+              height: minTouch,
               alignItems: 'center',
               justifyContent: 'center',
             }}
@@ -481,7 +550,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
             accessibilityRole="button"
             accessibilityLabel="Retry loading messages"
             style={{
-              minHeight: MIN_TOUCH,
+              minHeight: minTouch,
               paddingHorizontal: 20,
               justifyContent: 'center',
               borderRadius: 12,
@@ -499,6 +568,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
           onLongPress={openActions}
           onAddReaction={addReaction}
           onOpenThread={openThread}
+          onPin={doPin}
           onOpenFile={openFile}
           onRetrySend={retrySend}
           onDiscardSend={discardSend}
@@ -515,7 +585,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
           accessibilityLiveRegion="polite"
           accessible
           accessibilityLabel={typingLabel}
-          style={{ paddingHorizontal: 16, paddingBottom: 4 }}
+          style={{ paddingHorizontal: gutter, paddingBottom: 4 }}
         >
           <Text style={{ color: theme.textMuted, fontSize: 12, fontStyle: 'italic' }}>{typingLabel}</Text>
         </View>
@@ -541,26 +611,19 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
       {/* Emoji picker (React action / + reaction) */}
       <EmojiPicker
         visible={!!emojiTarget}
-        onClose={() => setEmojiTarget(null)}
+        anchor={emojiAnchor}
+        onClose={() => {
+          setEmojiTarget(null)
+          setEmojiAnchor(null)
+        }}
         onSelect={(emoji) => {
           if (emojiTarget) reactWithEmoji(emojiTarget, emoji)
         }}
       />
 
-      {/* Thread */}
-      <ThreadView
-        visible={!!threadRoot}
-        root={threadRoot}
-        channelId={channel.id}
-        channelName={title}
-        customEmoji={customEmoji}
-        onClose={() => setThreadRoot(null)}
-        onReplied={(rootId) => {
-          const store = useMessageStore.getState()
-          const current = (store.messages[channel.id] ?? EMPTY).find((m) => m.id === rootId)
-          if (current) store.updateMessage(channel.id, { ...current, reply_count: current.reply_count + 1 })
-        }}
-      />
+      {/* The thread is NOT rendered here. `openThread` puts it in `uiStore` and
+          the shell presents it, because only the shell knows whether there is
+          room for a third column. */}
 
       {/* Full-screen image */}
       <AttachmentViewer file={viewerFile} onClose={() => setViewerFile(null)} />
@@ -571,7 +634,20 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
           accessibilityViewIsModal
           style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', paddingHorizontal: 24 }}
         >
-          <View style={{ backgroundColor: theme.surface, borderRadius: 16, padding: 16, borderWidth: 1, borderColor: theme.border }}>
+          {/* A dialog is sized by its content, not by the window: stretched to
+              1500px the buttons end up a screen apart from the text. */}
+          <View
+            style={{
+              width: '100%',
+              maxWidth: 520,
+              alignSelf: 'center',
+              backgroundColor: theme.surface,
+              borderRadius: 16,
+              padding: 16,
+              borderWidth: 1,
+              borderColor: theme.border,
+            }}
+          >
             <Text accessibilityRole="header" style={{ color: theme.text, fontSize: 15, fontWeight: '600', marginBottom: 12 }}>
               Edit message
             </Text>
@@ -602,7 +678,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
                 }}
                 accessibilityRole="button"
                 accessibilityLabel="Cancel editing"
-                style={{ paddingHorizontal: 16, minHeight: MIN_TOUCH, justifyContent: 'center', borderRadius: 10, backgroundColor: theme.surfaceAlt }}
+                style={{ paddingHorizontal: 16, minHeight: minTouch, justifyContent: 'center', borderRadius: 10, backgroundColor: theme.surfaceAlt }}
               >
                 <Text style={{ color: theme.textMuted, fontWeight: '600' }}>Cancel</Text>
               </Pressable>
@@ -610,7 +686,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
                 onPress={submitEdit}
                 accessibilityRole="button"
                 accessibilityLabel="Save changes"
-                style={{ paddingHorizontal: 16, minHeight: MIN_TOUCH, justifyContent: 'center', borderRadius: 10, backgroundColor: theme.primary }}
+                style={{ paddingHorizontal: 16, minHeight: minTouch, justifyContent: 'center', borderRadius: 10, backgroundColor: theme.primary }}
               >
                 <Text style={{ color: '#fff', fontWeight: '600' }}>Save</Text>
               </Pressable>
@@ -625,7 +701,14 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
           onPress={() => setForwardTarget(null)}
           accessibilityRole="button"
           accessibilityLabel="Close"
-          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'flex-end' }}
+          style={{
+            flex: 1,
+            backgroundColor: 'rgba(0,0,0,0.6)',
+            // A sheet slides in from the thumb's edge of a phone. With a pointer
+            // there is no such edge, and a centred dialog is the idiom.
+            justifyContent: twoPane ? 'center' : 'flex-end',
+            alignItems: twoPane ? 'center' : 'stretch',
+          }}
         >
           <Pressable
             onPress={(e) => e.stopPropagation()}
@@ -634,10 +717,15 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
               backgroundColor: theme.surface,
               borderTopLeftRadius: 20,
               borderTopRightRadius: 20,
+              borderBottomLeftRadius: twoPane ? 20 : 0,
+              borderBottomRightRadius: twoPane ? 20 : 0,
+              width: twoPane ? 420 : undefined,
+              maxWidth: '100%',
               paddingHorizontal: 16,
               paddingTop: 16,
-              paddingBottom: 28,
+              paddingBottom: twoPane ? 16 : 28,
               borderTopWidth: 1,
+              borderWidth: twoPane ? 1 : 0,
               borderColor: theme.border,
               maxHeight: '70%',
             }}
@@ -654,7 +742,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers }: Props) {
                     onPress={() => forwardTarget && doForward(forwardTarget, c.id)}
                     accessibilityRole="button"
                     accessibilityLabel={`Forward to ${c.name || 'direct message'}`}
-                    style={{ flexDirection: 'row', alignItems: 'center', minHeight: MIN_TOUCH }}
+                    style={{ flexDirection: 'row', alignItems: 'center', minHeight: minTouch }}
                   >
                     <Text style={{ color: theme.textMuted, marginRight: 6 }}>
                       {c.type === 'dm' || c.type === 'group_dm' ? '💬' : '#'}

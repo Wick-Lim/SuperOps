@@ -8,13 +8,15 @@ import { useWorkspaceStore } from '../stores/workspaceStore'
 import { useUiStore } from '../stores/uiStore'
 import { errorMessage } from '../api/client'
 import type { AppNotification, NotificationType } from '../lib/types'
+import { useResponsive } from '../lib/responsive'
 import {
+  CONTENT_MAX_WIDTH,
   EmptyState,
   ErrorState,
   ListFooter,
   LoadingState,
-  MIN_TOUCH,
   ScreenHeader,
+  contentColumn,
 } from './internal/ui'
 
 const PAGE_SIZE = 30
@@ -62,6 +64,7 @@ function parseChannelId(data: string): string | null {
 export default function NotificationsScreen({ navigation }: { navigation: any; route: any }) {
   const channels = useChannelStore((s) => s.channels)
   const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace)
+  const { tier, gutter, minTouch } = useResponsive()
 
   const [items, setItems] = useState<AppNotification[]>([])
   const [cursor, setCursor] = useState<string | undefined>(undefined)
@@ -168,9 +171,9 @@ export default function NotificationsScreen({ navigation }: { navigation: any; r
       style={{
         flexDirection: 'row',
         gap: 12,
-        paddingHorizontal: 16,
-        paddingVertical: 14,
-        minHeight: MIN_TOUCH,
+        paddingHorizontal: gutter,
+        paddingVertical: tier === 'compact' ? 14 : 10,
+        minHeight: minTouch,
         borderBottomWidth: 1,
         borderBottomColor: theme.border,
         backgroundColor: item.is_read ? 'transparent' : theme.surface,
@@ -193,7 +196,16 @@ export default function NotificationsScreen({ navigation }: { navigation: any; r
           <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600', flex: 1 }} numberOfLines={1}>
             {item.title}
           </Text>
-          <Text style={{ color: theme.textMuted, fontSize: 11 }}>{relativeTime(item.created_at)}</Text>
+          {/* The icon is all a phone has room to say about the type; a wider
+              row can spell it out instead of leaving the space empty. */}
+          {tier !== 'compact' ? (
+            <Text style={{ color: theme.textFaint, fontSize: 11, fontWeight: '700', letterSpacing: 0.5 }}>
+              {(LABEL_BY_TYPE[item.type] ?? 'Notification').toUpperCase()}
+            </Text>
+          ) : null}
+          <Text style={{ color: theme.textMuted, fontSize: 11, minWidth: 62, textAlign: 'right' }}>
+            {relativeTime(item.created_at)}
+          </Text>
         </View>
         {!!item.body && (
           <Text style={{ color: theme.textMuted, fontSize: 13, lineHeight: 19, marginTop: 2 }} numberOfLines={2}>
@@ -214,13 +226,14 @@ export default function NotificationsScreen({ navigation }: { navigation: any; r
       <ScreenHeader
         title="Notifications"
         onBack={() => navigation.goBack()}
+        maxWidth={CONTENT_MAX_WIDTH}
         right={
           <Pressable
             onPress={markAll}
             accessibilityRole="button"
             accessibilityLabel="Mark all notifications read"
             hitSlop={8}
-            style={{ minHeight: MIN_TOUCH, justifyContent: 'center', paddingHorizontal: 8 }}
+            style={{ minHeight: minTouch, justifyContent: 'center', paddingHorizontal: 8 }}
           >
             <Text style={{ color: theme.accent, fontSize: 13 }}>Mark all read</Text>
           </Pressable>
@@ -236,6 +249,7 @@ export default function NotificationsScreen({ navigation }: { navigation: any; r
           data={items}
           keyExtractor={(item) => item.id}
           renderItem={renderItem}
+          contentContainerStyle={contentColumn()}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}

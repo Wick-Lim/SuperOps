@@ -5,7 +5,9 @@ import type { FileRef, Message } from '../../lib/types'
 import { theme } from '../../lib/theme'
 import { useUserStore } from '../../stores/userStore'
 import type { CustomEmoji } from '../../api/emoji'
+import { space, useResponsive } from '../../lib/responsive'
 import MessageItem, { type SendState } from './MessageItem'
+import type { Anchor } from './anchor'
 import { dayKey, formatDayLabel } from './time'
 
 /** One rendered row: the message plus everything derived from its neighbour. */
@@ -21,9 +23,11 @@ interface Props {
   sendStates?: Record<string, SendState>
   customEmoji?: CustomEmoji[]
   onLongPress?: (message: Message) => void
-  onAddReaction?: (message: Message) => void
+  onAddReaction?: (message: Message, anchor?: Anchor) => void
   onToggleReaction?: (message: Message, emoji: string, mine: boolean) => void
   onOpenThread?: (message: Message) => void
+  /** Enables the pin button in the pointer-only hover toolbar. */
+  onPin?: (message: Message) => void
   onOpenFile?: (file: FileRef) => void
   onRetrySend?: (message: Message) => void
   onDiscardSend?: (message: Message) => void
@@ -41,6 +45,12 @@ interface Props {
   emptyText?: string
   /** Bump to force a scroll to the newest row (e.g. after sending). */
   scrollToEndKey?: number
+  /**
+   * Overrides the tier's page padding. `useResponsive` measures the WINDOW, so
+   * a list inside a 380px thread pane on a 1600px monitor would otherwise be
+   * given the desktop gutter and lose an eighth of its width to it.
+   */
+  gutter?: number
 }
 
 const GROUP_WINDOW_MS = 300_000
@@ -73,6 +83,7 @@ export default function MessageList({
   onAddReaction,
   onToggleReaction,
   onOpenThread,
+  onPin,
   onOpenFile,
   onRetrySend,
   onDiscardSend,
@@ -83,9 +94,15 @@ export default function MessageList({
   paginate = 'start',
   emptyText = 'No messages yet. Start the conversation!',
   scrollToEndKey = 0,
+  gutter,
 }: Props) {
   const listRef = useRef<FlashListRef<Row>>(null)
   const ensureUsers = useUserStore((s) => s.ensureUsers)
+
+  // Resolved once here and handed to every row: fifty rows each calling
+  // `useResponsive` would mean fifty window-dimension subscriptions per screen.
+  const { tier, minTouch, gutter: tierGutter } = useResponsive()
+  const pad = gutter ?? tierGutter
 
   const rows = useMemo(() => buildRows(messages), [messages])
 
@@ -102,7 +119,17 @@ export default function MessageList({
 
   // `extraData` is how FlashList learns that a closure the rows read from
   // changed; the row components themselves are memoized on their props.
-  const extraData = useMemo(() => ({ sendStates, customEmoji }), [sendStates, customEmoji])
+  const extraData = useMemo(
+    () => ({ sendStates, customEmoji, tier, minTouch }),
+    [sendStates, customEmoji, tier, minTouch],
+  )
+
+  // Dragging a window across a breakpoint changes this, and FlashList needs a
+  // new object to notice.
+  const contentStyle = useMemo(
+    () => ({ paddingHorizontal: pad, paddingVertical: tier === 'compact' ? space.sm : space.md }),
+    [pad, tier],
+  )
 
   const renderItem = useCallback(
     ({ item }: ListRenderItemInfo<Row>) => (
@@ -112,10 +139,13 @@ export default function MessageList({
         dayLabel={item.dayLabel}
         sendState={sendStates[item.message.id]}
         customEmoji={customEmoji}
+        tier={tier}
+        minTouch={minTouch}
         onLongPress={onLongPress}
         onAddReaction={onAddReaction}
         onToggleReaction={onToggleReaction}
         onOpenThread={onOpenThread}
+        onPin={onPin}
         onOpenFile={onOpenFile}
         onRetrySend={onRetrySend}
         onDiscardSend={onDiscardSend}
@@ -124,10 +154,13 @@ export default function MessageList({
     [
       sendStates,
       customEmoji,
+      tier,
+      minTouch,
       onLongPress,
       onAddReaction,
       onToggleReaction,
       onOpenThread,
+      onPin,
       onOpenFile,
       onRetrySend,
       onDiscardSend,
@@ -193,7 +226,7 @@ export default function MessageList({
       // (whose ScrollView flex-grows by default) it collapses to zero height
       // without this.
       style={{ flex: 1 }}
-      contentContainerStyle={{ paddingHorizontal: 16, paddingVertical: 8 }}
+      contentContainerStyle={contentStyle}
       ListHeaderComponent={pagesBackwards ? pager : null}
       ListFooterComponent={pagesBackwards ? null : pager}
       onStartReached={pagesBackwards ? onLoadMore : undefined}

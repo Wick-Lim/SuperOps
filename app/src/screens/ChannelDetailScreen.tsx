@@ -8,14 +8,16 @@ import { useAuthStore } from '../stores/authStore'
 import { errorMessage } from '../api/client'
 import type { ChannelMemberView, ChannelNotificationPref } from '../lib/types'
 import { useWorkspaceRole } from './internal/useWorkspaceRole'
+import { useResponsive } from '../lib/responsive'
 import {
   Button,
   Chip,
+  CONTENT_MAX_WIDTH,
   ErrorState,
   LoadingState,
-  MIN_TOUCH,
   ScreenHeader,
   Section,
+  contentColumn,
 } from './internal/ui'
 
 const PREFS: Array<{ key: ChannelNotificationPref; label: string; hint: string }> = [
@@ -34,6 +36,7 @@ function NavRow({
   detail?: string
   onPress: () => void
 }) {
+  const { minTouch } = useResponsive()
   return (
     <Pressable
       onPress={onPress}
@@ -42,7 +45,7 @@ function NavRow({
       style={{
         flexDirection: 'row',
         alignItems: 'center',
-        minHeight: MIN_TOUCH,
+        minHeight: minTouch,
         paddingVertical: 10,
       }}
     >
@@ -64,6 +67,7 @@ export default function ChannelDetailScreen({ navigation, route }: { navigation:
   const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace)
   const me = useAuthStore((s) => s.user)
   const { isAdmin: workspaceIsAdmin } = useWorkspaceRole()
+  const { tier, gutter, minTouch } = useResponsive()
 
   const [membership, setMembership] = useState<ChannelMemberView | null>(null)
   const [memberCount, setMemberCount] = useState<number | null>(null)
@@ -174,6 +178,7 @@ export default function ChannelDetailScreen({ navigation, route }: { navigation:
         title={title}
         subtitle={channel?.is_archived ? 'Archived' : channel?.topic || undefined}
         onBack={() => navigation.goBack()}
+        maxWidth={CONTENT_MAX_WIDTH}
       />
 
       {loading ? (
@@ -181,7 +186,14 @@ export default function ChannelDetailScreen({ navigation, route }: { navigation:
       ) : error ? (
         <ErrorState message={error} onRetry={load} />
       ) : (
-        <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 48 }}>
+        <ScrollView
+          contentContainerStyle={{
+            ...contentColumn(),
+            paddingHorizontal: gutter,
+            paddingTop: 16,
+            paddingBottom: 48,
+          }}
+        >
           {channel?.description ? (
             <Text style={{ color: theme.textMuted, fontSize: 14, lineHeight: 20, marginBottom: 20 }}>
               {channel.description}
@@ -194,7 +206,7 @@ export default function ChannelDetailScreen({ navigation, route }: { navigation:
                 flexDirection: 'row',
                 alignItems: 'center',
                 justifyContent: 'space-between',
-                minHeight: MIN_TOUCH,
+                minHeight: minTouch,
               }}
             >
               <View style={{ flex: 1, paddingRight: 12 }}>
@@ -253,18 +265,23 @@ export default function ChannelDetailScreen({ navigation, route }: { navigation:
 
           {!isDM ? (
             <Section title="Danger zone">
-              {membership?.role === 'admin' || workspaceIsAdmin ? (
-                <>
+              <View
+                style={{
+                  flexDirection: tier === 'compact' ? 'column' : 'row',
+                  gap: 12,
+                }}
+              >
+                {membership?.role === 'admin' || workspaceIsAdmin ? (
                   <Button
                     label={channel?.is_archived ? 'Unarchive channel' : 'Archive channel'}
                     onPress={toggleArchive}
                     loading={busy}
                     variant="ghost"
+                    inline
                   />
-                  <View style={{ height: 12 }} />
-                </>
-              ) : null}
-              <Button label="Leave channel" onPress={leave} loading={busy} variant="danger" />
+                ) : null}
+                <Button label="Leave channel" onPress={leave} loading={busy} variant="danger" inline />
+              </View>
             </Section>
           ) : null}
         </ScrollView>

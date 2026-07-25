@@ -6,7 +6,8 @@ import { channelApi } from '../api/channels'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { useChannelStore } from '../stores/channelStore'
 import { errorMessage } from '../api/client'
-import { MIN_TOUCH, ScreenHeader } from './internal/ui'
+import { useResponsive } from '../lib/responsive'
+import { CONTENT_MAX_WIDTH, ScreenHeader, TABLE_MAX_WIDTH, contentColumn } from './internal/ui'
 
 function slugify(name: string): string {
   return name
@@ -32,6 +33,15 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
   const [browseLoading, setBrowseLoading] = useState(true)
   const [browseError, setBrowseError] = useState<string | null>(null)
   const [joiningId, setJoiningId] = useState<string | null>(null)
+
+  const { tier, gutter, minTouch } = useResponsive()
+  /**
+   * "Create one" and "join an existing one" are two answers to the same
+   * question. A phone has to ask them one after the other; anything wider can
+   * put them side by side, which is also what stops the browse list from
+   * sitting 700px below the fold.
+   */
+  const twoColumn = tier !== 'compact'
 
   const slug = slugify(name)
   const joinedIds = new Set(channels.map((c) => c.id))
@@ -96,168 +106,197 @@ export default function NewChannelScreen({ navigation }: { navigation: any; rout
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.bg }}>
-      <ScreenHeader title="New channel" backLabel="Cancel" onBack={() => navigation.goBack()} />
+      <ScreenHeader
+        title="New channel"
+        backLabel="Cancel"
+        onBack={() => navigation.goBack()}
+        maxWidth={twoColumn ? TABLE_MAX_WIDTH : CONTENT_MAX_WIDTH}
+      />
 
-      <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-        {/* Create form */}
-        <Text style={labelStyle}>NAME</Text>
-        <TextInput
-          value={name}
-          onChangeText={setName}
-          placeholder="e.g. marketing"
-          placeholderTextColor={theme.textMuted}
-          accessibilityLabel="Channel name"
-          accessibilityHint="Lowercase letters, numbers and dashes become the channel URL"
+      <ScrollView
+        contentContainerStyle={{
+          ...contentColumn(twoColumn ? TABLE_MAX_WIDTH : CONTENT_MAX_WIDTH),
+          paddingHorizontal: gutter,
+          paddingTop: 16,
+          paddingBottom: 40,
+        }}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={{ flexDirection: twoColumn ? 'row' : 'column', gap: twoColumn ? 40 : 0 }}>
+          <View style={{ flex: twoColumn ? 1 : undefined }}>
+            {/* Create form */}
+            <Text style={labelStyle}>NAME</Text>
+            <TextInput
+              value={name}
+              onChangeText={setName}
+              placeholder="e.g. marketing"
+              placeholderTextColor={theme.textMuted}
+              accessibilityLabel="Channel name"
+              accessibilityHint="Lowercase letters, numbers and dashes become the channel URL"
 
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={inputStyle}
-        />
-        {slug ? (
-          <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 6 }}>
-            URL: <Text style={{ color: theme.textMuted }}>#{slug}</Text>
-          </Text>
-        ) : null}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={inputStyle}
+            />
+            {slug ? (
+              <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 6 }}>
+                URL: <Text style={{ color: theme.textMuted }}>#{slug}</Text>
+              </Text>
+            ) : null}
 
-        <Text style={[labelStyle, { marginTop: 18 }]}>DESCRIPTION</Text>
-        <TextInput
-          value={description}
-          onChangeText={setDescription}
-          placeholder="What's this channel about?"
-          placeholderTextColor={theme.textMuted}
-          accessibilityLabel="Channel description"
+            <Text style={[labelStyle, { marginTop: 18 }]}>DESCRIPTION</Text>
+            <TextInput
+              value={description}
+              onChangeText={setDescription}
+              placeholder="What's this channel about?"
+              placeholderTextColor={theme.textMuted}
+              accessibilityLabel="Channel description"
 
-          multiline
-          style={[inputStyle, { minHeight: 72, textAlignVertical: 'top' }]}
-        />
+              multiline
+              style={[inputStyle, { minHeight: 72, textAlignVertical: 'top' }]}
+            />
 
-        <View
-          style={{
-            flexDirection: 'row',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            marginTop: 18,
-            backgroundColor: theme.surface,
-            borderWidth: 1,
-            borderColor: theme.borderStrong,
-            borderRadius: 12,
-            padding: 14,
-          }}
-        >
-          <View style={{ flex: 1, paddingRight: 12 }}>
-            <Text style={{ color: theme.text, fontSize: 15, fontWeight: '500' }}>Private channel</Text>
-            <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
-              Only invited members can view and join
-            </Text>
-          </View>
-          <Switch
-            value={isPrivate}
-            onValueChange={setIsPrivate}
-            accessibilityLabel="Private channel"
-            accessibilityHint="Only invited members can view and join"
-
-            trackColor={{ false: theme.borderStrong, true: theme.primary }}
-            thumbColor={theme.text}
-          />
-        </View>
-
-        <Pressable
-          onPress={handleCreate}
-          disabled={creating || !name.trim()}
-          accessibilityRole="button"
-          accessibilityLabel="Create channel"
-          accessibilityState={{ disabled: creating || !name.trim(), busy: creating }}
-          style={{
-            backgroundColor: theme.primary,
-            borderRadius: 12,
-            padding: 14,
-            minHeight: MIN_TOUCH,
-            justifyContent: 'center',
-            alignItems: 'center',
-            marginTop: 20,
-            opacity: creating || !name.trim() ? 0.5 : 1,
-          }}
-        >
-          <Text style={{ color: theme.primaryText, fontSize: 15, fontWeight: '600' }}>
-            {creating ? 'Creating...' : 'Create Channel'}
-          </Text>
-        </Pressable>
-
-        {/* Browse public channels */}
-        <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 32, marginBottom: 4 }}>
-          <Text style={[labelStyle, { flex: 1 }]}>BROWSE PUBLIC CHANNELS</Text>
-          <Pressable
-            onPress={loadBrowse}
-            accessibilityRole="button"
-            accessibilityLabel="Refresh the list of public channels"
-            hitSlop={16}
-            style={{ minHeight: 32, justifyContent: 'center' }}
-          >
-            <Text style={{ color: theme.accent, fontSize: 12 }}>Refresh</Text>
-          </Pressable>
-        </View>
-
-        {browseLoading ? (
-          <View style={{ paddingVertical: 24, alignItems: 'center' }}>
-            <ActivityIndicator color={theme.primary} />
-          </View>
-        ) : browseError ? (
-          <View style={{ paddingVertical: 16 }}>
-            <Text style={{ color: theme.danger, fontSize: 14 }}>{browseError}</Text>
-            <Pressable onPress={loadBrowse} style={{ marginTop: 8 }}>
-              <Text style={{ color: theme.accent, fontSize: 14 }}>Try again</Text>
-            </Pressable>
-          </View>
-        ) : browseList.length === 0 ? (
-          <Text style={{ color: theme.textMuted, fontSize: 14, paddingVertical: 12 }}>
-            No public channels available to join.
-          </Text>
-        ) : (
-          browseList.map((ch) => (
             <View
-              key={ch.id}
               style={{
                 flexDirection: 'row',
                 alignItems: 'center',
-                paddingVertical: 12,
-                borderBottomWidth: 1,
-                borderBottomColor: theme.border,
+                justifyContent: 'space-between',
+                marginTop: 18,
+                backgroundColor: theme.surface,
+                borderWidth: 1,
+                borderColor: theme.borderStrong,
+                borderRadius: 12,
+                padding: 14,
               }}
             >
-              <Text style={{ color: theme.textMuted, fontSize: 16, marginRight: 8 }}>#</Text>
-              <View style={{ flex: 1 }}>
-                <Text style={{ color: theme.body, fontSize: 15, fontWeight: '500' }}>
-                  {ch.name || ch.slug || 'unnamed'}
+              <View style={{ flex: 1, paddingRight: 12 }}>
+                <Text style={{ color: theme.text, fontSize: 15, fontWeight: '500' }}>Private channel</Text>
+                <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
+                  Only invited members can view and join
                 </Text>
-                {ch.description ? (
-                  <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }} numberOfLines={1}>
-                    {ch.description}
-                  </Text>
-                ) : null}
               </View>
+              <Switch
+                value={isPrivate}
+                onValueChange={setIsPrivate}
+                accessibilityLabel="Private channel"
+                accessibilityHint="Only invited members can view and join"
+
+                trackColor={{ false: theme.borderStrong, true: theme.primary }}
+                thumbColor={theme.text}
+              />
+            </View>
+
+            <Pressable
+              onPress={handleCreate}
+              disabled={creating || !name.trim()}
+              accessibilityRole="button"
+              accessibilityLabel="Create channel"
+              accessibilityState={{ disabled: creating || !name.trim(), busy: creating }}
+              style={{
+                backgroundColor: theme.primary,
+                borderRadius: 12,
+                paddingHorizontal: 20,
+                paddingVertical: twoColumn ? 10 : 14,
+                minHeight: minTouch,
+                justifyContent: 'center',
+                alignItems: 'center',
+                alignSelf: twoColumn ? 'flex-start' : 'auto',
+                minWidth: twoColumn ? 180 : undefined,
+                marginTop: 20,
+                opacity: creating || !name.trim() ? 0.5 : 1,
+              }}
+            >
+              <Text style={{ color: theme.primaryText, fontSize: 15, fontWeight: '600' }}>
+                {creating ? 'Creating...' : 'Create Channel'}
+              </Text>
+            </Pressable>
+          </View>
+
+          {/* Browse public channels */}
+          <View style={{ flex: twoColumn ? 1 : undefined }}>
+            <View
+              style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                marginTop: twoColumn ? 0 : 32,
+                marginBottom: 4,
+              }}
+            >
+              <Text style={[labelStyle, { flex: 1 }]}>BROWSE PUBLIC CHANNELS</Text>
               <Pressable
-                onPress={() => handleJoin(ch)}
-                disabled={joiningId === ch.id}
+                onPress={loadBrowse}
                 accessibilityRole="button"
-                accessibilityLabel={`Join ${ch.name || ch.slug || 'channel'}`}
-                accessibilityState={{ disabled: joiningId === ch.id, busy: joiningId === ch.id }}
-                style={{
-                  paddingHorizontal: 16,
-                  minHeight: MIN_TOUCH,
-                  justifyContent: 'center',
-                  borderRadius: 8,
-                  borderWidth: 1,
-                  borderColor: theme.primary,
-                  opacity: joiningId === ch.id ? 0.5 : 1,
-                }}
+                accessibilityLabel="Refresh the list of public channels"
+                hitSlop={16}
+                style={{ minHeight: 32, justifyContent: 'center' }}
               >
-                <Text style={{ color: theme.accent, fontSize: 13, fontWeight: '600' }}>
-                  {joiningId === ch.id ? 'Joining...' : 'Join'}
-                </Text>
+                <Text style={{ color: theme.accent, fontSize: 12 }}>Refresh</Text>
               </Pressable>
             </View>
-          ))
-        )}
+
+            {browseLoading ? (
+              <View style={{ paddingVertical: 24, alignItems: 'center' }}>
+                <ActivityIndicator color={theme.primary} />
+              </View>
+            ) : browseError ? (
+              <View style={{ paddingVertical: 16 }}>
+                <Text style={{ color: theme.danger, fontSize: 14 }}>{browseError}</Text>
+                <Pressable onPress={loadBrowse} style={{ marginTop: 8 }}>
+                  <Text style={{ color: theme.accent, fontSize: 14 }}>Try again</Text>
+                </Pressable>
+              </View>
+            ) : browseList.length === 0 ? (
+              <Text style={{ color: theme.textMuted, fontSize: 14, paddingVertical: 12 }}>
+                No public channels available to join.
+              </Text>
+            ) : (
+              browseList.map((ch) => (
+                <View
+                  key={ch.id}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    paddingVertical: 12,
+                    borderBottomWidth: 1,
+                    borderBottomColor: theme.border,
+                  }}
+                >
+                  <Text style={{ color: theme.textMuted, fontSize: 16, marginRight: 8 }}>#</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: theme.body, fontSize: 15, fontWeight: '500' }}>
+                      {ch.name || ch.slug || 'unnamed'}
+                    </Text>
+                    {ch.description ? (
+                      <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }} numberOfLines={1}>
+                        {ch.description}
+                      </Text>
+                    ) : null}
+                  </View>
+                  <Pressable
+                    onPress={() => handleJoin(ch)}
+                    disabled={joiningId === ch.id}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Join ${ch.name || ch.slug || 'channel'}`}
+                    accessibilityState={{ disabled: joiningId === ch.id, busy: joiningId === ch.id }}
+                    style={{
+                      paddingHorizontal: 16,
+                      minHeight: minTouch,
+                      justifyContent: 'center',
+                      borderRadius: 8,
+                      borderWidth: 1,
+                      borderColor: theme.primary,
+                      opacity: joiningId === ch.id ? 0.5 : 1,
+                    }}
+                  >
+                    <Text style={{ color: theme.accent, fontSize: 13, fontWeight: '600' }}>
+                      {joiningId === ch.id ? 'Joining...' : 'Join'}
+                    </Text>
+                  </Pressable>
+                </View>
+              ))
+            )}
+          </View>
+        </View>
       </ScrollView>
     </SafeAreaView>
   )

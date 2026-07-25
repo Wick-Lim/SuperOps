@@ -1,14 +1,26 @@
 import React, { useMemo, useState } from 'react'
 import { Image, Modal, Pressable, ScrollView, Text, TextInput, View } from 'react-native'
 import { theme } from '../../lib/theme'
+import { space, useResponsive } from '../../lib/responsive'
 import { MIN_TOUCH, useModalFocus } from '../a11y'
+import { clamp, type Anchor } from './anchor'
 import { customEmojiUrl, useCustomEmoji } from './customEmoji'
 
 interface Props {
   visible: boolean
   onClose: () => void
   onSelect: (emoji: string) => void
+  /**
+   * Where the press that opened this landed. With a pointer the picker opens
+   * there as a popover; without one (or on a phone) it stays a bottom sheet,
+   * which is the right shape for a thumb.
+   */
+  anchor?: Anchor | null
 }
+
+/** Eight columns of ~36px plus the card's own padding. */
+const POPOVER_WIDTH = 320
+const POPOVER_MAX_HEIGHT = 420
 
 /** `name` doubles as the search index and the accessibility label. */
 interface Entry {
@@ -67,10 +79,11 @@ const EMOJIS: Entry[] = [
   { char: '🙈', name: 'see no evil monkey oops' },
 ]
 
-export default function EmojiPicker({ visible, onClose, onSelect }: Props) {
+export default function EmojiPicker({ visible, onClose, onSelect, anchor }: Props) {
   const [query, setQuery] = useState('')
   const custom = useCustomEmoji()
   const heading = useModalFocus(visible)
+  const { tier, minTouch, width, height } = useResponsive()
 
   const q = query.trim().toLowerCase()
   const builtins = useMemo(() => (q ? EMOJIS.filter((e) => e.name.includes(q)) : EMOJIS), [q])
@@ -90,39 +103,67 @@ export default function EmojiPicker({ visible, onClose, onSelect }: Props) {
     onClose()
   }
 
+  // A popover needs a pointer to hang off AND room to hang in; a phone-width
+  // window has neither, so it keeps the sheet.
+  const popover = tier !== 'compact' && !!anchor
+
   const cell = {
     width: '12.5%' as const,
     aspectRatio: 1,
-    minHeight: MIN_TOUCH,
+    minHeight: popover ? minTouch : MIN_TOUCH,
     alignItems: 'center' as const,
     justifyContent: 'center' as const,
   }
 
+  const cardHeight = Math.min(POPOVER_MAX_HEIGHT, height - 2 * space.lg)
+  const card = popover
+    ? {
+        position: 'absolute' as const,
+        width: POPOVER_WIDTH,
+        maxHeight: cardHeight,
+        // Centred under the pointer, then pushed back inside the window rather
+        // than allowed to hang off the edge of a message near the right rail.
+        left: clamp(anchor!.x - POPOVER_WIDTH / 2, space.lg, width - POPOVER_WIDTH - space.lg),
+        top: clamp(anchor!.y + space.md, space.lg, height - cardHeight - space.lg),
+        backgroundColor: theme.surface,
+        borderRadius: 14,
+        borderWidth: 1,
+        borderColor: theme.borderStrong,
+        paddingHorizontal: space.md,
+        paddingTop: space.md,
+        paddingBottom: space.md,
+      }
+    : {
+        backgroundColor: theme.surface,
+        borderTopLeftRadius: 20,
+        borderTopRightRadius: 20,
+        paddingHorizontal: 16,
+        paddingTop: 12,
+        paddingBottom: 28,
+        borderTopWidth: 1,
+        borderColor: theme.border,
+      }
+
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={close}>
+    <Modal visible={visible} transparent animationType={popover ? 'none' : 'fade'} onRequestClose={close}>
       <Pressable
         onPress={close}
         accessibilityRole="button"
         accessibilityLabel="Close emoji picker"
-        style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'flex-end' }}
+        style={{
+          flex: 1,
+          // A popover is a light-touch attachment to the thing it acts on;
+          // dimming the whole app for it would read as a full modal.
+          backgroundColor: popover ? 'transparent' : 'rgba(0,0,0,0.6)',
+          justifyContent: 'flex-end',
+        }}
       >
-        <Pressable
-          onPress={(e) => e.stopPropagation()}
-          accessibilityViewIsModal
-          style={{
-            backgroundColor: theme.surface,
-            borderTopLeftRadius: 20,
-            borderTopRightRadius: 20,
-            paddingHorizontal: 16,
-            paddingTop: 12,
-            paddingBottom: 28,
-            borderTopWidth: 1,
-            borderColor: theme.border,
-          }}
-        >
-          <View style={{ alignItems: 'center', marginBottom: 12 }}>
-            <View style={{ width: 40, height: 4, borderRadius: 2, backgroundColor: theme.borderStrong }} />
-          </View>
+        <Pressable onPress={(e) => e.stopPropagation()} accessibilityViewIsModal style={card}>
+          {!popover && (
+            <View style={{ alignItems: 'center', marginBottom: 12 }}>
+              <View style={{ width: 40, height: 4, borderRadius: 2, backgroundColor: theme.borderStrong }} />
+            </View>
+          )}
 
           <View {...heading} accessible accessibilityRole="header">
             <Text style={{ color: theme.textMuted, fontSize: 12, fontWeight: '700', letterSpacing: 1 }}>
@@ -146,13 +187,16 @@ export default function EmojiPicker({ visible, onClose, onSelect }: Props) {
               borderColor: theme.borderStrong,
               borderRadius: 12,
               paddingHorizontal: 12,
-              minHeight: MIN_TOUCH,
+              minHeight: popover ? minTouch : MIN_TOUCH,
               color: theme.text,
               fontSize: 15,
             }}
           />
 
-          <ScrollView style={{ maxHeight: 280 }} keyboardShouldPersistTaps="handled">
+          <ScrollView
+            style={{ maxHeight: popover ? cardHeight - 120 : 280 }}
+            keyboardShouldPersistTaps="handled"
+          >
             {customs.length > 0 && (
               <>
                 <Text style={{ color: theme.textMuted, fontSize: 11, fontWeight: '700', marginBottom: 6 }}>

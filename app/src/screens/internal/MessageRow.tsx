@@ -3,7 +3,7 @@ import { View, Text, Pressable } from 'react-native'
 import { theme, avatarColor } from '../../lib/theme'
 import { displayName } from '../../stores/userStore'
 import type { Message, PublicUser } from '../../lib/types'
-import { MIN_TOUCH } from './ui'
+import { useResponsive } from '../../lib/responsive'
 
 /**
  * Compact read-only message row for the pin / bookmark / scheduled lists.
@@ -32,6 +32,7 @@ export default function MessageRow({
   actionDestructive?: boolean
   actionBusy?: boolean
 }) {
+  const { gutter, minTouch } = useResponsive()
   const author = displayName(users, message.user_id)
   const body = (
     <>
@@ -76,7 +77,9 @@ export default function MessageRow({
       style={{
         flexDirection: 'row',
         alignItems: 'flex-start',
-        paddingHorizontal: 16,
+        // The row draws its own divider, so it pads itself rather than sitting
+        // inside a padded column: the rule has to reach the column's edge.
+        paddingHorizontal: gutter,
         paddingVertical: 12,
         borderBottomWidth: 1,
         borderBottomColor: theme.border,
@@ -88,7 +91,7 @@ export default function MessageRow({
           accessibilityRole="button"
           accessibilityLabel={`Message from ${author}: ${message.content}`}
           accessibilityHint="Opens the conversation"
-          style={{ flexDirection: 'row', flex: 1, minHeight: MIN_TOUCH }}
+          style={{ flexDirection: 'row', flex: 1, minHeight: minTouch }}
         >
           {body}
         </Pressable>
@@ -113,7 +116,7 @@ export default function MessageRow({
           style={{
             marginLeft: 8,
             paddingHorizontal: 10,
-            minHeight: MIN_TOUCH,
+            minHeight: minTouch,
             justifyContent: 'center',
             opacity: actionBusy ? 0.5 : 1,
           }}

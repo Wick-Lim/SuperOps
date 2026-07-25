@@ -22,16 +22,21 @@ import { workspaceApi } from '../api/workspaces'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { errorMessage, isApiError } from '../api/client'
 import type { Workspace, WorkspaceRole } from '../lib/types'
+import { useResponsive } from '../lib/responsive'
 import {
   Button,
   Chip,
+  type Column,
   EmptyState,
   ErrorState,
   Field,
   ListFooter,
   LoadingState,
-  MIN_TOUCH,
   ScreenHeader,
+  TABLE_MAX_WIDTH,
+  TableHeader,
+  cell,
+  contentColumn,
 } from './internal/ui'
 
 type Tab = 'stats' | 'users' | 'invitations' | 'audit'
@@ -52,55 +57,92 @@ const STAT_LABELS: Array<{ key: keyof AdminStats; label: string }> = [
   { key: 'messages', label: 'Messages' },
 ]
 
+/** Columns for the users table. Compact never sees them — it keeps the cards. */
+const USER_COLS: Column[] = [
+  { key: 'member', label: 'Member', flex: 1 },
+  { key: 'email', label: 'Email', flex: 1 },
+  { key: 'status', label: 'Status', width: 92 },
+  { key: 'role', label: 'Role', width: 104 },
+  { key: 'active', label: '', width: 104, align: 'right' },
+]
+
+const INVITE_COLS: Column[] = [
+  { key: 'email', label: 'Email', flex: 1 },
+  { key: 'role', label: 'Role', width: 80 },
+  { key: 'workspace', label: 'Workspace', width: 150 },
+  { key: 'expires', label: 'Expires', width: 96 },
+  { key: 'status', label: 'Status', width: 88, align: 'right' },
+]
+
+const AUDIT_COLS: Column[] = [
+  { key: 'action', label: 'Action', flex: 1 },
+  { key: 'resource', label: 'Resource', flex: 1 },
+  { key: 'workspace', label: 'Workspace', width: 150 },
+  { key: 'when', label: 'When', width: 170, align: 'right' },
+]
+
 function TabBar({ tab, setTab }: { tab: Tab; setTab: (t: Tab) => void }) {
+  const { tier, gutter, minTouch } = useResponsive()
+  // Four tabs stretched across a monitor read as a toolbar, not a tab set:
+  // once there is room they size to their labels and sit with the content.
+  const wide = tier !== 'compact'
   return (
-    <View
-      accessibilityRole="tablist"
-      style={{ flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: theme.border }}
-    >
-      {TABS.map((t) => {
-        const active = t.key === tab
-        return (
-          <Pressable
-            key={t.key}
-            onPress={() => setTab(t.key)}
-            accessibilityRole="tab"
-            accessibilityLabel={t.label}
-            accessibilityState={{ selected: active }}
-            style={{
-              flex: 1,
-              paddingVertical: 12,
-              minHeight: MIN_TOUCH,
-              alignItems: 'center',
-              justifyContent: 'center',
-              borderBottomWidth: 2,
-              borderBottomColor: active ? theme.primary : 'transparent',
-            }}
-          >
-            <Text
+    <View style={{ borderBottomWidth: 1, borderBottomColor: theme.border }}>
+      <View
+        accessibilityRole="tablist"
+        style={{
+          ...contentColumn(TABLE_MAX_WIDTH),
+          flexDirection: 'row',
+          paddingHorizontal: wide ? gutter : 0,
+        }}
+      >
+        {TABS.map((t) => {
+          const active = t.key === tab
+          return (
+            <Pressable
+              key={t.key}
+              onPress={() => setTab(t.key)}
+              accessibilityRole="tab"
+              accessibilityLabel={t.label}
+              accessibilityState={{ selected: active }}
               style={{
-                color: active ? theme.text : theme.textMuted,
-                fontSize: 14,
-                fontWeight: active ? '700' : '500',
+                flex: wide ? undefined : 1,
+                paddingHorizontal: wide ? 20 : 0,
+                paddingVertical: wide ? 8 : 12,
+                minHeight: minTouch,
+                alignItems: 'center',
+                justifyContent: 'center',
+                borderBottomWidth: 2,
+                borderBottomColor: active ? theme.primary : 'transparent',
               }}
             >
-              {t.label}
-            </Text>
-          </Pressable>
-        )
-      })}
+              <Text
+                style={{
+                  color: active ? theme.text : theme.textMuted,
+                  fontSize: 14,
+                  fontWeight: active ? '700' : '500',
+                }}
+              >
+                {t.label}
+              </Text>
+            </Pressable>
+          )
+        })}
+      </View>
     </View>
   )
 }
 
 function StatCard({ label, value }: { label: string; value: number }) {
+  const { tier } = useResponsive()
   return (
     <View
       accessible
       accessibilityLabel={`${value} ${label}`}
       style={{
         flexGrow: 1,
-        flexBasis: '47%',
+        // Two-up under a thumb; one row of four once they fit side by side.
+        flexBasis: tier === 'compact' ? '47%' : 0,
         backgroundColor: theme.surface,
         borderWidth: 1,
         borderColor: theme.border,
@@ -129,6 +171,20 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
   const [tab, setTab] = useState<Tab>('stats')
   const [forbidden, setForbidden] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+
+  const { tier, gutter, minTouch } = useResponsive()
+  /** Users, invitations and the audit log are tables; a phone gets the cards. */
+  const table = tier !== 'compact'
+  /**
+   * Table rows pad themselves so their divider reaches the column edge; the
+   * stacked cards are inset by the container as they were.
+   */
+  const listContent = {
+    ...contentColumn(TABLE_MAX_WIDTH),
+    paddingHorizontal: table ? 0 : gutter,
+    paddingTop: 16,
+    paddingBottom: 24,
+  }
 
   const storeWorkspaces = useWorkspaceStore((s) => s.workspaces)
   const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace)
@@ -332,7 +388,12 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
   }
 
   const header = (
-    <ScreenHeader title="Admin" onBack={() => navigation.goBack()} subtitle="Workspaces you administer" />
+    <ScreenHeader
+      title="Admin"
+      onBack={() => navigation.goBack()}
+      subtitle="Workspaces you administer"
+      maxWidth={TABLE_MAX_WIDTH}
+    />
   )
 
   if (forbidden) {
@@ -347,24 +408,33 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
     )
   }
 
+  const workspaceChips =
+    workspaces.length === 0 ? (
+      <Text style={{ color: theme.textMuted, fontSize: 13 }}>No workspaces available.</Text>
+    ) : (
+      workspaces.map((w) => (
+        <Chip
+          key={w.id}
+          label={w.name}
+          selected={w.id === targetWorkspaceId}
+          onPress={() => setTargetWorkspaceId(w.id)}
+          accessibilityLabel={`Workspace ${w.name}`}
+        />
+      ))
+    )
+
   const workspacePicker = (
     <View style={{ marginBottom: 12 }}>
       <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 6 }}>Workspace</Text>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
-        {workspaces.length === 0 ? (
-          <Text style={{ color: theme.textMuted, fontSize: 13 }}>No workspaces available.</Text>
-        ) : (
-          workspaces.map((w) => (
-            <Chip
-              key={w.id}
-              label={w.name}
-              selected={w.id === targetWorkspaceId}
-              onPress={() => setTargetWorkspaceId(w.id)}
-              accessibilityLabel={`Workspace ${w.name}`}
-            />
-          ))
-        )}
-      </ScrollView>
+      {/* Sideways scrolling is a phone compromise; wide enough, they wrap and
+          every workspace is visible at once. */}
+      {table ? (
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>{workspaceChips}</View>
+      ) : (
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
+          {workspaceChips}
+        </ScrollView>
+      )}
     </View>
   )
 
@@ -380,7 +450,7 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
           <ErrorState message={statsError} onRetry={loadStats} />
         ) : (
           <ScrollView
-            contentContainerStyle={{ padding: 16 }}
+            contentContainerStyle={{ ...contentColumn(TABLE_MAX_WIDTH), padding: gutter }}
             refreshControl={
               <RefreshControl
                 refreshing={refreshing}
@@ -401,7 +471,7 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
         <FlatList
           data={users}
           keyExtractor={(u) => u.id}
-          contentContainerStyle={{ padding: 16 }}
+          contentContainerStyle={listContent}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -409,7 +479,14 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
               tintColor={theme.accent}
             />
           }
-          ListHeaderComponent={usersError ? null : workspacePicker}
+          ListHeaderComponent={
+            usersError ? null : (
+              <View>
+                <View style={{ paddingHorizontal: table ? gutter : 0 }}>{workspacePicker}</View>
+                {table && users.length > 0 ? <TableHeader columns={USER_COLS} /> : null}
+              </View>
+            )
+          }
           ListEmptyComponent={
             usersError ? (
               <ErrorState message={usersError} onRetry={loadUsers} />
@@ -422,6 +499,127 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
           renderItem={({ item: u }) => {
             const busy = pendingUserId === u.id
             const expanded = expandedUserId === u.id
+            const name = u.full_name || u.username
+
+            const rolePanel = (
+              <View style={{ marginTop: 8 }}>
+                <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 8 }}>
+                  Role in {targetWorkspaceId ? workspaceName(targetWorkspaceId) : 'no workspace selected'}
+                </Text>
+                <View style={{ flexDirection: 'row', gap: 8 }}>
+                  {INVITE_ROLES.map((r) => (
+                    <Chip
+                      key={r}
+                      label={r}
+                      selected={false}
+                      onPress={() => setUserRole(u, r)}
+                      accessibilityLabel={`Set role ${r}`}
+                    />
+                  ))}
+                </View>
+              </View>
+            )
+
+            const roleToggle = (
+              <Pressable
+                onPress={() => setExpandedUserId(expanded ? null : u.id)}
+                accessibilityRole="button"
+                accessibilityLabel={expanded ? 'Hide role options' : `Change role for ${name}`}
+                accessibilityState={{ expanded }}
+                hitSlop={8}
+                style={{ minHeight: 32, justifyContent: 'center' }}
+              >
+                <Text style={{ color: theme.accent, fontSize: 13 }}>
+                  {expanded ? 'Hide role' : 'Change role…'}
+                </Text>
+              </Pressable>
+            )
+
+            const activeToggle = (
+              <Pressable
+                onPress={() => toggleUserActive(u)}
+                disabled={busy}
+                accessibilityRole="button"
+                accessibilityLabel={`${u.is_active ? 'Deactivate' : 'Activate'} ${name}`}
+                accessibilityState={{ disabled: busy, busy }}
+                style={{
+                  borderWidth: 1,
+                  borderColor: u.is_active ? theme.danger : theme.success,
+                  borderRadius: 8,
+                  paddingHorizontal: 12,
+                  minHeight: minTouch,
+                  minWidth: table ? 96 : 100,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  opacity: busy ? 0.5 : 1,
+                }}
+              >
+                <Text
+                  style={{
+                    color: u.is_active ? theme.danger : theme.success,
+                    fontSize: 13,
+                    fontWeight: '600',
+                  }}
+                >
+                  {u.is_active ? 'Deactivate' : 'Activate'}
+                </Text>
+              </Pressable>
+            )
+
+            if (table) {
+              return (
+                <View style={{ borderBottomWidth: 1, borderBottomColor: theme.border }}>
+                  <View
+                    style={{
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      gap: 12,
+                      paddingHorizontal: gutter,
+                      paddingVertical: 6,
+                      minHeight: minTouch,
+                    }}
+                  >
+                    <View style={{ ...cell(USER_COLS[0]), flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                      <View
+                        style={{
+                          width: 28,
+                          height: 28,
+                          borderRadius: 14,
+                          backgroundColor: avatarColor(u.id),
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                      >
+                        <Text style={{ color: '#fff', fontWeight: '700', fontSize: 12 }}>
+                          {(name || '?').charAt(0).toUpperCase()}
+                        </Text>
+                      </View>
+                      <Text
+                        style={{ color: theme.text, fontSize: 14, fontWeight: '600', flexShrink: 1 }}
+                        numberOfLines={1}
+                      >
+                        {name}
+                        {u.is_bot ? '  ·  bot' : ''}
+                      </Text>
+                    </View>
+                    <View style={cell(USER_COLS[1])}>
+                      <Text style={{ color: theme.textMuted, fontSize: 13 }} numberOfLines={1}>
+                        {u.email}
+                      </Text>
+                    </View>
+                    <View style={cell(USER_COLS[2])}>
+                      <Text style={{ color: u.is_active ? theme.success : theme.textMuted, fontSize: 13 }}>
+                        {u.is_active ? 'Active' : 'Deactivated'}
+                      </Text>
+                    </View>
+                    <View style={cell(USER_COLS[3])}>{roleToggle}</View>
+                    <View style={cell(USER_COLS[4])}>{activeToggle}</View>
+                  </View>
+                  {expanded ? <View style={{ paddingHorizontal: gutter, paddingBottom: 12 }}>{rolePanel}</View> : null}
+                </View>
+              )
+            }
+
             return (
               <View
                 style={{
@@ -446,12 +644,12 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
                     }}
                   >
                     <Text style={{ color: '#fff', fontWeight: '700' }}>
-                      {(u.full_name || u.username || '?').charAt(0).toUpperCase()}
+                      {(name || '?').charAt(0).toUpperCase()}
                     </Text>
                   </View>
                   <View style={{ flex: 1 }}>
                     <Text style={{ color: theme.text, fontSize: 15, fontWeight: '600' }}>
-                      {u.full_name || u.username}
+                      {name}
                       {u.is_bot ? '  ·  bot' : ''}
                     </Text>
                     <Text style={{ color: theme.textMuted, fontSize: 12 }}>{u.email}</Text>
@@ -465,67 +663,12 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
                       {u.is_active ? 'Active' : 'Deactivated'}
                     </Text>
                   </View>
-                  <Pressable
-                    onPress={() => toggleUserActive(u)}
-                    disabled={busy}
-                    accessibilityRole="button"
-                    accessibilityLabel={`${u.is_active ? 'Deactivate' : 'Activate'} ${u.full_name || u.username}`}
-                    accessibilityState={{ disabled: busy, busy }}
-                    style={{
-                      borderWidth: 1,
-                      borderColor: u.is_active ? theme.danger : theme.success,
-                      borderRadius: 8,
-                      paddingHorizontal: 12,
-                      minHeight: MIN_TOUCH,
-                      minWidth: 100,
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      opacity: busy ? 0.5 : 1,
-                    }}
-                  >
-                    <Text
-                      style={{
-                        color: u.is_active ? theme.danger : theme.success,
-                        fontSize: 13,
-                        fontWeight: '600',
-                      }}
-                    >
-                      {u.is_active ? 'Deactivate' : 'Activate'}
-                    </Text>
-                  </Pressable>
+                  {activeToggle}
                 </View>
 
-                <Pressable
-                  onPress={() => setExpandedUserId(expanded ? null : u.id)}
-                  accessibilityRole="button"
-                  accessibilityLabel={expanded ? 'Hide role options' : `Change role for ${u.full_name || u.username}`}
-                  accessibilityState={{ expanded }}
-                  hitSlop={8}
-                  style={{ marginTop: 10, minHeight: 32, justifyContent: 'center' }}
-                >
-                  <Text style={{ color: theme.accent, fontSize: 13 }}>
-                    {expanded ? 'Hide role' : 'Change role…'}
-                  </Text>
-                </Pressable>
+                <View style={{ marginTop: 10 }}>{roleToggle}</View>
 
-                {expanded ? (
-                  <View style={{ marginTop: 8 }}>
-                    <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 8 }}>
-                      Role in {targetWorkspaceId ? workspaceName(targetWorkspaceId) : 'no workspace selected'}
-                    </Text>
-                    <View style={{ flexDirection: 'row', gap: 8 }}>
-                      {INVITE_ROLES.map((r) => (
-                        <Chip
-                          key={r}
-                          label={r}
-                          selected={false}
-                          onPress={() => setUserRole(u, r)}
-                          accessibilityLabel={`Set role ${r}`}
-                        />
-                      ))}
-                    </View>
-                  </View>
-                ) : null}
+                {expanded ? rolePanel : null}
               </View>
             )
           }}
@@ -536,7 +679,7 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
         <FlatList
           data={invitations}
           keyExtractor={(i) => i.id}
-          contentContainerStyle={{ padding: 16 }}
+          contentContainerStyle={listContent}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -545,7 +688,7 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
             />
           }
           ListHeaderComponent={
-            <View>
+            <View style={{ paddingHorizontal: table ? gutter : 0 }}>
               <View
                 style={{
                   backgroundColor: theme.surface,
@@ -563,26 +706,38 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
                   Invite a new member
                 </Text>
                 {workspacePicker}
-                <Field
-                  label="Email"
-                  value={inviteEmail}
-                  onChangeText={setInviteEmail}
-                  placeholder="email@example.com"
-                  keyboardType="email-address"
-                />
-                <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 6 }}>Role</Text>
-                <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
-                  {INVITE_ROLES.map((r) => (
-                    <Chip
-                      key={r}
-                      label={r}
-                      selected={inviteRole === r}
-                      onPress={() => setInviteRole(r)}
-                      accessibilityLabel={`Invite as ${r}`}
+                {/* Address and role are one decision; a phone has to stack them. */}
+                <View style={{ flexDirection: table ? 'row' : 'column', gap: table ? 20 : 0 }}>
+                  <View style={{ flex: table ? 1 : undefined }}>
+                    <Field
+                      label="Email"
+                      value={inviteEmail}
+                      onChangeText={setInviteEmail}
+                      placeholder="email@example.com"
+                      keyboardType="email-address"
                     />
-                  ))}
+                  </View>
+                  <View style={{ flex: table ? 1 : undefined }}>
+                    <Text style={{ color: theme.textMuted, fontSize: 12, marginBottom: 6 }}>Role</Text>
+                    <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
+                      {INVITE_ROLES.map((r) => (
+                        <Chip
+                          key={r}
+                          label={r}
+                          selected={inviteRole === r}
+                          onPress={() => setInviteRole(r)}
+                          accessibilityLabel={`Invite as ${r}`}
+                        />
+                      ))}
+                    </View>
+                  </View>
                 </View>
-                <Button label="Send invitation" onPress={createInvitation} loading={creatingInvite} />
+                <Button
+                  label="Send invitation"
+                  onPress={createInvitation}
+                  loading={creatingInvite}
+                  inline
+                />
               </View>
 
               {lastCreated ? (
@@ -606,7 +761,13 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
                     {lastCreated.invite_url}
                   </Text>
                   <View style={{ height: 12 }} />
-                  <Button label="Dismiss" onPress={() => setLastCreated(null)} variant="ghost" />
+                  <Button label="Dismiss" onPress={() => setLastCreated(null)} variant="ghost" inline />
+                </View>
+              ) : null}
+
+              {table && invitations.length > 0 ? (
+                <View style={{ marginHorizontal: -gutter }}>
+                  <TableHeader columns={INVITE_COLS} />
                 </View>
               ) : null}
             </View>
@@ -620,38 +781,87 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
               <LoadingState label="Loading invitations" />
             )
           }
-          renderItem={({ item: i }) => (
-            <View
-              accessible
-              accessibilityLabel={`${i.email}, ${i.role}, ${i.status}`}
-              style={{
-                flexDirection: 'row',
-                alignItems: 'center',
-                backgroundColor: theme.surface,
-                borderWidth: 1,
-                borderColor: theme.border,
-                borderRadius: 12,
-                padding: 12,
-                marginBottom: 10,
-              }}
-            >
-              <View style={{ flex: 1 }}>
-                <Text style={{ color: theme.text, fontSize: 15, fontWeight: '600' }}>{i.email}</Text>
-                <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
-                  {i.role} · {workspaceName(i.workspace_id)}
-                  {i.invited_by ? ` · by ${i.invited_by}` : ''}
-                </Text>
-                <Text style={{ color: theme.textMuted, fontSize: 11, marginTop: 2 }}>
-                  expires {shortDate(i.expires_at)}
-                </Text>
+          renderItem={({ item: i }) => {
+            // The backend field is `status`; the screen used to read a
+            // non-existent `accepted`, so everything said "Pending".
+            const status = i.status.charAt(0).toUpperCase() + i.status.slice(1)
+            const label = `${i.email}, ${i.role}, ${i.status}`
+
+            if (table) {
+              return (
+                <View
+                  accessible
+                  accessibilityLabel={label}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    gap: 12,
+                    paddingHorizontal: gutter,
+                    paddingVertical: 10,
+                    minHeight: minTouch,
+                    borderBottomWidth: 1,
+                    borderBottomColor: theme.border,
+                  }}
+                >
+                  <View style={cell(INVITE_COLS[0])}>
+                    <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }} numberOfLines={1}>
+                      {i.email}
+                    </Text>
+                    {i.invited_by ? (
+                      <Text style={{ color: theme.textFaint, fontSize: 11 }} numberOfLines={1}>
+                        by {i.invited_by}
+                      </Text>
+                    ) : null}
+                  </View>
+                  <View style={cell(INVITE_COLS[1])}>
+                    <Text style={{ color: theme.textMuted, fontSize: 13 }}>{i.role}</Text>
+                  </View>
+                  <View style={cell(INVITE_COLS[2])}>
+                    <Text style={{ color: theme.textMuted, fontSize: 13 }} numberOfLines={1}>
+                      {workspaceName(i.workspace_id)}
+                    </Text>
+                  </View>
+                  <View style={cell(INVITE_COLS[3])}>
+                    <Text style={{ color: theme.textMuted, fontSize: 13 }}>{shortDate(i.expires_at)}</Text>
+                  </View>
+                  <View style={cell(INVITE_COLS[4])}>
+                    <Text style={{ color: statusColor(i.status), fontSize: 12, fontWeight: '600' }}>
+                      {status}
+                    </Text>
+                  </View>
+                </View>
+              )
+            }
+
+            return (
+              <View
+                accessible
+                accessibilityLabel={label}
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  backgroundColor: theme.surface,
+                  borderWidth: 1,
+                  borderColor: theme.border,
+                  borderRadius: 12,
+                  padding: 12,
+                  marginBottom: 10,
+                }}
+              >
+                <View style={{ flex: 1 }}>
+                  <Text style={{ color: theme.text, fontSize: 15, fontWeight: '600' }}>{i.email}</Text>
+                  <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
+                    {i.role} · {workspaceName(i.workspace_id)}
+                    {i.invited_by ? ` · by ${i.invited_by}` : ''}
+                  </Text>
+                  <Text style={{ color: theme.textMuted, fontSize: 11, marginTop: 2 }}>
+                    expires {shortDate(i.expires_at)}
+                  </Text>
+                </View>
+                <Text style={{ color: statusColor(i.status), fontSize: 12, fontWeight: '600' }}>{status}</Text>
               </View>
-              {/* The backend field is `status`; the screen used to read a
-                  non-existent `accepted`, so everything said "Pending". */}
-              <Text style={{ color: statusColor(i.status), fontSize: 12, fontWeight: '600' }}>
-                {i.status.charAt(0).toUpperCase() + i.status.slice(1)}
-              </Text>
-            </View>
-          )}
+            )
+          }}
         />
       )}
 
@@ -659,7 +869,8 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
         <FlatList
           data={audit}
           keyExtractor={(a) => a.id}
-          contentContainerStyle={{ padding: 16 }}
+          contentContainerStyle={listContent}
+          ListHeaderComponent={table && audit.length > 0 ? <TableHeader columns={AUDIT_COLS} /> : null}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -687,29 +898,79 @@ export default function AdminScreen({ navigation }: { navigation: any; route: an
               onLoadMore={() => loadAudit(auditCursor)}
             />
           }
-          renderItem={({ item: a }) => (
-            <View
-              style={{
-                backgroundColor: theme.surface,
-                borderWidth: 1,
-                borderColor: theme.border,
-                borderRadius: 12,
-                padding: 12,
-                marginBottom: 10,
-              }}
-            >
-              <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }}>{a.action}</Text>
-              <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
-                {a.resource_type}
-                {a.resource_id ? ` · ${a.resource_id.slice(0, 8)}` : ''}
-                {a.workspace_id ? ` · ${workspaceName(a.workspace_id)}` : ''}
-              </Text>
-              <Text style={{ color: theme.textMuted, fontSize: 11, marginTop: 4 }}>
-                {new Date(a.created_at).toLocaleString()}
-                {a.ip_address ? ` · ${a.ip_address}` : ''}
-              </Text>
-            </View>
-          )}
+          renderItem={({ item: a }) => {
+            const resource = `${a.resource_type}${a.resource_id ? ` · ${a.resource_id.slice(0, 8)}` : ''}`
+            const when = new Date(a.created_at).toLocaleString()
+
+            if (table) {
+              // Three stacked lines per entry is a phone compromise: a log is
+              // read by scanning one column, which needs the entry on one line.
+              return (
+                <View
+                  accessible
+                  accessibilityLabel={`${a.action}, ${resource}, ${when}`}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    gap: 12,
+                    paddingHorizontal: gutter,
+                    paddingVertical: 8,
+                    borderBottomWidth: 1,
+                    borderBottomColor: theme.border,
+                  }}
+                >
+                  <View style={cell(AUDIT_COLS[0])}>
+                    <Text style={{ color: theme.text, fontSize: 13, fontWeight: '600' }} numberOfLines={1}>
+                      {a.action}
+                    </Text>
+                  </View>
+                  <View style={cell(AUDIT_COLS[1])}>
+                    <Text style={{ color: theme.textMuted, fontSize: 13 }} numberOfLines={1}>
+                      {resource}
+                    </Text>
+                  </View>
+                  <View style={cell(AUDIT_COLS[2])}>
+                    <Text style={{ color: theme.textMuted, fontSize: 13 }} numberOfLines={1}>
+                      {a.workspace_id ? workspaceName(a.workspace_id) : ''}
+                    </Text>
+                  </View>
+                  <View style={cell(AUDIT_COLS[3])}>
+                    <Text style={{ color: theme.textFaint, fontSize: 12 }} numberOfLines={1}>
+                      {when}
+                    </Text>
+                    {a.ip_address ? (
+                      <Text style={{ color: theme.textDim, fontSize: 11 }} numberOfLines={1}>
+                        {a.ip_address}
+                      </Text>
+                    ) : null}
+                  </View>
+                </View>
+              )
+            }
+
+            return (
+              <View
+                style={{
+                  backgroundColor: theme.surface,
+                  borderWidth: 1,
+                  borderColor: theme.border,
+                  borderRadius: 12,
+                  padding: 12,
+                  marginBottom: 10,
+                }}
+              >
+                <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }}>{a.action}</Text>
+                <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 2 }}>
+                  {resource}
+                  {a.workspace_id ? ` · ${workspaceName(a.workspace_id)}` : ''}
+                </Text>
+                <Text style={{ color: theme.textMuted, fontSize: 11, marginTop: 4 }}>
+                  {when}
+                  {a.ip_address ? ` · ${a.ip_address}` : ''}
+                </Text>
+              </View>
+            )
+          }}
         />
       )}
     </SafeAreaView>
