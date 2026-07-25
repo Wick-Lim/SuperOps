@@ -34,6 +34,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/issue"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
+	"github.com/Wick-Lim/SuperOps/backend/internal/mailbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ratelimit"
@@ -593,6 +594,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	channelHandler.RegisterRoutes(mux, authMw)
 	collabHandler.RegisterRoutes(mux, authMw)
 	driveHandler.RegisterRoutes(mux, authMw)
+	mailboxHandler := mailbox.NewHandler(pool, az, logger)
+	mailboxHandler.RegisterRoutes(mux, authMw)
+	// Ingest is authenticated by a deployment-owned bearer token, not by a user
+	// session, and rate-limited by IP so a provider stuck in a retry loop
+	// cannot saturate the API.
+	mailboxHandler.RegisterIngestRoutes(mux, func(next http.Handler) http.Handler { return next })
 	huddleHandler.RegisterRoutes(mux, authMw)
 	// The webhook is authenticated by signature rather than by session, and it
 	// is rate-limited by IP: a media server that started retrying in a loop

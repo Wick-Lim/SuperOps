@@ -14,7 +14,7 @@ named, and explicit cuts.
 | [05-spreadsheet](05-spreadsheet.md) | Phase 4 — grid + formula engine | **Implemented** — no migration; see ruling 8 |
 | [06-design-surface](06-design-surface.md) | Phase 5 — bounded design surface | **Implemented** — no migration; see ruling 8 |
 | [07-huddle](07-huddle.md) | — huddles (order-independent) | **Implemented** (`050`) — media is a §3c capability, off by default |
-| [08-email](08-email.md) | Phase 6 — shared inbox | Plan |
+| [08-email](08-email.md) | Phase 6 — shared inbox | **Implemented** (`055`) |
 | [09-workflow](09-workflow.md) | Phase 7 — automation | Plan |
 
 Already shipped or in flight, so not planned here: outbound mail

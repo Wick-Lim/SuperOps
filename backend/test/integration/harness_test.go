@@ -865,3 +865,12 @@ func (h *harness) resolveLink(t *testing.T, token, password string) (int, apiRes
 	}
 	return h.do(t, http.MethodPost, "/api/v1/drive/links/"+token+"/resolve", "", body)
 }
+
+// doBearer sends a request with a RAW bearer token that is not a user session
+// — the ingest credential. h.do would work too, but naming it separately keeps
+// the distinction visible: this endpoint is called by a machine, and giving it
+// a user account would mean a user whose password lives in a webhook config.
+func (h *harness) doBearer(t *testing.T, method, path, token string, body any) (int, apiResp) {
+	t.Helper()
+	return h.do(t, method, path, token, body)
+}
