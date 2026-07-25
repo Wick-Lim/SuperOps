@@ -3,10 +3,11 @@ package notification
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
 type Repository struct {
@@ -28,18 +29,23 @@ func (r *Repository) Create(ctx context.Context, n *Notification) error {
 	return nil
 }
 
-func (r *Repository) ListByUser(ctx context.Context, userID string, before time.Time, limit int) ([]*Notification, error) {
-	query := `SELECT id, user_id, type, title, body, data::text, is_read, created_at
+// ListByUser pages by the total (created_at, id) key. Ordering on created_at
+// alone dropped rows at a page boundary whenever two notifications shared a
+// timestamp, which a single fan-out routinely produces.
+func (r *Repository) ListByUser(ctx context.Context, userID string, cursor httputil.Cursor, limit int) ([]*Notification, error) {
+	const cols = `SELECT id, user_id, type, title, body, data::text, is_read, created_at
 		 FROM notifications WHERE user_id = $1`
 
 	var rows pgx.Rows
 	var err error
-	if before.IsZero() {
-		query += ` ORDER BY created_at DESC LIMIT $2`
-		rows, err = r.pool.Query(ctx, query, userID, limit)
+	if cursor.IsZero() {
+		rows, err = r.pool.Query(ctx,
+			cols+` ORDER BY created_at DESC, id DESC LIMIT $2`,
+			userID, limit)
 	} else {
-		query += ` AND created_at < $2 ORDER BY created_at DESC LIMIT $3`
-		rows, err = r.pool.Query(ctx, query, userID, before, limit)
+		rows, err = r.pool.Query(ctx,
+			cols+` AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $4`,
+			userID, cursor.CreatedAt, cursor.ID, limit)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list notifications: %w", err)
@@ -54,23 +60,36 @@ func (r *Repository) ListByUser(ctx context.Context, userID string, before time.
 		}
 		notifications = append(notifications, n)
 	}
-	return notifications, nil
+	return notifications, rows.Err()
 }
 
-func (r *Repository) MarkRead(ctx context.Context, id, userID string) error {
-	_, err := r.pool.Exec(ctx, `UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2`, id, userID)
+// MarkRead reports whether a notification owned by the caller was updated, so a
+// no-op is distinguishable from a success.
+func (r *Repository) MarkRead(ctx context.Context, id, userID string) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2 AND is_read = FALSE`, id, userID)
 	if err != nil {
-		return fmt.Errorf("mark read: %w", err)
+		return false, fmt.Errorf("mark read: %w", err)
 	}
-	return nil
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+	// Already read is still a success; only a missing (or someone else's) row is not.
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM notifications WHERE id = $1 AND user_id = $2)`, id, userID,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("mark read: %w", err)
+	}
+	return exists, nil
 }
 
-func (r *Repository) MarkAllRead(ctx context.Context, userID string) error {
-	_, err := r.pool.Exec(ctx, `UPDATE notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE`, userID)
+func (r *Repository) MarkAllRead(ctx context.Context, userID string) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `UPDATE notifications SET is_read = TRUE WHERE user_id = $1 AND is_read = FALSE`, userID)
 	if err != nil {
-		return fmt.Errorf("mark all read: %w", err)
+		return 0, fmt.Errorf("mark all read: %w", err)
 	}
-	return nil
+	return tag.RowsAffected(), nil
 }
 
 func (r *Repository) UnreadCount(ctx context.Context, userID string) (int, error) {

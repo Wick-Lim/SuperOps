@@ -24,7 +24,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
-	params := httputil.ParsePagination(r)
+	params, err := httputil.ParsePagination(r)
+	if err != nil {
+		httputil.HandleError(w, err)
+		return
+	}
 
 	notifications, err := h.repo.ListByUser(r.Context(), userID, params.Cursor, params.Limit+1)
 	if err != nil {
@@ -42,7 +46,8 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 	var cursor string
 	if len(notifications) > 0 {
-		cursor = httputil.EncodeCursor(notifications[len(notifications)-1].CreatedAt)
+		last := notifications[len(notifications)-1]
+		cursor = httputil.EncodeCursor(last.CreatedAt, last.ID)
 	}
 	httputil.JSONList(w, http.StatusOK, notifications, cursor, hasMore)
 }
@@ -51,8 +56,13 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 	nID := r.PathValue("notification_id")
 
-	if err := h.repo.MarkRead(r.Context(), nID, userID); err != nil {
+	ok, err := h.repo.MarkRead(r.Context(), nID, userID)
+	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if !ok {
+		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "notification not found")
 		return
 	}
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "marked as read"})
@@ -61,11 +71,15 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) MarkAllRead(w http.ResponseWriter, r *http.Request) {
 	userID := authctx.UserID(r.Context())
 
-	if err := h.repo.MarkAllRead(r.Context(), userID); err != nil {
+	updated, err := h.repo.MarkAllRead(r.Context(), userID)
+	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
-	httputil.JSON(w, http.StatusOK, map[string]string{"message": "all marked as read"})
+	httputil.JSON(w, http.StatusOK, map[string]interface{}{
+		"message": "all marked as read",
+		"updated": updated,
+	})
 }
 
 func (h *Handler) UnreadCount(w http.ResponseWriter, r *http.Request) {

@@ -1,0 +1,37 @@
+SuperOps {{ .Chart.AppVersion }} — release {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+Endpoints
+  Web UI / API : http{{ if .Values.ingress.tls.enabled }}s{{ end }}://{{ .Values.global.domain }}
+  Backend Svc  : {{ include "superops.fullname" . }}-backend:8080 (cluster-internal)
+
+Dependencies this release points at
+  Postgres : {{ include "superops.postgresqlHost" . }}:{{ include "superops.postgresqlPort" . }}
+  Redis    : {{ include "superops.redisHost" . }}:6379
+  NATS     : {{ include "superops.natsHost" . }}:4222
+  MinIO    : {{ include "superops.minioHost" . }}:9000
+  Search   : {{ if and .Values.search.enabled .Values.externalMeilisearch.host }}{{ .Values.externalMeilisearch.host }}{{ else }}disabled (no meilisearch dependency in this chart){{ end }}
+
+First login
+  Email    : {{ .Values.admin.email }}
+  Password : the value of admin.password, seeded on first boot.
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "superops.fullname" . }}-secret \
+    -o jsonpath='{.data.ADMIN_PASSWORD}' | base64 -d; echo
+
+Migrations run as a post-install / pre-upgrade hook Job
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "superops.fullname" . }}-migrate
+
+{{- if not .Values.ingress.tls.enabled }}
+
+WARNING: ingress.tls.enabled=false — JWTs would travel in cleartext.
+{{- end }}
+{{- if and .Values.ingress.tls.enabled (not (or .Values.ingress.tls.clusterIssuer .Values.ingress.tls.issuer)) }}
+
+NOTE: TLS is on but no cert-manager issuer is set. Create the Secret
+"{{ .Values.ingress.tls.secretName }}" yourself, or the ingress controller will
+serve its self-signed default certificate.
+{{- end }}
+{{- if eq (.Values.backend.env.CORS_ALLOWED_ORIGINS | default "*") "*" }}
+
+WARNING: CORS_ALLOWED_ORIGINS is "*". Restrict it to your web origin(s).
+{{- end }}

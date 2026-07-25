@@ -2,9 +2,14 @@ apiVersion: v2
 name: superops
 description: Self-hosted messenger platform
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.1.0"
 
+# NOTE: these are version ranges, so `helm dependency build` resolves
+# differently over time unless Chart.lock is committed. Run
+# `helm dependency update deploy/k8s/helm/superops` and commit the resulting
+# Chart.lock to make installs reproducible (it needs registry access, so it is
+# not generated here).
 dependencies:
   - name: postgresql
     version: "~16.0"
@@ -22,3 +27,7 @@ dependencies:
     version: "~14.0"
     repository: "oci://registry-1.docker.io/bitnamicharts"
     condition: minio.enabled
+  # There is deliberately no meilisearch dependency: nothing upstream is pinned
+  # here, so search is opt-in against an external instance
+  # (externalMeilisearch.host). values.yaml used to claim meilisearch.enabled,
+  # which deployed nothing and left search silently dead.

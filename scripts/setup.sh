@@ -1,41 +1,122 @@
 #!/usr/bin/env bash
+#
+# Local development setup: dependencies, a .env with REAL generated secrets,
+# the infrastructure stack, and the database schema.
+#
+# Re-running is safe: an existing deploy/docker/.env is never overwritten.
+
 set -euo pipefail
+
+# shellcheck source=scripts/_common.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
 echo "=== SuperOps Development Setup ==="
 
-# Check prerequisites
-command -v go >/dev/null 2>&1 || { echo "Go is required. Install from https://go.dev"; exit 1; }
-command -v node >/dev/null 2>&1 || { echo "Node.js is required. Install from https://nodejs.org"; exit 1; }
-command -v docker >/dev/null 2>&1 || { echo "Docker is required. Install from https://docker.com"; exit 1; }
+require_cmd go
+require_cmd node
+require_cmd docker
 
-# Backend dependencies
+# --- Dependencies ---
 echo "Installing backend dependencies..."
-cd backend && go mod download && cd ..
+( cd "$REPO_ROOT/backend" && go mod download )
 
-# App dependencies (React Native / Expo)
 echo "Installing app dependencies..."
-cd app && npm ci && cd ..
+( cd "$REPO_ROOT/app" && npm ci )
 
-# Docker env
-if [ ! -f deploy/docker/.env ]; then
-  cp deploy/docker/.env.example deploy/docker/.env
-  echo "Created deploy/docker/.env from template. Edit secrets before running."
+# --- Environment ---
+# Never let changeme_ placeholders reach a running stack: generate real values.
+#
+# `tr -dc ... </dev/urandom | head -c N` is the obvious one-liner and is wrong
+# here: head exits early, tr dies of SIGPIPE, and `set -o pipefail` turns the
+# whole script into an exit-141. Read a bounded chunk instead.
+gen_secret() {
+  local len="${1:-40}" out=""
+  while [ "${#out}" -lt "$len" ]; do
+    out="$out$(LC_ALL=C head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
+  done
+  printf '%s' "${out:0:$len}"
+}
+
+ENV_FILE="$COMPOSE_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+  echo "Keeping existing $ENV_FILE."
+else
+  echo "Generating $ENV_FILE with random secrets..."
+  ( umask 077; cp "$COMPOSE_DIR/.env.example" "$ENV_FILE" )
+
+  set_env() { # set_env KEY VALUE
+    local key="$1" val="$2" tmp="$ENV_FILE.tmp"
+    awk -v k="$key" -v v="$val" -F= '
+      $1 == k { print k "=" v; found = 1; next }
+      { print }
+      END { if (!found) print k "=" v }
+    ' "$ENV_FILE" > "$tmp"
+    mv "$tmp" "$ENV_FILE"
+  }
+
+  DB_PW="$(gen_secret 32)"
+  set_env DB_PASSWORD "$DB_PW"
+  set_env POSTGRES_PASSWORD "$DB_PW"
+  set_env REDIS_PASSWORD "$(gen_secret 32)"
+  set_env NATS_PASSWORD "$(gen_secret 32)"
+  set_env JWT_SECRET "$(gen_secret 64)"
+  set_env ADMIN_PASSWORD "$(gen_secret 24)"
+  set_env MINIO_ACCESS_KEY "superops_$(gen_secret 12)"
+  set_env MINIO_SECRET_KEY "$(gen_secret 40)"
+  set_env MEILI_MASTER_KEY "$(gen_secret 40)"
+  set_env METRICS_TOKEN "$(gen_secret 32)"
+  set_env GRAFANA_ADMIN_PASSWORD "$(gen_secret 24)"
+  chmod 600 "$ENV_FILE"
+
+  # Assignments only — the file header mentions the word in a comment.
+  if grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=changeme_' "$ENV_FILE"; then
+    echo "Remaining placeholders:" >&2
+    grep -En '^[A-Za-z_][A-Za-z0-9_]*=changeme_' "$ENV_FILE" >&2
+    die "$ENV_FILE still contains changeme_ placeholders — secret generation failed"
+  fi
+  echo "  -> secrets generated (stored only in $ENV_FILE; nothing is printed here)"
 fi
 
-# Start infrastructure
+load_env
+
+# Prometheus reads the metrics bearer token from this file (compose secret).
+mkdir -p "$COMPOSE_DIR/secrets"
+( umask 077; printf '%s' "${METRICS_TOKEN:-}" > "$COMPOSE_DIR/secrets/metrics_token" )
+
+# --- Infrastructure ---
 echo "Starting infrastructure services..."
-cd deploy/docker && docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d && cd ../..
+compose -f "$COMPOSE_DIR/docker-compose.dev.yml" up -d
 
-echo "Waiting for PostgreSQL..."
-until docker exec docker-postgres-1 pg_isready -U superops 2>/dev/null; do sleep 1; done
+echo "Waiting for PostgreSQL (up to 120s)..."
+PG_CID="$(service_cid postgres)"
+deadline=$(( $(date +%s) + 120 ))
+until docker exec "$PG_CID" pg_isready -U "$(db_user)" -d "$(db_name)" >/dev/null 2>&1; do
+  [ "$(date +%s)" -lt "$deadline" ] || die "PostgreSQL not ready within 120s (cd deploy/docker && docker compose logs postgres)"
+  sleep 2
+done
+echo "  -> ready"
 
-# Run migrations (config loader requires JWT_SECRET + ADMIN_* even for migrate)
+# --- Migrations ---
+# Credentials are passed through the environment from .env, so no secret is
+# echoed to the terminal or left in shell history.
 echo "Running database migrations..."
-DEV_ENV="JWT_SECRET=dev_secret_change_me_32chars_long DB_HOST=localhost DB_PASSWORD=changeme_db_password REDIS_PASSWORD=changeme_redis_password ADMIN_EMAIL=admin@company.com ADMIN_PASSWORD=changeme_admin_password"
-cd backend && env $DEV_ENV go run ./cmd/migrate -direction up && cd ..
+( cd "$REPO_ROOT/backend" \
+  && DB_HOST=127.0.0.1 REDIS_ADDR=127.0.0.1:6379 \
+     NATS_URL="nats://${NATS_USER:-superops}:${NATS_PASSWORD}@127.0.0.1:4222" \
+     go run ./cmd/migrate -direction up )
 
-echo ""
-echo "=== Setup Complete ==="
-echo "Start backend:  cd backend && env $DEV_ENV go run ./cmd/superops"
-echo "Seed demo data: cd backend && env $DEV_ENV go run ./cmd/seed   # demo users password: demo_password_123"
-echo "Start app:      cd app && npx expo start                       # press i/a/w for iOS/Android/web"
+cat <<'EOF'
+
+=== Setup Complete ===
+Secrets live in deploy/docker/.env (mode 600) and are never printed.
+
+  make dev                      # infra + API server on the host
+  make app-dev                  # Expo web client
+  make seed                     # demo data (demo users password: demo_password_123)
+  make backend-test             # unit tests
+  make backend-test-integration # integration suite (needs the infra above)
+
+Admin login — read it from the env file when you need it:
+
+  grep -E '^ADMIN_(EMAIL|PASSWORD)=' deploy/docker/.env
+EOF

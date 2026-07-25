@@ -34,7 +34,7 @@ func (r *Repository) ListByBlocker(ctx context.Context, blockerID string) ([]*Bl
 		}
 		blocks = append(blocks, b)
 	}
-	return blocks, nil
+	return blocks, rows.Err()
 }
 
 // Create inserts a block, ignoring duplicates.
@@ -50,14 +50,27 @@ func (r *Repository) Create(ctx context.Context, blockerID, blockedID string) er
 	return nil
 }
 
-// Delete removes a block.
-func (r *Repository) Delete(ctx context.Context, blockerID, blockedID string) error {
-	_, err := r.pool.Exec(ctx,
+// Delete removes a block and reports whether one existed, so unblocking
+// somebody who was never blocked is not reported as a success.
+func (r *Repository) Delete(ctx context.Context, blockerID, blockedID string) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
 		`DELETE FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2`,
 		blockerID, blockedID,
 	)
 	if err != nil {
-		return fmt.Errorf("delete block: %w", err)
+		return false, fmt.Errorf("delete block: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
+}
+
+// UserExists lets the handler answer 404 for an unknown target instead of
+// letting the foreign-key violation become a 500.
+func (r *Repository) UserExists(ctx context.Context, userID string) (bool, error) {
+	var ok bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, userID,
+	).Scan(&ok); err != nil {
+		return false, fmt.Errorf("check user exists: %w", err)
+	}
+	return ok, nil
 }

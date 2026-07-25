@@ -49,7 +49,7 @@ func TestJSONError(t *testing.T) {
 }
 
 func TestEncodeCursor(t *testing.T) {
-	cursor := EncodeCursor(mustParseTime("2026-01-15T10:30:00Z"))
+	cursor := EncodeCursor(mustParseTime("2026-01-15T10:30:00Z"), "0199a1f0-0000-7000-8000-000000000001")
 	if cursor == "" {
 		t.Fatal("cursor should not be empty")
 	}

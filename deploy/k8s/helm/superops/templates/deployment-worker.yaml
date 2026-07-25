@@ -13,18 +13,55 @@ spec:
       app.kubernetes.io/component: worker
   template:
     metadata:
+      annotations:
+        {{- include "superops.configChecksums" . | nindent 8 }}
       labels:
         {{- include "superops.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: worker
     spec:
+      serviceAccountName: {{ include "superops.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: worker
-          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
           command: ["/app/worker"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # Distinguishes worker connections in pg_stat_activity.
+            - name: DB_APPLICATION_NAME
+              value: superops-worker
           envFrom:
             - configMapRef:
                 name: {{ include "superops.fullname" . }}-config
             - secretRef:
                 name: {{ include "superops.fullname" . }}-secret
+          # NOTE: no liveness/readiness probe. cmd/worker starts no HTTP
+          # listener, and a probe that only checks "PID 1 exists" would be
+          # theatre — the kubelet already restarts the container if the process
+          # dies. A wedged (but alive) worker is therefore not detected. Fixing
+          # that needs a health endpoint in cmd/worker; see the wiring handoff.
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -5,6 +5,8 @@ end_of_line = lf
 insert_final_newline = true
 trim_trailing_whitespace = true
 charset = utf-8
+indent_style = space
+indent_size = 2
 
 [*.go]
 indent_style = tab
@@ -14,8 +16,31 @@ indent_size = 4
 indent_style = space
 indent_size = 2
 
+[*.{sh,bash}]
+indent_style = space
+indent_size = 2
+
+[*.sql]
+indent_style = space
+indent_size = 4
+
+# nginx configs in deploy/docker use 4-space indentation.
+[*.conf]
+indent_style = space
+indent_size = 4
+
+[Dockerfile*]
+indent_style = space
+indent_size = 4
+
 [*.md]
 trim_trailing_whitespace = false
 
-[Makefile]
+# Make requires literal tabs in recipes.
+[{Makefile,*.mk}]
 indent_style = tab
+
+# Helm templates are YAML with Go template directives.
+[*.tpl]
+indent_style = space
+indent_size = 2

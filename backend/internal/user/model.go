@@ -2,6 +2,12 @@ package user
 
 import "time"
 
+// Status field limits, mirroring the CHECK constraint added in migration 009.
+const (
+	MaxStatusTextLen  = 100
+	MaxStatusEmojiLen = 64
+)
+
 type User struct {
 	ID           string     `json:"id"`
 	Email        string     `json:"email"`
@@ -9,6 +15,8 @@ type User struct {
 	FullName     string     `json:"full_name"`
 	PasswordHash string     `json:"-"`
 	AvatarURL    string     `json:"avatar_url"`
+	StatusText   string     `json:"status_text"`
+	StatusEmoji  string     `json:"status_emoji"`
 	Timezone     string     `json:"timezone"`
 	Locale       string     `json:"locale"`
 	IsBot        bool       `json:"is_bot"`
@@ -19,19 +27,23 @@ type User struct {
 }
 
 type PublicUser struct {
-	ID        string `json:"id"`
-	Username  string `json:"username"`
-	FullName  string `json:"full_name"`
-	AvatarURL string `json:"avatar_url"`
-	IsBot     bool   `json:"is_bot"`
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	FullName    string `json:"full_name"`
+	AvatarURL   string `json:"avatar_url"`
+	StatusText  string `json:"status_text"`
+	StatusEmoji string `json:"status_emoji"`
+	IsBot       bool   `json:"is_bot"`
 }
 
 func (u *User) ToPublic() PublicUser {
 	return PublicUser{
-		ID:        u.ID,
-		Username:  u.Username,
-		FullName:  u.FullName,
-		AvatarURL: u.AvatarURL,
-		IsBot:     u.IsBot,
+		ID:          u.ID,
+		Username:    u.Username,
+		FullName:    u.FullName,
+		AvatarURL:   u.AvatarURL,
+		StatusText:  u.StatusText,
+		StatusEmoji: u.StatusEmoji,
+		IsBot:       u.IsBot,
 	}
 }

@@ -1,8 +1,30 @@
 global:
   scrape_interval: 15s
+  evaluation_interval: 30s
+  external_labels:
+    deployment: docker-compose
+
+rule_files:
+  - /etc/prometheus/prometheus-alerts.yml
 
 scrape_configs:
   - job_name: 'superops-backend'
+    metrics_path: '/metrics'
     static_configs:
       - targets: ['backend:8080']
-    metrics_path: '/metrics'
+    # /metrics is bearer-token protected whenever METRICS_TOKEN is set
+    # (backend/internal/app/metrics.go). Without this block the scrape silently
+    # 401s and the dashboards just go empty. The file is a compose secret
+    # written by scripts/setup.sh; when METRICS_TOKEN is unset it holds an empty
+    # string and the backend ignores the header.
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/metrics_token
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+# No exporters for postgres/redis/nats/minio are wired up: that needs four more
+# sidecar services, and the app's own /metrics is a hand-rolled text exposition
+# with counters only (no histograms, hence no latency percentiles).

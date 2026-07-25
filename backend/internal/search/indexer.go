@@ -9,11 +9,12 @@ import (
 )
 
 type MessageEvent struct {
-	ID          string `json:"id"`
-	ChannelID   string `json:"channel_id"`
-	UserID      string `json:"user_id"`
-	Content     string `json:"content"`
-	CreatedAt   string `json:"created_at"`
+	ID        string `json:"id"`
+	ChannelID string `json:"channel_id"`
+	UserID    string `json:"user_id"`
+	Content   string `json:"content"`
+	CreatedAt string `json:"created_at"`
+	IsDeleted bool   `json:"is_deleted"`
 }
 
 type Indexer struct {
@@ -52,7 +53,14 @@ func (idx *Indexer) HandleMessage(msg *nats.Msg) {
 		return
 
 	case "message.new", "message.updated":
-		// index/re-index below
+		// A soft-deleted message can also arrive as an update; drop it from the
+		// index rather than re-indexing deleted content.
+		if event.IsDeleted {
+			if err := idx.service.DeleteMessage(event.ID); err != nil {
+				idx.logger.Warn("indexer: delete message", "error", err, "id", event.ID)
+			}
+			return
+		}
 	default:
 		return
 	}

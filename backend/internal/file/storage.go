@@ -77,5 +77,31 @@ func (s *Storage) Download(ctx context.Context, key string) (io.ReadCloser, stri
 }
 
 func (s *Storage) Delete(ctx context.Context, key string) error {
-	return s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
+	if err := s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("remove object: %w", err)
+	}
+	return nil
+}
+
+// ListKeys walks the bucket so the garbage collector can find objects whose
+// files row no longer exists (workspace deletion cascades the rows away and
+// leaves every object behind). limit bounds one sweep; pass a prefix to shard.
+func (s *Storage) ListKeys(ctx context.Context, prefix string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	keys := make([]string, 0, limit)
+	for obj := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
+		Prefix:    prefix,
+		Recursive: true,
+	}) {
+		if obj.Err != nil {
+			return nil, fmt.Errorf("list objects: %w", obj.Err)
+		}
+		keys = append(keys, obj.Key)
+		if len(keys) >= limit {
+			break
+		}
+	}
+	return keys, nil
 }

@@ -5,6 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets release.yml depend on a full CI run for the tagged commit
+  # (`needs:` cannot reference jobs in another workflow).
+  workflow_call:
+
+# Least privilege by default; jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   backend:
@@ -17,9 +28,12 @@ jobs:
           cache-dependency-path: backend/go.sum
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
           working-directory: backend
+          # Pinned: an unpinned linter silently changes the rule set between
+          # runs, and v2 is what backend/.golangci.yml is written against.
+          version: v2.12.2
 
       - name: Build
         working-directory: backend
@@ -31,7 +45,31 @@ jobs:
 
       - name: Unit tests
         working-directory: backend
-        run: go test ./... -race -count=1
+        run: go test ./... -race -count=1 -coverprofile=coverage.out -covermode=atomic
+
+      - name: Coverage summary
+        working-directory: backend
+        run: go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.out
+          if-no-files-found: error
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: backend/go.sum
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Scan
+        working-directory: backend
+        run: govulncheck ./...
 
   integration:
     runs-on: ubuntu-latest
@@ -55,6 +93,9 @@ jobs:
       nats:
         image: nats:2
         ports: ['4222:4222']
+        # No --health-cmd: a service container cannot override the image
+        # command, so the monitoring port (-m 8222) is off and there is nothing
+        # to probe. The "Wait for NATS" step does a TCP check instead.
     env:
       DB_HOST: localhost
       DB_PORT: '5432'
@@ -63,13 +104,21 @@ jobs:
       DB_NAME: superops
       DB_SSLMODE: disable
       REDIS_ADDR: localhost:6379
+      # Set-but-empty means "no password" — the CI redis runs without
+      # requirepass. The harness distinguishes unset from empty (os.LookupEnv),
+      # so this no longer falls back to the compose default and fails AUTH.
       REDIS_PASSWORD: ''
       NATS_URL: nats://localhost:4222
       JWT_SECRET: ci_jwt_secret_at_least_32_characters_long
       ADMIN_EMAIL: admin@company.com
       ADMIN_PASSWORD: changeme_admin_password
-      # No MinIO/Meilisearch in CI — app.New degrades gracefully (file/search disabled).
+      # No MinIO/Meilisearch in CI — app.New degrades gracefully, and empty now
+      # really means empty, so file uploads and search are deliberately off.
       MEILI_HOST: ''
+      MINIO_ENDPOINT: ''
+      # GitHub sets CI=true, which makes the harness fail instead of skip when
+      # the infrastructure is unreachable. A suite that cannot go red is not a
+      # suite.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -77,13 +126,27 @@ jobs:
           go-version: '1.25'
           cache-dependency-path: backend/go.sum
 
+      - name: Wait for NATS
+        run: |
+          for _ in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/4222) 2>/dev/null; then
+              echo "NATS is listening"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "NATS never started listening on 4222" >&2
+          exit 1
+
       - name: Run migrations
         working-directory: backend
         run: go run ./cmd/migrate -direction up
 
       - name: Integration tests
         working-directory: backend
-        run: go test -tags=integration ./test/integration/... -count=1 -v
+        # -race: the hub, the NATS bridge and the event relay are only reachable
+        # from this suite, so without it the concurrent code is never checked.
+        run: go test -tags=integration ./test/integration/... -race -count=1 -v
 
   app:
     runs-on: ubuntu-latest
@@ -101,7 +164,23 @@ jobs:
 
       - name: Type check
         working-directory: app
-        run: npx tsc --noEmit
+        run: npm run typecheck
+
+      - name: Audit runtime dependencies
+        working-directory: app
+        run: npm audit --omit=dev --audit-level=critical
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        # Needs the dependency graph enabled on the repository; do not block the
+        # pipeline where it is unavailable.
+        continue-on-error: true
+        with:
+          fail-on-severity: high
 
   docker-build:
     runs-on: ubuntu-latest
@@ -114,6 +193,13 @@ jobs:
 
   helm:
     runs-on: ubuntu-latest
+    env:
+      HELM_SETS: >-
+        --set jwt.secret=ci-secret-at-least-32-characters-long
+        --set admin.password=ci-admin-password
+        --set postgresql.auth.password=ci-pg
+        --set redis.auth.password=ci-redis
+        --set minio.auth.rootPassword=ci-minio
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
@@ -122,11 +208,12 @@ jobs:
           # nats is an HTTPS repo (bitnami deps are OCI and need no add).
           helm repo add nats https://nats-io.github.io/k8s/helm/charts/
           helm dependency build deploy/k8s/helm/superops
-          helm lint deploy/k8s/helm/superops
-          helm template superops deploy/k8s/helm/superops \
-            --set jwt.secret=ci-secret \
-            --set postgresql.auth.password=ci-pg \
-            --set redis.auth.password=ci-redis \
-            --set minio.auth.rootPassword=ci-minio \
-            --set meilisearch.masterKey=ci-meili \
-            > /dev/null
+          helm lint deploy/k8s/helm/superops $HELM_SETS
+          helm template superops deploy/k8s/helm/superops $HELM_SETS > /dev/null
+          # A release name that is NOT "superops": every subchart Service name
+          # is derived from the release name, and the chart used to assume one.
+          helm template prod deploy/k8s/helm/superops $HELM_SETS > /tmp/prod.yaml
+          grep -q 'DB_HOST: "prod-postgresql"' /tmp/prod.yaml \
+            || { echo "DB_HOST does not match the postgresql subchart Service name"; exit 1; }
+          grep -q 'ADMIN_PASSWORD' /tmp/prod.yaml \
+            || { echo "ADMIN_PASSWORD missing — LoadConfig fatals without it"; exit 1; }

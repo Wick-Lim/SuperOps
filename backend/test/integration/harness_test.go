@@ -6,8 +6,12 @@
 //
 //	go test -tags=integration ./test/integration/...
 //
-// It requires a migrated database; CI runs `cmd/migrate` first. If the infra is
-// unreachable the whole suite skips rather than failing.
+// It requires a migrated database; CI runs `cmd/migrate` first.
+//
+// If the infrastructure is unreachable the suite skips locally but FAILS under
+// CI (CI=true, or SUPEROPS_REQUIRE_INFRA=1 to force it anywhere). Skipping
+// everywhere is how the suite silently went green for months on a Redis
+// password mismatch.
 package integration
 
 import (
@@ -19,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -42,11 +47,43 @@ var (
 	adminPass  = "changeme_admin_password"
 )
 
+// env returns the environment value for k, honouring a set-but-empty variable
+// as an explicit empty value.
+//
+// It used to treat the empty string as unset. CI sets REDIS_PASSWORD to an
+// empty value because its redis service runs without requirepass, so the
+// harness substituted the compose default, go-redis sent AUTH, Redis replied
+// "ERR Client sent AUTH, but no password is set", app.New failed and every test
+// skipped — with a green job. MEILI_HOST had the same problem.
 func env(k, def string) string {
-	if v := os.Getenv(k); v != "" {
+	if v, ok := os.LookupEnv(k); ok {
 		return v
 	}
 	return def
+}
+
+// requireInfra reports whether unreachable infrastructure must fail the suite
+// instead of skipping it. Every CI provider sets CI=true;
+// SUPEROPS_REQUIRE_INFRA forces the same behaviour (or opts out of it) anywhere.
+func requireInfra() bool {
+	if v, ok := os.LookupEnv("SUPEROPS_REQUIRE_INFRA"); ok {
+		b, err := strconv.ParseBool(v)
+		return err == nil && b
+	}
+	b, err := strconv.ParseBool(os.Getenv("CI"))
+	return err == nil && b
+}
+
+// TestMain tears the shared app down after the package finishes. Without it the
+// pgx pool, the Redis client, the NATS connection and the hub goroutine outlive
+// the suite, which -race and leak-sensitive tooling both notice.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if shared != nil {
+		shared.srv.Close()
+		shared.app.Close()
+	}
+	os.Exit(code)
 }
 
 func buildConfig() *app.Config {
@@ -70,7 +107,14 @@ func buildConfig() *app.Config {
 	cfg.JWT.Secret = env("JWT_SECRET", "changeme_jwt_secret_at_least_32_chars_long")
 	cfg.JWT.AccessTokenTTL = 15 * time.Minute
 	cfg.JWT.RefreshTokenTTL = 720 * time.Hour
+	cfg.NATS.DrainTimeout = 10 * time.Second
 	// Optional services — left at defaults; app.New degrades gracefully if down.
+	// Enabled must be set explicitly: this literal never goes through
+	// LoadConfig, so the SEARCH_ENABLED/FILES_ENABLED defaults (both true) do
+	// not apply and MinIO.IsEnabled()/Meili.IsEnabled() would be false for
+	// every run, silently unregistering the file and search routes.
+	cfg.MinIO.Enabled = true
+	cfg.Meili.Enabled = true
 	cfg.MinIO.Endpoint = env("MINIO_ENDPOINT", "localhost:19000")
 	cfg.MinIO.AccessKey = env("MINIO_ACCESS_KEY", "minioadmin")
 	cfg.MinIO.SecretKey = env("MINIO_SECRET_KEY", "changeme_minio_password")
@@ -85,8 +129,9 @@ func buildConfig() *app.Config {
 	return cfg
 }
 
-// getHarness builds the shared app+server once, skipping every test if the
-// infrastructure (or schema) is not available.
+// getHarness builds the shared app+server once. If the infrastructure (or the
+// schema) is not available it fails under CI and skips otherwise; see
+// requireInfra.
 func getHarness(t *testing.T) *harness {
 	t.Helper()
 	once.Do(func() {
@@ -107,6 +152,9 @@ func getHarness(t *testing.T) *harness {
 		shared = &harness{app: application, srv: srv, base: srv.URL}
 	})
 	if setupErr != nil {
+		if requireInfra() {
+			t.Fatalf("integration infrastructure unavailable: %v", setupErr)
+		}
 		t.Skipf("integration infra unavailable: %v", setupErr)
 	}
 	return shared
@@ -115,8 +163,8 @@ func getHarness(t *testing.T) *harness {
 // --- HTTP helpers ---
 
 type apiResp struct {
-	Data  json.RawMessage `json:"data"`
-	Meta  *struct {
+	Data json.RawMessage `json:"data"`
+	Meta *struct {
 		Cursor  string `json:"cursor"`
 		HasMore bool   `json:"has_more"`
 	} `json:"meta"`
@@ -175,13 +223,18 @@ func (h *harness) adminToken(t *testing.T) string { return h.login(t, adminEmail
 
 func (h *harness) firstWorkspace(t *testing.T, token string) string {
 	t.Helper()
-	_, r := h.do(t, "GET", "/api/v1/workspaces", token, nil)
+	code, r := h.do(t, "GET", "/api/v1/workspaces", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("list workspaces: status %d (%v)", code, r.Error)
+	}
 	var ws []struct {
 		ID string `json:"id"`
 	}
-	json.Unmarshal(r.Data, &ws)
+	if err := json.Unmarshal(r.Data, &ws); err != nil {
+		t.Fatalf("list workspaces: decode %q: %v", string(r.Data), err)
+	}
 	if len(ws) == 0 {
-		t.Fatal("no workspace for admin")
+		t.Fatal("no workspace for admin (seedAdmin should have created 'superops')")
 	}
 	return ws[0].ID
 }

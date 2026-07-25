@@ -6,7 +6,10 @@
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "dev": "expo start --web",
+    "build": "expo export --platform web --output-dir dist",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@expo/metro-runtime": "^55.0.6",
@@ -17,6 +20,7 @@
     "@shopify/flash-list": "^2.3.1",
     "expo": "~55.0.8",
     "expo-document-picker": "^55.0.9",
+    "expo-secure-store": "~55.0.16",
     "expo-status-bar": "~55.0.4",
     "react": "19.2.0",
     "react-dom": "^19.2.0",

@@ -7,14 +7,29 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-const natsSubjectPrefix = "ws.broadcast."
+const (
+	natsSubjectPrefix = "ws.broadcast."
+	natsRevokeSubject = "ws.revoke"
+)
 
-// BroadcastEnvelope is published to NATS for cross-instance delivery.
+// BroadcastEnvelope is published to NATS for cross-instance delivery. It
+// carries the frame type and payload rather than a fully-encoded frame, because
+// the sequence number is per-connection and must be stamped by the receiving
+// replica.
 type BroadcastEnvelope struct {
-	OriginID      string `json:"origin_id"`
-	ChannelID     string `json:"channel_id"`
-	ExcludeUserID string `json:"exclude_user_id"`
-	Payload       []byte `json:"payload"`
+	OriginID      string          `json:"origin_id"`
+	ChannelID     string          `json:"channel_id"`
+	ExcludeUserID string          `json:"exclude_user_id"`
+	Type          string          `json:"type"`
+	Data          json.RawMessage `json:"data"`
+}
+
+// RevokeEnvelope withdraws a channel subscription across replicas. A member can
+// be removed by a request served by a replica the member's socket is not on.
+type RevokeEnvelope struct {
+	OriginID  string `json:"origin_id"`
+	UserID    string `json:"user_id"` // "" = every connection
+	ChannelID string `json:"channel_id"`
 }
 
 // StartNATSBridge subscribes the hub to NATS broadcast subjects
@@ -37,17 +52,34 @@ func (h *Hub) StartNATSBridge(nc *nats.Conn, logger *slog.Logger) {
 		}
 
 		// Deliver to local clients only (no re-publish)
-		h.localBroadcastRaw(env.ChannelID, env.Payload, env.ExcludeUserID)
+		h.localBroadcast(env.ChannelID, frame{msgType: env.Type, data: env.Data}, env.ExcludeUserID)
 	})
 	if err != nil {
 		logger.Error("nats bridge: subscribe failed", "error", err)
 	} else {
 		logger.Info("WebSocket NATS bridge started", "subject", natsSubjectPrefix+">")
 	}
+
+	_, err = nc.Subscribe(natsRevokeSubject, func(msg *nats.Msg) {
+		var env RevokeEnvelope
+		if err := json.Unmarshal(msg.Data, &env); err != nil {
+			logger.Warn("nats bridge: unmarshal revoke", "error", err)
+			return
+		}
+		if env.OriginID == h.id {
+			return
+		}
+		h.revokeLocal(env.UserID, env.ChannelID)
+	})
+	if err != nil {
+		logger.Error("nats bridge: revoke subscribe failed", "error", err)
+	} else {
+		logger.Info("WebSocket revoke bridge started", "subject", natsRevokeSubject)
+	}
 }
 
 // publishToNATS sends a broadcast envelope to NATS for other instances.
-func (h *Hub) publishToNATS(channelID string, payload []byte, excludeUserID string) {
+func (h *Hub) publishToNATS(channelID string, f frame, excludeUserID string) {
 	if h.natsConn == nil {
 		return
 	}
@@ -55,29 +87,28 @@ func (h *Hub) publishToNATS(channelID string, payload []byte, excludeUserID stri
 		OriginID:      h.id,
 		ChannelID:     channelID,
 		ExcludeUserID: excludeUserID,
-		Payload:       payload,
+		Type:          f.msgType,
+		Data:          f.data,
 	}
 	data, err := json.Marshal(env)
 	if err != nil {
+		h.logger.Warn("nats bridge: marshal envelope", "error", err)
 		return
 	}
-	h.natsConn.Publish(natsSubjectPrefix+channelID, data)
+	if err := h.natsConn.Publish(natsSubjectPrefix+channelID, data); err != nil {
+		h.logger.Warn("nats bridge: publish failed", "channel_id", channelID, "error", err)
+	}
 }
 
-// localBroadcastRaw delivers raw bytes to local subscribed clients.
-func (h *Hub) localBroadcastRaw(channelID string, payload []byte, excludeUserID string) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	for userID, client := range h.clients {
-		if userID == excludeUserID {
-			continue
-		}
-		if client.IsSubscribed(channelID) {
-			select {
-			case client.send <- payload:
-			default:
-			}
-		}
+func (h *Hub) publishRevoke(userID, channelID string) {
+	if h.natsConn == nil {
+		return
+	}
+	data, err := json.Marshal(RevokeEnvelope{OriginID: h.id, UserID: userID, ChannelID: channelID})
+	if err != nil {
+		return
+	}
+	if err := h.natsConn.Publish(natsRevokeSubject, data); err != nil {
+		h.logger.Warn("nats bridge: publish revoke failed", "channel_id", channelID, "error", err)
 	}
 }

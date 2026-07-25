@@ -51,6 +51,14 @@ func NewRateLimited() *AppError {
 	return &AppError{Status: http.StatusTooManyRequests, Code: "RATE_LIMITED", Message: "too many requests"}
 }
 
+func NewPayloadTooLarge(message string) *AppError {
+	return &AppError{Status: http.StatusRequestEntityTooLarge, Code: "PAYLOAD_TOO_LARGE", Message: message}
+}
+
+func NewMethodNotAllowed() *AppError {
+	return &AppError{Status: http.StatusMethodNotAllowed, Code: "METHOD_NOT_ALLOWED", Message: "method not allowed"}
+}
+
 func HandleError(w http.ResponseWriter, err error) {
 	var appErr *AppError
 	if errors.As(err, &appErr) {

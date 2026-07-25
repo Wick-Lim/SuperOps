@@ -3,19 +3,22 @@ package presence
 import (
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
 type Handler struct {
 	service *Service
+	authz   *authz.Checker
 	pool    *pgxpool.Pool
 }
 
-func NewHandler(service *Service, pool *pgxpool.Pool) *Handler {
-	return &Handler{service: service, pool: pool}
+func NewHandler(service *Service, az *authz.Checker, pool *pgxpool.Pool) *Handler {
+	return &Handler{service: service, authz: az, pool: pool}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -26,14 +29,19 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 // WorkspacePresence returns the presence status of every member of a workspace.
 func (h *Handler) WorkspacePresence(w http.ResponseWriter, r *http.Request) {
 	wsID := r.PathValue("workspace_id")
+	if uuid.Validate(wsID) != nil {
+		httputil.HandleError(w, httputil.NewBadRequest("workspace_id must be a UUID"))
+		return
+	}
 	userID := authctx.UserID(r.Context())
 
-	var member bool
-	_ = h.pool.QueryRow(r.Context(),
-		`SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)`,
-		wsID, userID).Scan(&member)
+	member, err := h.authz.IsWorkspaceMember(r.Context(), wsID, userID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
 	if !member {
-		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this workspace")
+		httputil.HandleError(w, httputil.NewForbidden("not a member of this workspace"))
 		return
 	}
 
@@ -49,9 +57,14 @@ func (h *Handler) WorkspacePresence(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var uid string
 		if err := rows.Scan(&uid); err != nil {
-			continue
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return
 		}
 		userIDs = append(userIDs, uid)
+	}
+	if err := rows.Err(); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
 	}
 
 	statuses := h.service.GetBulkStatus(r.Context(), userIDs)
@@ -65,18 +78,36 @@ func (h *Handler) WorkspacePresence(w http.ResponseWriter, r *http.Request) {
 // ChannelTyping returns the list of user IDs currently typing in a channel.
 func (h *Handler) ChannelTyping(w http.ResponseWriter, r *http.Request) {
 	chID := r.PathValue("channel_id")
+	if uuid.Validate(chID) != nil {
+		httputil.HandleError(w, httputil.NewBadRequest("channel_id must be a UUID"))
+		return
+	}
 	userID := authctx.UserID(r.Context())
 
-	var member bool
-	_ = h.pool.QueryRow(r.Context(),
-		`SELECT EXISTS(SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2)`,
-		chID, userID).Scan(&member)
-	if !member {
-		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "not a member of this channel")
+	ch, err := h.authz.Channel(r.Context(), chID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if ch == nil {
+		httputil.HandleError(w, httputil.NewNotFound("channel not found"))
+		return
+	}
+	ok, err := h.authz.CanReadChannel(r.Context(), ch, userID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if !ok {
+		httputil.HandleError(w, httputil.NewForbidden("not a member of this channel"))
 		return
 	}
 
-	users := h.service.GetTypingUsers(r.Context(), chID)
+	users, err := h.service.GetTypingUsers(r.Context(), chID)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
 	if users == nil {
 		users = []string{}
 	}

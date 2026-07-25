@@ -7,17 +7,31 @@ metadata:
 data:
   SERVER_HOST: "0.0.0.0"
   SERVER_PORT: "8080"
-  DB_HOST: "{{ include "superops.fullname" . }}-postgresql"
-  DB_PORT: "5432"
-  DB_NAME: "superops"
-  DB_USER: "superops"
+  DB_HOST: "{{ include "superops.postgresqlHost" . }}"
+  DB_PORT: "{{ include "superops.postgresqlPort" . }}"
+  DB_NAME: {{ .Values.postgresql.auth.database | default "superops" | quote }}
+  DB_USER: {{ .Values.postgresql.auth.username | default "superops" | quote }}
   DB_SSLMODE: {{ .Values.backend.env.DB_SSLMODE | default "disable" | quote }}
-  REDIS_ADDR: "{{ include "superops.fullname" . }}-redis-master:6379"
-  NATS_URL: "nats://{{ include "superops.fullname" . }}-nats:4222"
-  MINIO_ENDPOINT: "{{ include "superops.fullname" . }}-minio:9000"
+  DB_APPLICATION_NAME: "superops"
+  REDIS_ADDR: "{{ include "superops.redisHost" . }}:6379"
+  NATS_URL: "nats://{{ include "superops.natsHost" . }}:4222"
+  MINIO_ENDPOINT: "{{ include "superops.minioHost" . }}:9000"
   MINIO_BUCKET: "superops"
   MINIO_USE_SSL: {{ .Values.backend.env.MINIO_USE_SSL | default "false" | quote }}
-  MEILI_HOST: "http://{{ include "superops.fullname" . }}-meilisearch:7700"
-  RATE_LIMIT_TRUST_PROXY: {{ .Values.backend.env.RATE_LIMIT_TRUST_PROXY | default "true" | quote }}
-  CORS_ALLOWED_ORIGINS: {{ .Values.backend.env.CORS_ALLOWED_ORIGINS | default "*" | quote }}
-  LOG_LEVEL: {{ .Values.backend.env.LOG_LEVEL | quote }}
+  FILES_ENABLED: {{ .Values.minio.enabled | toString | quote }}
+  # Search only works against an externally provisioned Meilisearch — the chart
+  # has no meilisearch dependency.
+  SEARCH_ENABLED: {{ and .Values.search.enabled (ne (.Values.externalMeilisearch.host | default "") "") | toString | quote }}
+  {{- if and .Values.search.enabled .Values.externalMeilisearch.host }}
+  MEILI_HOST: {{ .Values.externalMeilisearch.host | quote }}
+  {{- end }}
+  {{- range $k, $v := .Values.backend.env }}
+  {{- if not (has $k (list "DB_SSLMODE" "MINIO_USE_SSL")) }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- end }}
+  {{- range $k, $v := .Values.backend.extraEnv }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  ADMIN_EMAIL: {{ required "admin.email is required — LoadConfig fatals without ADMIN_EMAIL" .Values.admin.email | quote }}
+  ADMIN_USERNAME: {{ .Values.admin.username | default "admin" | quote }}

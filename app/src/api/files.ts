@@ -15,6 +15,12 @@ export interface PickedFile {
   mimeType?: string
 }
 
+/**
+ * Downloads go through `fileURL(id)` in ./client — `?token=` is accepted on that
+ * route. The response now carries `X-Content-Type-Options: nosniff`, a
+ * restrictive CSP, and `Content-Disposition: attachment` for anything that is
+ * not an image, PDF or plain text: only images render inline in `<Image>`.
+ */
 export const fileApi = {
   upload(workspaceId: string, file: PickedFile) {
     const form = new FormData()

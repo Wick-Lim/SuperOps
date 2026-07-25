@@ -1,10 +1,10 @@
-import { api } from './client'
+import { api, withPaging } from './client'
 import type { AppNotification } from '../lib/types'
 
 export const notificationApi = {
-  list(cursor?: string) {
-    const params = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
-    return api.get<AppNotification[]>(`/notifications${params}`)
+  /** Paginated (`meta.cursor` / `meta.has_more`). */
+  list(cursor?: string, limit?: number) {
+    return api.get<AppNotification[]>(withPaging('/notifications', cursor, limit))
   },
   markRead(id: string) {
     return api.put<{ message: string }>(`/notifications/${id}/read`)

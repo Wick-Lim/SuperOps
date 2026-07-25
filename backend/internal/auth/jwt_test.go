@@ -3,6 +3,8 @@ package auth
 import (
 	"testing"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 func TestJWTGenerateAndValidate(t *testing.T) {
@@ -47,6 +49,31 @@ func TestJWTInvalidToken(t *testing.T) {
 	_, err := mgr.Validate("invalid-token")
 	if err == nil {
 		t.Fatal("expected error for invalid token")
+	}
+}
+
+// We stamp iss on every token we mint, so we must reject a correctly signed
+// token that carries a different issuer.
+func TestJWTWrongIssuer(t *testing.T) {
+	const secret = "test-secret-32-chars-long-enough"
+	mgr := NewJWTManager(secret, 15*time.Minute)
+
+	now := time.Now()
+	foreign := jwt.NewWithClaims(jwt.SigningMethodHS256, Claims{
+		UserID: "user-1",
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			Issuer:    "somebody-else",
+		},
+	})
+	signed, err := foreign.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	if _, err := mgr.Validate(signed); err == nil {
+		t.Fatal("expected a token from another issuer to be rejected")
 	}
 }
 
