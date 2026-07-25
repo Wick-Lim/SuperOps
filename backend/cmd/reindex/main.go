@@ -207,18 +207,35 @@ const messageSQL = `
 	 ORDER BY m.created_at, m.id
 	 LIMIT $4`
 
-// fileSQL walks files, resolving the channel of the message each one is
-// attached to.
+// fileSQL walks files, carrying the MATERIALIZED ACCESS KEYS.
 //
-// The join is deliberately not filtered by messages.is_deleted: a soft-deleted
-// message keeps its channel, and internal/file authorizes a download through
-// authz.MessageChannel, which ignores the flag too. Filtering here would make
-// the index stricter than the API in one direction and — after the row is hard
-// deleted and m is NULL — fall back to uploader-only, which is what the API
-// does as well. An unattached upload is readable by its uploader alone, so that
-// is the access key it gets.
+// It read only (id, workspace, user, name, channel) until now, which made
+// FileDoc.Doc() fall through to its pre-Drive derivation — "the channel key,
+// else the uploader key". That derivation is exactly file.Handler.canRead and
+// exactly right for a chat attachment, and WRONG for a Drive file, which is
+// readable through its folder, through the workspace grant on the Drive root,
+// or through a per-object grant.
+//
+// So running this tool NARROWED every Drive file in the index to its uploader
+// alone. Reindex is the recovery path — it is what an operator runs when the
+// index is wrong — and it silently un-shared the corpus instead.
+//
+// A SUBQUERY, not a join. A join against acl_key multiplies a row by its key
+// count, and this query's (created_at, id) keyset cursor is built from the last
+// row of a page: duplicated rows make a page hold fewer distinct files than it
+// claims, and the cursor then skips the difference. That is the same reason
+// internal/drive and internal/issue filter with EXISTS rather than joining.
+//
+// The messages join is still not filtered by messages.is_deleted: a
+// soft-deleted message keeps its channel, and the materialized keys already say
+// so.
 const fileSQL = `
-	SELECT f.id, f.workspace_id, f.user_id, f.name, COALESCE(m.channel_id::text, ''), f.created_at
+	SELECT f.id, f.workspace_id, f.user_id, f.name,
+	       COALESCE(m.channel_id::text, ''),
+	       COALESCE(f.folder_id::text, ''),
+	       COALESCE(ARRAY(SELECT k.key FROM acl_key k
+	                       WHERE k.object_type = 'file' AND k.object_id = f.id), '{}'),
+	       f.created_at
 	  FROM files f
 	  LEFT JOIN messages m ON m.id = f.message_id
 	 WHERE ($1::uuid IS NULL OR f.workspace_id = $1::uuid)
@@ -251,7 +268,8 @@ func sources() []source {
 					doc       search.FileDoc
 					createdAt time.Time
 				)
-				if err := row.Scan(&doc.ID, &doc.WorkspaceID, &doc.UserID, &doc.Name, &doc.ChannelID, &createdAt); err != nil {
+				if err := row.Scan(&doc.ID, &doc.WorkspaceID, &doc.UserID, &doc.Name,
+					&doc.ChannelID, &doc.FolderID, &doc.ACL, &createdAt); err != nil {
 					return search.Doc{}, cursor{}, fmt.Errorf("scan file: %w", err)
 				}
 				doc.CreatedAt = createdAt.Unix()

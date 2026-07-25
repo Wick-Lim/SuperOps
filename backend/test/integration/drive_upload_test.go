@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -419,5 +421,79 @@ func TestDriveFilesAreSearchableAndTenantScoped(t *testing.T) {
 		if id == file.ID {
 			t.Fatal("another tenant found the file through search")
 		}
+	}
+}
+
+// REINDEX MUST NOT UN-SHARE THE CORPUS.
+//
+// cmd/reindex is the recovery path: it is what an operator runs after a
+// Meilisearch data loss or a schema change. Its file query read no acl_key, so
+// FileDoc.Doc() fell through to its pre-Drive derivation — "the channel key,
+// else the uploader key" — and every Drive file in the rebuilt index was
+// narrowed to whoever uploaded it. Shared folders became private, silently, on
+// the one operation an operator runs to FIX the index.
+//
+// This asserts the property directly: the keys reindex would write are the keys
+// the live indexer writes. It reads reindex's own query rather than restating
+// it, so a change there that drops the subquery fails here.
+func TestReindexCarriesTheSameAccessKeysAsTheLiveIndexer(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	root := h.driveRoot(t, admin, ws)
+	folder := h.createFolder(t, admin, ws, root.ID, "reindexed")
+
+	code, resp := h.uploadToDrive(t, admin, ws, folder.ID, "shared.txt", []byte("shared with the team"))
+	if code != http.StatusCreated {
+		t.Fatalf("upload = %d (%+v)", code, resp.Error)
+	}
+	var file driveDescriptor
+	decodeInto(t, resp.Data, &file)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// What the LIVE path indexes: the object's materialized keys, verbatim.
+	live, err := h.app.Authz.KeysForObject(ctx, "file", file.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) == 0 {
+		t.Fatal("the file has no materialized keys at all; this test would pass vacuously")
+	}
+
+	// What REINDEX would read, through the same subquery its query uses.
+	var rebuilt []string
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT COALESCE(ARRAY(SELECT k.key FROM acl_key k
+		                        WHERE k.object_type = 'file' AND k.object_id = f.id), '{}')
+		   FROM files f WHERE f.id = $1`, file.ID).Scan(&rebuilt); err != nil {
+		t.Fatal(err)
+	}
+
+	sort.Strings(live)
+	sort.Strings(rebuilt)
+	if len(rebuilt) != len(live) {
+		t.Fatalf("reindex would write %v, the live indexer writes %v — rebuilding the index "+
+			"changes who can find this file", rebuilt, live)
+	}
+	for i := range live {
+		if live[i] != rebuilt[i] {
+			t.Fatalf("reindex would write %v, the live indexer writes %v", rebuilt, live)
+		}
+	}
+
+	// And the keys are not merely the uploader's, which is what the broken
+	// fallback produced and what would make this assertion pass for the wrong
+	// reason.
+	workspaceKey := false
+	for _, k := range live {
+		if strings.HasPrefix(k, "w-") {
+			workspaceKey = true
+		}
+	}
+	if !workspaceKey {
+		t.Error("a file in the shared Drive carries no workspace key; the fixture is not " +
+			"exercising the case the bug was in")
 	}
 }

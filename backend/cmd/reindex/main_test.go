@@ -10,10 +10,12 @@ import (
 )
 
 const (
-	wsID   = "11111111-1111-1111-1111-111111111111"
-	chID   = "22222222-2222-2222-2222-222222222222"
-	objID  = "33333333-3333-3333-3333-333333333333"
-	userID = "44444444-4444-4444-4444-444444444444"
+	wsID     = "11111111-1111-1111-1111-111111111111"
+	chID     = "22222222-2222-2222-2222-222222222222"
+	objID    = "33333333-3333-3333-3333-333333333333"
+	userID   = "44444444-4444-4444-4444-444444444444"
+	folderID = "55555555-5555-5555-5555-555555555555"
+	otherID  = "66666666-6666-6666-6666-666666666666"
 )
 
 func TestSelectSources(t *testing.T) {
@@ -69,6 +71,12 @@ func (r fakeRow) Scan(dest ...any) error {
 				return fmt.Errorf("value %d is %T, want string", i, v)
 			}
 			*d = s
+		case *[]string:
+			ss, ok := v.([]string)
+			if !ok {
+				return fmt.Errorf("value %d is %T, want []string", i, v)
+			}
+			*d = ss
 		case *time.Time:
 			ts, ok := v.(time.Time)
 			if !ok {
@@ -118,10 +126,28 @@ func TestScanRows(t *testing.T) {
 			},
 		},
 		{
+			// THE CASE THE TOOL GOT WRONG. A Drive file's readers are the
+			// materialized acl_key rows and nothing else: the workspace grant on
+			// the Drive root, the folder it sits in, whoever it was shared with.
+			// The query carries them verbatim and Doc() must pass them through
+			// UNCHANGED — the moment it derives anything, a rebuild rewrites who
+			// can see the file.
+			name: "drive file carries its materialized keys verbatim",
+			typ:  search.TypeFile,
+			// id, workspace_id, user_id, name, channel_id, folder_id, acl, created_at
+			row: fakeRow{objID, wsID, userID, "budget.xlsx", "", folderID,
+				[]string{"w-" + wsID, "f-" + folderID, "u-" + otherID}, createdAt},
+			wantACL: []string{"w-" + wsID, "f-" + folderID, "u-" + otherID},
+			want: search.Doc{
+				Type: search.TypeFile, ID: objID, WorkspaceID: wsID, FolderID: folderID,
+				UserID: userID, Title: "budget.xlsx", CreatedAt: createdAt.Unix(),
+			},
+		},
+		{
 			name: "attached file is keyed on the channel of its message",
 			typ:  search.TypeFile,
-			// id, workspace_id, user_id, name, channel_id, created_at
-			row:     fakeRow{objID, wsID, userID, "plan.pdf", chID, createdAt},
+			row: fakeRow{objID, wsID, userID, "plan.pdf", chID, "",
+				[]string{"c-" + chID}, createdAt},
 			wantACL: []string{"c-" + chID},
 			want: search.Doc{
 				Type: search.TypeFile, ID: objID, WorkspaceID: wsID, ChannelID: chID,
@@ -129,11 +155,12 @@ func TestScanRows(t *testing.T) {
 			},
 		},
 		{
-			name: "unattached file is keyed on its uploader",
-			typ:  search.TypeFile,
-			row:  fakeRow{objID, wsID, userID, "draft.pdf", "", createdAt},
-			// COALESCE(m.channel_id, '') is what makes this branch reachable: an
-			// upload with no message is readable by nobody but the uploader.
+			// A chat attachment predating the Drive migration has no acl_key row at
+			// all, and the derivation is the ONLY thing that keeps it findable. It
+			// stays, for exactly this case.
+			name:    "unattached file with no materialized keys falls back to its uploader",
+			typ:     search.TypeFile,
+			row:     fakeRow{objID, wsID, userID, "draft.pdf", "", "", []string(nil), createdAt},
 			wantACL: []string{"u-" + userID},
 			want: search.Doc{
 				Type: search.TypeFile, ID: objID, WorkspaceID: wsID,
@@ -153,6 +180,7 @@ func TestScanRows(t *testing.T) {
 			want.ACL = tt.wantACL
 			if doc.Type != want.Type || doc.ID != want.ID || doc.WorkspaceID != want.WorkspaceID ||
 				doc.ChannelID != want.ChannelID || doc.UserID != want.UserID ||
+				doc.FolderID != want.FolderID ||
 				doc.Title != want.Title || doc.Content != want.Content || doc.CreatedAt != want.CreatedAt {
 				t.Fatalf("doc  = %+v\nwant = %+v", doc, want)
 			}
