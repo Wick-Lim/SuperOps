@@ -94,6 +94,18 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    healthcheck:
+      # cmd/worker serves /health on WORKER_HEALTH_PORT (8081 by default) and
+      # answers 503 once a job loop stops ticking. Nothing depends on the
+      # worker's health condition, so this reports rather than gates — but
+      # `docker compose ps` now distinguishes "running" from "still working".
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${WORKER_HEALTH_PORT:-8081}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The worker retries the JetStream stream for ~20s before the listener
+      # starts, and the scheduled-messages loop needs a first tick after that.
+      start_period: 60s
     deploy:
       resources:
         limits:
@@ -248,6 +260,55 @@ services:
     restart: unless-stopped
 
   # --- Tools (one-shot, never started by `up`) ---
+  # Demo data (idempotent) in the admin's workspace. Same binary the README
+  # runs as `go run ./cmd/seed`, for hosts with no Go toolchain:
+  #   docker compose --profile tools run --rm seed
+  seed:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.backend
+    profiles: ["tools"]
+    entrypoint: ["/app/seed"]
+    command: []
+    env_file: .env
+    environment:
+      NATS_URL: *nats-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # It publishes message.created, so search and notifications see the demo
+      # messages; without NATS those events are lost.
+      nats:
+        condition: service_healthy
+    # No depends_on migrate: the dev override disables that service, and a
+    # dependency in an inactive profile is an error rather than a no-op. Run
+    # seed against an already-migrated stack (it fails loudly otherwise).
+    logging: *default-logging
+    restart: "no"
+
+  # Rebuilds the Meilisearch index from Postgres — the only recovery path after
+  # a Meilisearch data loss or a retention purge, since the index is otherwise
+  # only ever written incrementally by the worker:
+  #   docker compose --profile tools run --rm reindex -batch 500
+  #   docker compose --profile tools run --rm reindex -workspace <uuid> -dry-run
+  reindex:
+    build:
+      context: ../../
+      dockerfile: deploy/docker/Dockerfile.backend
+    profiles: ["tools"]
+    entrypoint: ["/app/reindex"]
+    command: []
+    env_file: .env
+    environment:
+      NATS_URL: *nats-url
+    depends_on:
+      postgres:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+    logging: *default-logging
+    restart: "no"
+
   # Used by scripts/backup.sh and scripts/restore.sh to mirror the MinIO bucket,
   # which holds the file bytes that the Postgres dump only references.
   #   docker compose --profile tools run --rm mc "mc ls superops"

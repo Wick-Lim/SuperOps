@@ -18,9 +18,20 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
+// Create inserts a notification, or does nothing if that exact notification is
+// already there.
+//
+// The worker consumes the events that produce these from a durable JetStream
+// consumer, which is at-least-once: any redelivery — a nak, an AckWait expiry,
+// a crash between two recipients of one fan-out — replays the whole fan-out.
+// Notification ids are derived from the event rather than random (see
+// notificationID) precisely so this second pass is a no-op instead of a
+// duplicate row in someone's notification list.
 func (r *Repository) Create(ctx context.Context, n *Notification) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO notifications (id, user_id, type, title, body, data) VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+		`INSERT INTO notifications (id, user_id, type, title, body, data)
+		 VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+		 ON CONFLICT (id) DO NOTHING`,
 		n.ID, n.UserID, n.Type, n.Title, n.Body, n.Data,
 	)
 	if err != nil {

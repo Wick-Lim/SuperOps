@@ -3,6 +3,7 @@ package channel
 import (
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -11,15 +12,21 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
+	natspkg "github.com/Wick-Lim/SuperOps/backend/pkg/nats"
 )
 
 type Handler struct {
 	repo *Repository
 	az   *authz.Checker
+	// hub fans channel lifecycle events out to connected clients and revokes
+	// subscriptions that have stopped being authorized. It may be nil.
+	hub  Publisher
+	nats *natspkg.Client
+	log  *slog.Logger
 }
 
-func NewHandler(repo *Repository, az *authz.Checker) *Handler {
-	return &Handler{repo: repo, az: az}
+func NewHandler(repo *Repository, az *authz.Checker, hub Publisher, nats *natspkg.Client, log *slog.Logger) *Handler {
+	return &Handler{repo: repo, az: az, hub: hub, nats: nats, log: log}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -173,6 +180,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The creator is the whole roster at this point, which is what makes a
+	// private channel deliverable at all: the relay addresses a non-public
+	// channel.created to member_ids only.
+	h.emitChannelCreated(ch, []string{userID})
+
 	httputil.JSON(w, http.StatusCreated, ch)
 }
 
@@ -293,6 +305,8 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.emitChannelUpdated(ch)
+
 	httputil.JSON(w, http.StatusOK, ch)
 }
 
@@ -324,6 +338,8 @@ func (h *Handler) Join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.emitMemberJoined(info.WorkspaceID, info.ID, userID, RoleMember)
+
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "joined channel"})
 }
 
@@ -345,6 +361,8 @@ func (h *Handler) Leave(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
+
+	h.emitMemberLeft(info.WorkspaceID, info.ID, userID)
 
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "left channel"})
 }
@@ -423,6 +441,16 @@ func (h *Handler) setArchived(w http.ResponseWriter, r *http.Request, archived b
 	if ch == nil {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "channel not found")
 		return
+	}
+
+	h.emitChannelUpdated(ch)
+	if archived {
+		// An archived channel is gone from every client's view, but delivery is
+		// gated on a subscription map written only at subscribe time, so its
+		// subscribers would otherwise keep receiving its traffic for the life of
+		// their sockets. Revoke after the announcement so they see the state
+		// change before the "unsubscribed" frame explains it.
+		h.revokeChannelForAll(ch.ID)
 	}
 
 	httputil.JSON(w, http.StatusOK, ch)
@@ -537,6 +565,9 @@ func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "member not found")
 		return
 	}
+
+	h.announceMemberAdded(r.Context(), info, input.UserID, userID, role)
+
 	httputil.JSON(w, http.StatusCreated, member)
 }
 
@@ -575,6 +606,8 @@ func (h *Handler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
+
+	h.emitMemberLeft(info.WorkspaceID, info.ID, targetID)
 
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "member removed"})
 }
@@ -635,6 +668,11 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
+
+	// The badge just moved on this device; the caller's other sockets only learn
+	// about it from this event.
+	h.emitUnreadUpdate(info.WorkspaceID, userID, unread)
+
 	httputil.JSON(w, http.StatusOK, unread)
 }
 
@@ -772,14 +810,22 @@ func (h *Handler) CreateDM(w http.ResponseWriter, r *http.Request) {
 		CreatorID:   &userID,
 	}
 
-	created, err := h.repo.EnsureDM(r.Context(), ch, dmKey, append([]string{userID}, others...))
+	participants := append([]string{userID}, others...)
+	created, err := h.repo.EnsureDM(r.Context(), ch, dmKey, participants)
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
 	if !created {
+		// An adopted conversation was already announced when it was created.
 		httputil.JSON(w, http.StatusOK, ch)
 		return
 	}
+
+	// A DM is never public, so the relay addresses it to its participants —
+	// which is how the other side's client learns the conversation exists
+	// without a reload.
+	h.emitChannelCreated(ch, participants)
+
 	httputil.JSON(w, http.StatusCreated, ch)
 }

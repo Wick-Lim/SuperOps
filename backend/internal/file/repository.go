@@ -25,10 +25,28 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-// Orphan is a file row whose object should be removed.
+// Orphan is a file row whose objects should be removed.
+//
+// A row owns up to two objects. ThumbnailKey is empty for the rows this tree
+// writes today — nothing populates files.thumbnail_key yet — but it is part of
+// the schema, and a collector that only knew about storage_key would leak the
+// thumbnail of every row it deleted the moment something did.
 type Orphan struct {
-	ID         string `json:"id"`
-	StorageKey string `json:"storage_key"`
+	ID           string `json:"id"`
+	StorageKey   string `json:"storage_key"`
+	ThumbnailKey string `json:"thumbnail_key,omitempty"`
+}
+
+// Keys returns the object keys this row owns, skipping the empty ones.
+func (o Orphan) Keys() []string {
+	keys := make([]string, 0, 2)
+	if o.StorageKey != "" {
+		keys = append(keys, o.StorageKey)
+	}
+	if o.ThumbnailKey != "" && o.ThumbnailKey != o.StorageKey {
+		keys = append(keys, o.ThumbnailKey)
+	}
+	return keys
 }
 
 // ListOrphans returns unattached files older than cutoff. The cutoff exists so
@@ -38,7 +56,7 @@ func (r *Repository) ListOrphans(ctx context.Context, cutoff time.Time, limit in
 		limit = 500
 	}
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, storage_key FROM files
+		`SELECT id, storage_key, COALESCE(thumbnail_key, '') FROM files
 		  WHERE message_id IS NULL AND created_at < $1
 		  ORDER BY created_at
 		  LIMIT $2`, cutoff, limit)
@@ -50,7 +68,7 @@ func (r *Repository) ListOrphans(ctx context.Context, cutoff time.Time, limit in
 	orphans := []Orphan{}
 	for rows.Next() {
 		var o Orphan
-		if err := rows.Scan(&o.ID, &o.StorageKey); err != nil {
+		if err := rows.Scan(&o.ID, &o.StorageKey, &o.ThumbnailKey); err != nil {
 			return nil, fmt.Errorf("scan orphan file: %w", err)
 		}
 		orphans = append(orphans, o)
@@ -73,12 +91,21 @@ func (r *Repository) DeleteByIDs(ctx context.Context, ids []string) (int64, erro
 // StorageKeysPresent returns the subset of keys that still have a files row.
 // Anything the sweeper listed from the bucket and that is absent from the
 // result has no owner left in Postgres and can be removed.
+//
+// It checks thumbnail_key as well as storage_key. Those are two different
+// objects in the same bucket, so a lookup that only knew about storage_key
+// would report a perfectly live thumbnail as unreferenced and the sweeper would
+// delete it. (`thumbnail_key = ANY(...)` never matches a NULL, so rows without
+// a thumbnail contribute nothing.)
 func (r *Repository) StorageKeysPresent(ctx context.Context, keys []string) (map[string]bool, error) {
 	present := map[string]bool{}
 	if len(keys) == 0 {
 		return present, nil
 	}
-	rows, err := r.pool.Query(ctx, `SELECT storage_key FROM files WHERE storage_key = ANY($1)`, keys)
+	rows, err := r.pool.Query(ctx,
+		`SELECT storage_key   FROM files WHERE storage_key   = ANY($1)
+		  UNION
+		 SELECT thumbnail_key FROM files WHERE thumbnail_key = ANY($1)`, keys)
 	if err != nil {
 		return nil, fmt.Errorf("check storage keys: %w", err)
 	}

@@ -43,20 +43,60 @@ spec:
           command: ["/app/worker"]
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            # Not fronted by a Service: nothing routes traffic to the worker,
+            # this is only the probe target. Must match WORKER_HEALTH_PORT below.
+            - name: health
+              containerPort: 8081
+              protocol: TCP
           env:
             # Distinguishes worker connections in pg_stat_activity.
             - name: DB_APPLICATION_NAME
               value: superops-worker
+            # cmd/worker defaults to 8081; set explicitly so the containerPort
+            # above and the listener cannot drift apart.
+            - name: WORKER_HEALTH_PORT
+              value: "8081"
           envFrom:
             - configMapRef:
                 name: {{ include "superops.fullname" . }}-config
             - secretRef:
                 name: {{ include "superops.fullname" . }}-secret
-          # NOTE: no liveness/readiness probe. cmd/worker starts no HTTP
-          # listener, and a probe that only checks "PID 1 exists" would be
-          # theatre — the kubelet already restarts the container if the process
-          # dies. A wedged (but alive) worker is therefore not detected. Fixing
-          # that needs a health endpoint in cmd/worker; see the wiring handoff.
+          # cmd/worker serves GET /health on WORKER_HEALTH_PORT. It returns 503
+          # only when a periodic job loop has stopped attempting to run — a job
+          # that keeps *failing* (Postgres down) reports last_error in the body
+          # but still answers 200, because restarting the container does not fix
+          # a dependency outage, it only adds a CrashLoopBackOff to it. So a 503
+          # here really does mean "wedged", which is what liveness should act on.
+          #
+          # The listener only starts after the JetStream stream is reachable,
+          # which cmd/worker retries for ~20s before giving up and exiting. The
+          # startupProbe holds liveness off for 60s so that retry window cannot
+          # be mistaken for a wedge; a worker that never gets its stream exits
+          # on its own rather than being killed by the probe.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 3
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          # No Service selects this pod, so readiness gates nothing but the
+          # rollout: `kubectl rollout status` and maxUnavailable accounting stop
+          # treating a wedged replica as a successful one.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
           volumeMounts:

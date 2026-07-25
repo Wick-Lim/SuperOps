@@ -9,7 +9,9 @@
 //     core-NATS subscriptions. A core subscription drops every event published
 //     while the worker is restarting, and those events are the only trigger for
 //     search indexing and notifications — there is no reconciliation pass that
-//     would ever notice.
+//     would ever notice. For the same reason an ack has to mean the work
+//     happened: handlers return an error, and only a nil error acks. See
+//     bindDurable.
 //   - Every job that mutates shared state at scale takes a Postgres advisory
 //     lock, so scaling the Deployment to three replicas does not mean three
 //     replicas racing on the same DELETE.
@@ -25,7 +27,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -81,16 +85,36 @@ const (
 	consumerMaxDeliver = 5
 	consumerAckWait    = 30 * time.Second
 	consumerMaxPending = 256
+
+	// handlerTimeout bounds one callback. It sits under consumerAckWait so a
+	// wedged handler gives up before the server decides the message was never
+	// acked and hands a second copy to another replica.
+	handlerTimeout = consumerAckWait - 5*time.Second
+
+	// termReasonMax keeps the TERM advisory readable; the full error goes to the
+	// log and to /health.
+	termReasonMax = 200
 )
+
+// consumerBackOff is both the consumer's AckWait schedule (delivery n waits
+// backoff[n] before the server assumes the ack was lost) and the delay this
+// worker asks for when it naks explicitly. A bare Nak() redelivers immediately,
+// which for "Meilisearch is down" means five deliveries burned inside a second
+// and the event terminated while the outage is still a few seconds old.
+var consumerBackOff = []time.Duration{time.Second, 5 * time.Second, 15 * time.Second, time.Minute}
 
 const (
 	retentionBatchSize  = 500
 	retentionMaxBatches = 40 // ceiling per tick: 20k messages, then wait for the next hour
 
-	objectGCGrace     = 24 * time.Hour // an upload is unattached until its message is sent
-	objectGCRowBatch  = 500
-	objectGCKeyBatch  = 1000
-	scheduledPageSize = 200
+	objectGCGrace = 24 * time.Hour // an upload is unattached until its message is sent
+	// objectKeyDateSlack is how much a storage key's date can understate the
+	// object's real age: a whole day (the key has date granularity) plus the
+	// worst-case timezone skew. See olderThan.
+	objectKeyDateSlack = 48 * time.Hour
+	objectGCRowBatch   = 500
+	objectGCKeyBatch   = 1000
+	scheduledPageSize  = 200
 )
 
 // drainTimeout bounds the whole shutdown: consumer drain, in-flight handlers
@@ -334,17 +358,58 @@ func waitBounded(wg *sync.WaitGroup, timeout time.Duration, forced <-chan struct
 type durableSpec struct {
 	durable string
 	filter  string
-	handle  func(*nats.Msg)
+	handle  func(context.Context, *nats.Msg) error
+}
+
+// permanentError is implemented by handler errors that redelivery cannot fix:
+// a payload that does not parse, a subject with no workspace id, a document
+// Meilisearch rejected outright. It is matched structurally so this file does
+// not have to import — and enumerate — every domain package's error type.
+type permanentError interface{ Permanent() bool }
+
+func isPermanent(err error) bool {
+	var p permanentError
+	return errors.As(err, &p) && p.Permanent()
+}
+
+// nakDelay is the redelivery delay to request for the delivery that just
+// failed, mirroring the consumer's own backoff schedule.
+func nakDelay(delivery int) time.Duration {
+	i := delivery - 1
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(consumerBackOff) {
+		i = len(consumerBackOff) - 1
+	}
+	return consumerBackOff[i]
+}
+
+// termReason renders a TERM advisory: single line, bounded length.
+func termReason(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > termReasonMax {
+		return s[:termReasonMax] + "..."
+	}
+	return s
 }
 
 // bindDurable creates (or updates) a durable pull consumer and starts consuming.
 //
-// The domain handlers were written against core NATS and take a *nats.Msg with
-// no error return, so the JetStream message is adapted rather than rewritten:
-// a clean return acks, a panic naks for redelivery, and the last permitted
-// delivery terminates the message so it stops circulating. A handler that
-// swallows its own error still acks — that is a known gap, see the note on
-// each handler in internal/{search,notification}.
+// The ack decision is the whole point of the exercise:
+//
+//   - handler returns nil          → Ack. The work is done.
+//   - handler returns a permanent  → Term, with a reason, and the drop is
+//     error                          recorded in /health. Redelivering a
+//     message that can never succeed is its own outage.
+//   - handler returns anything     → Nak with the backoff delay, up to
+//     else                           MaxDeliver, then Term.
+//
+// Before this, the handlers were `func(*nats.Msg)`: they logged their failures
+// internally and returned nothing, so a Meilisearch write failure or a Postgres
+// blip acked exactly like a success and the event was gone — and nothing in
+// this system reconciles the search index or missed notifications after the
+// fact. Only a panic was distinguishable from success.
 func bindDurable(
 	ctx context.Context,
 	nc *natspkg.Client,
@@ -365,7 +430,7 @@ func bindDurable(
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		AckWait:       consumerAckWait,
 		MaxDeliver:    consumerMaxDeliver,
-		BackOff:       []time.Duration{time.Second, 5 * time.Second, 15 * time.Second, time.Minute},
+		BackOff:       consumerBackOff,
 		MaxAckPending: consumerMaxPending,
 	})
 	if err != nil {
@@ -377,38 +442,69 @@ func bindDurable(
 		defer handlers.Done()
 
 		delivery := 1
-		if md, err := msg.Metadata(); err == nil {
+		if md, err := msg.Metadata(); err == nil && md.NumDelivered > 0 {
 			delivery = int(md.NumDelivered)
 		}
 
-		defer func() {
-			p := recover()
-			if p == nil {
+		hctx, cancel := context.WithTimeout(ctx, handlerTimeout)
+		defer cancel()
+
+		err := invokeHandler(hctx, l, spec, msg)
+
+		switch {
+		case err == nil:
+			if ackErr := msg.Ack(); ackErr != nil {
+				// The work is done but the ack was lost: the server will redeliver
+				// and the handler will redo it. Every handler behind this is
+				// idempotent, which is what makes that survivable.
+				l.Warn("ack failed", "durable", spec.durable, "subject", msg.Subject(), "error", ackErr)
 				return
 			}
-			l.Error("event handler panicked",
-				"durable", spec.durable, "subject", msg.Subject(), "delivery", delivery, "panic", p)
-			if delivery >= consumerMaxDeliver {
-				// Terminal: stop redelivering a message that has failed every
-				// allowed attempt, and make the drop loud rather than silent.
-				_ = msg.TermWithReason("handler panicked on every delivery")
-				health.fail(spec.durable, fmt.Errorf("dropped %s after %d failed deliveries", msg.Subject(), delivery))
-				return
+			health.tick(spec.durable)
+
+		case isPermanent(err):
+			l.Error("event dropped: permanently unprocessable",
+				"durable", spec.durable, "subject", msg.Subject(), "delivery", delivery, "error", err)
+			if termErr := msg.TermWithReason(termReason(err.Error())); termErr != nil {
+				l.Warn("term failed", "durable", spec.durable, "subject", msg.Subject(), "error", termErr)
 			}
-			_ = msg.Nak()
-		}()
+			health.fail(spec.durable, fmt.Errorf("terminated %s: %w", msg.Subject(), err))
 
-		spec.handle(&nats.Msg{
-			Subject: msg.Subject(),
-			Data:    msg.Data(),
-			Header:  nats.Header(msg.Headers()),
-		})
+		case delivery >= consumerMaxDeliver:
+			l.Error("event dropped after final delivery",
+				"durable", spec.durable, "subject", msg.Subject(), "delivery", delivery, "error", err)
+			if termErr := msg.TermWithReason(termReason("failed on every delivery: " + err.Error())); termErr != nil {
+				l.Warn("term failed", "durable", spec.durable, "subject", msg.Subject(), "error", termErr)
+			}
+			health.fail(spec.durable, fmt.Errorf("dropped %s after %d failed deliveries: %w", msg.Subject(), delivery, err))
 
-		if err := msg.Ack(); err != nil {
-			l.Warn("ack failed", "durable", spec.durable, "subject", msg.Subject(), "error", err)
-			return
+		default:
+			delay := nakDelay(delivery)
+			l.Warn("event handler failed, redelivering",
+				"durable", spec.durable, "subject", msg.Subject(),
+				"delivery", delivery, "retry_in", delay.String(), "error", err)
+			if nakErr := msg.NakWithDelay(delay); nakErr != nil {
+				l.Warn("nak failed", "durable", spec.durable, "subject", msg.Subject(), "error", nakErr)
+			}
 		}
-		health.tick(spec.durable)
+	})
+}
+
+// invokeHandler runs one handler, converting a panic into an ordinary (and
+// retryable) error so a single bad payload cannot take the consumer down.
+func invokeHandler(ctx context.Context, l *slog.Logger, spec durableSpec, msg jetstream.Msg) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			l.Error("event handler panicked",
+				"durable", spec.durable, "subject", msg.Subject(), "panic", p, "stack", string(debug.Stack()))
+			err = fmt.Errorf("handler panicked: %v", p)
+		}
+	}()
+
+	return spec.handle(ctx, &nats.Msg{
+		Subject: msg.Subject(),
+		Data:    msg.Data(),
+		Header:  nats.Header(msg.Headers()),
 	})
 }
 
@@ -691,28 +787,38 @@ func publishPromoted(
 // `parent_id ON DELETE SET NULL`, and (d) never decremented reply_count.
 func runRetention(ctx context.Context, pool *pgxpool.Pool, searchSvc *search.Service, l *slog.Logger) error {
 	ran, err := withSingletonLock(ctx, pool, lockRetention, func(ctx context.Context) error {
+		// unindex runs inside the purge transaction, before the rows go. Doing it
+		// after the commit — as this used to — means a Meilisearch hiccup leaves
+		// content that retention has permanently destroyed fully readable through
+		// GET /api/v1/search, with nothing left in Postgres to retry from. Ordered
+		// this way the failure mode inverts: the batch rolls back and is retried
+		// next hour, and the worst case is a document missing from the index for
+		// a message that still exists, which cmd/reindex can repair.
+		unindex := func(ctx context.Context, ids []string) error {
+			if searchSvc == nil {
+				return nil
+			}
+			if err := searchSvc.DeleteMessages(ctx, ids); err != nil {
+				return fmt.Errorf("retention: remove from search index: %w", err)
+			}
+			return nil
+		}
+
 		total := 0
 		for batch := 0; batch < retentionMaxBatches; batch++ {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 
-			ids, files, err := purgeRetentionBatch(ctx, pool, retentionBatchSize)
+			expired, deleted, files, err := purgeRetentionBatch(ctx, pool, retentionBatchSize, unindex)
 			if err != nil {
 				return err
 			}
-			if len(ids) == 0 {
+			if deleted == 0 {
 				break
 			}
-			total += len(ids)
+			total += deleted
 
-			// Purged content must leave the search index too, or it stays fully
-			// readable through GET /api/v1/search.
-			if searchSvc != nil {
-				if err := searchSvc.DeleteMessages(ids); err != nil {
-					l.Error("retention: remove from search index", "count", len(ids), "error", err)
-				}
-			}
 			if files > 0 {
 				// files.message_id is ON DELETE SET NULL, so the rows survive as
 				// orphans and the object GC job collects them after its grace
@@ -720,7 +826,10 @@ func runRetention(ctx context.Context, pool *pgxpool.Pool, searchSvc *search.Ser
 				l.Info("retention: files detached, awaiting object GC", "count", files)
 			}
 
-			if len(ids) < retentionBatchSize {
+			// Measured on the roots the batch query returned, not on the total
+			// including thread replies: one big thread would otherwise look like a
+			// full page and keep the loop going for no reason.
+			if expired < retentionBatchSize {
 				break
 			}
 		}
@@ -739,15 +848,19 @@ func runRetention(ctx context.Context, pool *pgxpool.Pool, searchSvc *search.Ser
 }
 
 // purgeRetentionBatch deletes up to limit expired messages (plus the replies of
-// any expired thread root) and returns the ids removed and how many file rows
-// were detached.
-func purgeRetentionBatch(ctx context.Context, pool *pgxpool.Pool, limit int) ([]string, int64, error) {
-	var (
-		ids   []string
-		files int64
-	)
-
-	err := database.WithTx(ctx, pool, func(tx pgx.Tx) error {
+// any expired thread root). beforeDelete runs inside the transaction with the
+// full set of doomed ids; if it fails, nothing is purged.
+//
+// It reports how many expired roots the batch query found (the loop control
+// signal), how many rows were actually deleted, and how many file rows were
+// detached.
+func purgeRetentionBatch(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	limit int,
+	beforeDelete func(context.Context, []string) error,
+) (expiredCount, deleted int, files int64, err error) {
+	err = database.WithTx(ctx, pool, func(tx pgx.Tx) error {
 		expired, err := scanIDs(ctx, tx, `
 			SELECT m.id
 			  FROM messages m
@@ -761,7 +874,8 @@ func purgeRetentionBatch(ctx context.Context, pool *pgxpool.Pool, limit int) ([]
 		if err != nil {
 			return fmt.Errorf("select expired messages: %w", err)
 		}
-		if len(expired) == 0 {
+		expiredCount = len(expired)
+		if expiredCount == 0 {
 			return nil
 		}
 
@@ -770,8 +884,14 @@ func purgeRetentionBatch(ctx context.Context, pool *pgxpool.Pool, limit int) ([]
 		// i.e. silently promoted into the channel timeline as new-looking
 		// top-level messages, which is worse than either keeping or deleting
 		// them.
+		//
+		// Deliberately not SKIP LOCKED here, unlike the root query. Skipping a
+		// concurrently-locked reply would delete the root anyway and reintroduce
+		// exactly the orphan-promotion this is here to prevent; blocking instead
+		// either gets the whole thread or trips the pool's lock_timeout and rolls
+		// the batch back for the next tick.
 		replies, err := scanIDs(ctx, tx,
-			`SELECT id FROM messages WHERE parent_id = ANY($1) FOR UPDATE SKIP LOCKED`, expired)
+			`SELECT id FROM messages WHERE parent_id = ANY($1) FOR UPDATE`, expired)
 		if err != nil {
 			return fmt.Errorf("select thread replies: %w", err)
 		}
@@ -799,17 +919,24 @@ func purgeRetentionBatch(ctx context.Context, pool *pgxpool.Pool, limit int) ([]
 			return fmt.Errorf("decrement reply counts: %w", err)
 		}
 
-		if _, err := tx.Exec(ctx, `DELETE FROM messages WHERE id = ANY($1)`, targets); err != nil {
+		if beforeDelete != nil {
+			if err := beforeDelete(ctx, targets); err != nil {
+				return err
+			}
+		}
+
+		tag, err := tx.Exec(ctx, `DELETE FROM messages WHERE id = ANY($1)`, targets)
+		if err != nil {
 			return fmt.Errorf("delete expired messages: %w", err)
 		}
 
-		ids = targets
+		deleted = int(tag.RowsAffected())
 		return nil
 	})
 	if err != nil {
-		return nil, 0, err
+		return 0, 0, 0, err
 	}
-	return ids, files, nil
+	return expiredCount, deleted, files, nil
 }
 
 func scanIDs(ctx context.Context, tx pgx.Tx, sql string, args ...any) ([]string, error) {
@@ -895,11 +1022,19 @@ func runObjectGC(
 		}
 		removed := make([]string, 0, len(orphans))
 		for _, o := range orphans {
-			if err := storage.Delete(ctx, o.StorageKey); err != nil {
-				l.Warn("object gc: delete object", "key", o.StorageKey, "error", err)
-				continue
+			// A row owns its thumbnail as well as its main object; the row is only
+			// dropped once every object it owns is gone, so a partial failure is
+			// retried next hour instead of leaking the remainder forever.
+			ok := true
+			for _, key := range o.Keys() {
+				if err := storage.Delete(ctx, key); err != nil {
+					l.Warn("object gc: delete object", "key", key, "error", err)
+					ok = false
+				}
 			}
-			removed = append(removed, o.ID)
+			if ok {
+				removed = append(removed, o.ID)
+			}
 		}
 		if n, err := repo.DeleteByIDs(ctx, removed); err != nil {
 			return err
@@ -924,19 +1059,16 @@ func runObjectGC(
 		// left alone rather than guessed at.
 		candidates := make([]string, 0, len(keys))
 		for _, k := range keys {
-			if day, ok := objectDay(k); ok && day.Before(cutoff) {
+			if olderThan(k, cutoff) {
 				candidates = append(candidates, k)
 			}
 		}
+		// Checks thumbnail_key as well as storage_key, so a live thumbnail is
+		// never mistaken for an object whose row is gone.
 		present, err := repo.StorageKeysPresent(ctx, candidates)
 		if err != nil {
 			return err
 		}
-		// Note: only storage_key is checked, because that is what
-		// file.Repository exposes. files.thumbnail_key is written by nothing in
-		// this tree today; if a thumbnail is ever stored under the same
-		// {ws}/YYYY/MM/DD/{id}.{ext} scheme, StorageKeysPresent must learn about
-		// that column before this sweep can be trusted with it.
 		swept := 0
 		for _, k := range candidates {
 			if present[k] {
@@ -962,8 +1094,37 @@ func runObjectGC(
 	return nil
 }
 
+// olderThan reports whether an object can be proven, from its key alone, to
+// have been uploaded before cutoff.
+//
+// This is the guard that stops the bucket sweep from deleting an upload that
+// has been PUT but whose files row is not committed yet, and it has to be
+// conservative in the right direction.
+//
+// All the key carries is a date, so an object under .../2026/07/25/ may have
+// been written at any instant during that day — the youngest it can possibly be
+// is the *end* of it, not the start. Comparing the start of the day against the
+// cutoff, as this used to, collapsed the 24-hour grace period to nothing:
+// an object written at 23:59:59 was eligible for deletion two seconds later,
+// because its day started 24 hours and one second before the cutoff.
+//
+// The extra slack on top covers the zone: file.Handler.Upload formats the key
+// with time.Now() in local time while this parses it as UTC, so the day can sit
+// up to fourteen hours either side of where it looks. Two days of slack makes
+// the guarantee "at least objectGCGrace old" hold for any deployment timezone,
+// at the price of a candidate becoming eligible two or three days after upload
+// instead of one. For a leak collector that is the right trade.
+func olderThan(key string, cutoff time.Time) bool {
+	day, ok := objectDay(key)
+	if !ok {
+		return false
+	}
+	return day.Add(objectKeyDateSlack).Before(cutoff)
+}
+
 // objectDay parses the upload date out of a storage key of the shape
 // {workspace_id}/YYYY/MM/DD/{file_id}{ext}, written by file.Handler.Upload.
+// The returned time is midnight UTC at the start of that day.
 func objectDay(key string) (time.Time, bool) {
 	parts := splitN(key, '/', 5)
 	if len(parts) < 5 {

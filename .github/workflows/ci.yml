@@ -90,12 +90,7 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 5s --health-retries 20
-      nats:
-        image: nats:2
-        ports: ['4222:4222']
-        # No --health-cmd: a service container cannot override the image
-        # command, so the monitoring port (-m 8222) is off and there is nothing
-        # to probe. The "Wait for NATS" step does a TCP check instead.
+      # NATS is deliberately NOT a service container — see "Start NATS" below.
     env:
       DB_HOST: localhost
       DB_PORT: '5432'
@@ -126,16 +121,37 @@ jobs:
           go-version: '1.25'
           cache-dependency-path: backend/go.sum
 
-      - name: Wait for NATS
+      # JetStream must be on: the API and the worker publish with
+      # PublishDurable, which waits for a stream ack, so against a server
+      # started without -js every publish in this suite fails — while
+      # docker-compose and the Helm chart both enable it. A service container
+      # cannot express this: GitHub Actions services accept only image /
+      # credentials / env / ports / volumes / options, none of which sets the
+      # container command, and `options` is emitted before the image name so a
+      # bare `-js` there would be parsed as a docker flag. Running the server as
+      # a step is the way to own its command line; the runner has docker and the
+      # job itself is not containerised, so localhost:4222 still reaches it.
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats \
+            -p 4222:4222 -p 8222:8222 \
+            nats:2 -js -m 8222
+
+      - name: Wait for NATS JetStream
         run: |
           for _ in $(seq 1 60); do
-            if (echo > /dev/tcp/127.0.0.1/4222) 2>/dev/null; then
-              echo "NATS is listening"
+            # js-enabled-only makes this an assertion rather than a liveness
+            # ping: /healthz answers 503 while JetStream is unavailable, so a
+            # server that somehow came up without -js fails here loudly instead
+            # of at the first publish inside a test.
+            if curl -fsS "http://127.0.0.1:8222/healthz?js-enabled-only=true" >/dev/null; then
+              echo "NATS JetStream ready"
               exit 0
             fi
             sleep 1
           done
-          echo "NATS never started listening on 4222" >&2
+          docker logs nats || true
+          echo "NATS JetStream never became ready on 8222" >&2
           exit 1
 
       - name: Run migrations
