@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 )
 
 // Drive, end to end. What these assert that the package tests cannot:
@@ -479,5 +480,60 @@ func TestDriveMovedFileLeavesItsOldFolderImmediately(t *testing.T) {
 	}
 	if !inTo {
 		t.Error("the moved file is not listed in the folder it moved to")
+	}
+}
+
+// The second and third editors work end to end without a line of server code
+// written for either of them.
+//
+// This is the registry's whole claim, asserted rather than described: create a
+// spreadsheet and a design, and each gets a collab room, a projection route, a
+// per-caller embed resolver and a typed search facet — all of which landed with
+// the FIRST editor and none of which either of these two touched.
+func TestASpreadsheetAndADesignAreEditorsWithNoBackendOfTheirOwn(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	root := h.driveRoot(t, admin, ws)
+	me := h.whoami(t, admin)
+
+	for _, kind := range []string{"spreadsheet", "design"} {
+		t.Run(kind, func(t *testing.T) {
+			resp := h.req(t, http.StatusCreated, http.MethodPost,
+				"/api/v1/workspaces/"+ws+"/drive/files", admin,
+				map[string]string{
+					"folder_id": root.ID,
+					"name":      fmt.Sprintf("%s-%d", kind, time.Now().UnixNano()),
+					"file_type": kind,
+				})
+			var created driveDescriptor
+			decodeInto(t, resp.Data, &created)
+
+			if created.StorageMode != "collab" {
+				t.Fatalf("storage_mode = %q, want collab", created.StorageMode)
+			}
+			if created.CollabDocumentID == nil || *created.CollabDocumentID == "" {
+				t.Fatal("no collaborative document, so the editor has no room to join")
+			}
+
+			// The projection route works for it, unchanged.
+			h.appendUpdate(t, *created.CollabDocumentID, me, []byte{1})
+			phrase := fmt.Sprintf("orbital%d", time.Now().UnixNano())
+			if code, r := h.project(t, admin, created.ID, map[string]any{
+				"seq": 1, "schema_version": 1,
+				"body_text": "a cell or a layer containing " + phrase,
+			}); code != http.StatusOK {
+				t.Fatalf("project a %s = %d (%+v)", kind, code, r.Error)
+			}
+
+			// And it is indexed under its OWN type, not as a plain file — which
+			// is what makes ?type=spreadsheet mean anything.
+			if h.search != nil {
+				h.indexDriveFile(t, ws, created.ID)
+				if !contains(h.searchHitsOfType(t, admin, ws, phrase, kind), created.ID) {
+					t.Fatalf("a %s is not findable under its own type", kind)
+				}
+			}
+		})
 	}
 }

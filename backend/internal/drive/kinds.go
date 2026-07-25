@@ -60,6 +60,59 @@ func DocumentKind(collab CollabCreator) registry.Kind {
 	}
 }
 
+// SpreadsheetKind is the grid.
+//
+// THE POINT OF THIS FUNCTION IS ITS LENGTH. It is the second editor, and it
+// adds no table, no route, no migration, no durable and no advisory lock — the
+// projection table, the projection route, the five rules that make trusting a
+// client-published body safe, the search wiring and the client transport all
+// landed with the first editor and are shared verbatim.
+//
+// If the backend for the second editor had not been close to zero, the registry
+// would not have worked, and that is the number ROADMAP §3b asks to be checked.
+//
+// Text stays nil for the same structural reason it does for a document: its
+// signature takes an io.Reader over the stored object, and a collab file's
+// storage_key is ” because there is no stored object. validate() refuses the
+// combination outright.
+func SpreadsheetKind(collab CollabCreator) registry.Kind {
+	return registry.Kind{
+		Type:        "spreadsheet",
+		DisplayName: "Spreadsheet",
+		Storage:     registry.StorageCollab,
+		New: func(ctx context.Context, tx pgx.Tx, req registry.NewRequest) error {
+			if err := collab.EnsureDocumentTx(ctx, tx, req.WorkspaceID, "spreadsheet", req.FileID, req.ActorID); err != nil {
+				return fmt.Errorf("create collaborative spreadsheet for file %s: %w", req.FileID, err)
+			}
+			return nil
+		},
+		Versioned: false,
+		// One TypeScript extractor, and nothing else. A sheet is findable by the
+		// text in its cells because the client that has the grid in memory says
+		// what it contains.
+		ClientProjected: true,
+	}
+}
+
+// DesignKind is the canvas. Same shape, same reason, same length.
+func DesignKind(collab CollabCreator) registry.Kind {
+	return registry.Kind{
+		Type:        "design",
+		DisplayName: "Design",
+		Storage:     registry.StorageCollab,
+		New: func(ctx context.Context, tx pgx.Tx, req registry.NewRequest) error {
+			if err := collab.EnsureDocumentTx(ctx, tx, req.WorkspaceID, "design", req.FileID, req.ActorID); err != nil {
+				return fmt.Errorf("create collaborative design for file %s: %w", req.FileID, err)
+			}
+			return nil
+		},
+		Versioned: false,
+		// The extractor emits the text layers. A canvas whose words are not
+		// findable is a canvas nobody can find.
+		ClientProjected: true,
+	}
+}
+
 // CollabCreator is the part of internal/collab that Drive needs.
 //
 // An interface so the dependency runs drive -> interface <- collab, matching

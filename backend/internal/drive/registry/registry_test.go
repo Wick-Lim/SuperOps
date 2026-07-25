@@ -281,3 +281,52 @@ func TestProjectionRefusals(t *testing.T) {
 		}
 	})
 }
+
+// THE NUMBER §3b ASKS TO BE CHECKED.
+//
+// The registry's whole claim is that the second and third editors are
+// additions, not projects. This asserts it structurally: every collab kind in
+// the product has the same shape, differing only in its type string and its
+// display name, and none of them carries a Text extractor or a Thumb.
+//
+// It is written against the shape rather than a count so that a fourth editor
+// passes it for free — and so that an editor which grew a bespoke server-side
+// hook fails it, which is the case worth catching.
+func TestEveryCollabKindIsTheSameTwentyLines(t *testing.T) {
+	r := New()
+	for _, k := range []Kind{
+		{Type: "document", DisplayName: "Document", Storage: StorageCollab, ClientProjected: true,
+			New: func(context.Context, pgx.Tx, NewRequest) error { return nil }},
+		{Type: "spreadsheet", DisplayName: "Spreadsheet", Storage: StorageCollab, ClientProjected: true,
+			New: func(context.Context, pgx.Tx, NewRequest) error { return nil }},
+		{Type: "design", DisplayName: "Design", Storage: StorageCollab, ClientProjected: true,
+			New: func(context.Context, pgx.Tx, NewRequest) error { return nil }},
+	} {
+		if err := r.Register(k); err != nil {
+			t.Fatalf("register %q: %v", k.Type, err)
+		}
+	}
+
+	for _, d := range r.Descriptors() {
+		if d.Type == TypeFile {
+			continue
+		}
+		if d.StorageMode != string(StorageCollab) {
+			t.Errorf("%s: storage_mode = %q, want collab", d.Type, d.StorageMode)
+		}
+		if !d.ClientProjected {
+			t.Errorf("%s: not client-projected, so its body is invisible to search — "+
+				"either it ships an extractor or it accepts title-only search on purpose", d.Type)
+		}
+		if d.Versioned {
+			t.Errorf("%s: versioned, but bytes posted to a CRDT object are discarded "+
+				"by the next merge", d.Type)
+		}
+		if d.Previewable {
+			t.Errorf("%s: claims a thumbnail; a CRDT object has no bytes to render one from", d.Type)
+		}
+		if !d.Creatable {
+			t.Errorf("%s: not creatable, so the New menu will not offer it", d.Type)
+		}
+	}
+}

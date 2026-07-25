@@ -329,10 +329,16 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// no table, no route, no migration. That is what the registry is for, and
 	// the projection field is what makes it true for the searchable body too.
 	driveKinds := registry.New()
-	if err := driveKinds.Register(drive.DocumentKind(collabRepo)); err != nil {
-		natsClient.Close()
-		pool.Close()
-		return nil, fmt.Errorf("register drive kinds: %w", err)
+	for _, kind := range []registry.Kind{
+		drive.DocumentKind(collabRepo),
+		drive.SpreadsheetKind(collabRepo),
+		drive.DesignKind(collabRepo),
+	} {
+		if err := driveKinds.Register(kind); err != nil {
+			natsClient.Close()
+			pool.Close()
+			return nil, fmt.Errorf("register drive kind %q: %w", kind.Type, err)
+		}
 	}
 	driveRepo := drive.NewRepository(pool, az, driveKinds)
 	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService,
