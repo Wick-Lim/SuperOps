@@ -41,6 +41,34 @@ ENV_FILE="$COMPOSE_DIR/.env"
 if [ -f "$ENV_FILE" ]; then
   echo "Keeping existing $ENV_FILE."
 else
+  # Postgres applies POSTGRES_PASSWORD only when it initializes an EMPTY data
+  # directory. Generating fresh secrets against a volume that already holds a
+  # cluster leaves .env and the database disagreeing, and every service then
+  # fails with "password authentication failed for user superops" — which reads
+  # like a broken image rather than stale state. Warn before that happens.
+  if command -v docker >/dev/null 2>&1 &&
+     docker volume ls --format '{{.Name}}' 2>/dev/null | grep -q '_postgres_data$'; then
+    echo "WARNING: an existing Postgres volume was found, but $ENV_FILE is missing."
+    echo "         New secrets will NOT match the password already baked into that"
+    echo "         volume, and the stack will fail to authenticate."
+    echo "         Either restore the original .env, or wipe the data:"
+    echo "             cd $COMPOSE_DIR && docker compose down -v"
+    if [ "${SUPEROPS_FORCE_NEW_SECRETS:-}" = "1" ]; then
+      echo "         SUPEROPS_FORCE_NEW_SECRETS=1 — continuing anyway."
+    else
+      # Read from stdin, not /dev/tty: a piped answer must work, and a
+      # non-interactive run with nothing on stdin must fall through to the safe
+      # default (abort) rather than erroring on a missing terminal.
+      printf "         Continue and generate new secrets anyway? [y/N] "
+      reply=""
+      read -r reply || true
+      case "$reply" in
+        [yY]*) ;;
+        *) die "Aborted. No secrets were generated. Set SUPEROPS_FORCE_NEW_SECRETS=1 to skip this prompt." ;;
+      esac
+    fi
+  fi
+
   echo "Generating $ENV_FILE with random secrets..."
   ( umask 077; cp "$COMPOSE_DIR/.env.example" "$ENV_FILE" )
 
