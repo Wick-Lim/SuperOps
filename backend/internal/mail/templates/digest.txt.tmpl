@@ -1,0 +1,13 @@
+Hello {{.Data.UserName}},
+
+While you were away, {{.Data.TotalUnread}} thing{{if ne .Data.TotalUnread 1}}s{{end}} came up in {{.Data.WorkspaceName}}.
+{{range .Data.Items}}
+  * {{.Title}}{{if gt .UnreadCount 1}} ({{.UnreadCount}} new){{end}}
+    {{if .Preview}}{{.Preview}}
+    {{end}}{{$.URL .Link}}
+{{end}}
+Open your inbox: {{.URL "/inbox"}}
+
+--
+This is an automated summary from {{.Product}} at {{.BaseURL}}. Please do not reply to it.
+Change what you are emailed about in your notification preferences: {{.URL "/settings/notifications"}}

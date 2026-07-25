@@ -20,6 +20,35 @@ concurrency:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # Postgres, and only Postgres. internal/inbox and internal/audit carry
+    # DB-backed unit tests that cannot be expressed against a mocked pool — the
+    # ON CONFLICT DO NOTHING row count that gates the coalesced inbox counter, a
+    # monthly partition rotating, a hash chain surviving an UPDATE issued behind
+    # the application's back. Without a reachable database they SKIP, which is
+    # how a suite silently goes green over exactly the mechanisms it exists to
+    # protect.
+    #
+    # Redis/NATS/Meilisearch are deliberately absent: the packages that need
+    # them skip here and are covered by the `integration` job, which has all of
+    # them and fails rather than skipping.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: superops
+          POSTGRES_PASSWORD: superops
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U superops"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DB_HOST: localhost
+      DB_PORT: '5432'
+      DB_USER: superops
+      DB_PASSWORD: superops
+      DB_MAINTENANCE_NAME: postgres
+      DB_SSLMODE: disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -45,7 +74,27 @@ jobs:
 
       - name: Unit tests
         working-directory: backend
+        # SUPEROPS_REQUIRE_INFRA is NOT set here: it would force the Redis, NATS
+        # and Meilisearch tests to fail in a job that deliberately has none of
+        # them. Postgres is reachable, so the database-backed tests run rather
+        # than skip — which is the point of the service above — and the step
+        # below proves they actually did.
         run: go test ./... -race -count=1 -coverprofile=coverage.out -covermode=atomic
+
+      - name: Assert the database-backed tests actually ran
+        working-directory: backend
+        # A skip is invisible in `go test` output that is otherwise all "ok", and
+        # these are the tests guarding the inbox's idempotency gate and the audit
+        # chain. Naming one from each package turns "Postgres was unreachable"
+        # from a silent green into a failure.
+        run: |
+          go test ./internal/inbox/ ./internal/audit/ -count=1 -v \
+            -run 'TestRedeliveryMovesTheCounterExactlyOnce|TestChainDetectsTamper' \
+            | tee /tmp/dbtests.txt
+          grep -q -- '--- PASS: TestRedeliveryMovesTheCounterExactlyOnce' /tmp/dbtests.txt \
+            || { echo "::error::the inbox idempotency test did not run (Postgres unreachable?)"; exit 1; }
+          grep -q -- '--- PASS: TestChainDetectsTamper' /tmp/dbtests.txt \
+            || { echo "::error::the audit chain test did not run (Postgres unreachable?)"; exit 1; }
 
       - name: Coverage summary
         working-directory: backend

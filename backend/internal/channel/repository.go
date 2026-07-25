@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
 
@@ -406,23 +407,43 @@ func (r *Repository) RemoveMember(ctx context.Context, channelID, userID string)
 	return nil
 }
 
-// UpdateReadAt advances the caller's read marker to at. The marker is monotonic
-// (GREATEST) and clamped to NOW(), so neither an out-of-order request nor a
-// client clock skewed into the future can mark unsent messages read.
+// UpdateReadAt advances the caller's read marker to at, AND marks this
+// channel's inbox items read, in ONE transaction.
+//
+// The marker itself is monotonic (GREATEST) and clamped to NOW(), so neither an
+// out-of-order request nor a client clock skewed into the future can mark unsent
+// messages read.
+//
+// # Why the inbox write belongs here
+//
+// Three subsystems own part of "unread": channel_members.last_read_at (this
+// one), and inbox_items.state. They are trustworthy together only because they
+// cover DISJOINT things and agree at their SINGLE overlap — and this is that
+// overlap. A plain channel message never produces an inbox item (that is this
+// badge's job, and it already works); only directed events do. But a user who
+// reads #alerts has read the mention in it, so the one place where both systems
+// have an opinion is right here, and they have to change together or not at all.
+//
+// Doing it in a second statement after the commit would leave a window in which
+// the channel badge is zero and the inbox bell still says one. Nobody files a
+// bug about that; they stop trusting the bell, and every pillar that files into
+// it is then wasted work.
 func (r *Repository) UpdateReadAt(ctx context.Context, channelID, userID string, at time.Time) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE channel_members
-		    SET last_read_at = GREATEST(last_read_at, LEAST($3::timestamptz, NOW()))
-		  WHERE channel_id = $1 AND user_id = $2`,
-		channelID, userID, at,
-	)
-	if err != nil {
-		return fmt.Errorf("update read at: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotAMember
-	}
-	return nil
+	return database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`UPDATE channel_members
+			    SET last_read_at = GREATEST(last_read_at, LEAST($3::timestamptz, NOW()))
+			  WHERE channel_id = $1 AND user_id = $2`,
+			channelID, userID, at,
+		)
+		if err != nil {
+			return fmt.Errorf("update read at: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotAMember
+		}
+		return inbox.MarkSubjectRead(ctx, tx, userID, inbox.SubjectChannel, channelID)
+	})
 }
 
 // MessageTimestamp resolves a message's created_at, scoped to the channel it is

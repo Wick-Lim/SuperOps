@@ -36,6 +36,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 )
 
 // Workspace roles, ordered by privilege. Mirrors the CHECK constraint on
@@ -69,6 +71,82 @@ type Checker struct {
 	// Revoker in checker.go: a revoked grant has to reach connections that were
 	// authorized before it was revoked.
 	revoker Revoker
+
+	// auditor is nil unless the composition root wired one. See WithAuditor.
+	auditor Auditor
+}
+
+// Auditor records authorization changes. *audit.Service is the implementation.
+//
+// The hooks live INSIDE Grant/Revoke/Move rather than at their call sites, and
+// that is the whole point: a pillar cannot forget an audit hook it never had to
+// write. Nine pillars each remembering to log a grant is nine chances to miss
+// one, and the one that gets missed is the one an auditor asks about.
+type Auditor interface {
+	Try(ctx context.Context, e audit.Entry)
+}
+
+// WithAuditor attaches the audit trail to the authorization mutations. Without
+// it the mutations behave identically and record nothing, which is correct for
+// the operational tools and tests that construct a bare New(pool).
+func WithAuditor(a Auditor) Option {
+	return func(c *Checker) { c.auditor = a }
+}
+
+// audit records one authorization change, if an auditor is wired.
+//
+// Try, not Record: the mutation has already committed by the time this is
+// called, so losing the trail entry must be visible in the logs (and in
+// superops_audit_write_failures_total) without turning a successful revocation
+// into a 500. These entries are Tier 1 — synchronous, never coalesced, chained —
+// because "who was given access to what" is exactly the category that must not
+// be lost, and it is low-volume enough to afford it.
+func (c *Checker) audit(ctx context.Context, actor SubjectRef, action string, obj ObjectRef, subject *SubjectRef, meta map[string]interface{}) {
+	if c.auditor == nil {
+		return
+	}
+	actorID := ""
+	if actor.Type == SubjectUser {
+		if id, ok := canonicalUUID(actor.ID); ok {
+			actorID = id
+		}
+	}
+	if meta == nil {
+		meta = map[string]interface{}{}
+	}
+	if subject != nil {
+		meta["subject_type"] = string(subject.Type)
+		meta["subject_id"] = subject.ID
+	}
+	workspaceID := ""
+	if obj.Type == TypeWorkspace {
+		workspaceID = obj.ID
+	} else if ws, err := c.objectWorkspace(ctx, obj); err == nil {
+		workspaceID = ws
+	}
+
+	c.auditor.Try(ctx, audit.Entry{
+		WorkspaceID:  workspaceID,
+		ActorID:      actorID,
+		Action:       action,
+		ResourceType: string(obj.Type),
+		ResourceID:   obj.ID,
+		Metadata:     meta,
+	})
+}
+
+// objectWorkspace resolves the tenant an object belongs to, for the audit row.
+// acl_object.workspace_id is authoritative for tenancy, so this is the same
+// answer every authorization decision uses.
+func (c *Checker) objectWorkspace(ctx context.Context, obj ObjectRef) (string, error) {
+	var ws string
+	err := c.pool.QueryRow(ctx,
+		`SELECT workspace_id FROM acl_object WHERE object_type = $1 AND object_id = $2`,
+		obj.Type, obj.ID).Scan(&ws)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return ws, err
 }
 
 // Option configures a Checker. Variadic so a plain New(pool) — which every test

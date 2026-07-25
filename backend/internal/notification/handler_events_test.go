@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 )
 
@@ -95,37 +94,5 @@ func TestEventHandlersIgnoreForeignEventTypes(t *testing.T) {
 	}
 }
 
-// Durable consumers are at-least-once, so the id has to be a function of the
-// event: the second delivery must collide with the first row rather than add a
-// duplicate to the recipient's list.
-func TestNotificationIDIsStableAndDistinguishing(t *testing.T) {
-	const (
-		user  = "1c1b6e7a-2f3d-4c5b-8a9e-0d1f2a3b4c5d"
-		other = "9e8d7c6b-5a4f-4e3d-2c1b-0a9f8e7d6c5b"
-		msgID = "44444444-4444-4444-4444-444444444444"
-	)
-
-	base := notificationID(TypeMention, user, msgID)
-	if base != notificationID(TypeMention, user, msgID) {
-		t.Fatal("the same event must derive the same id on every delivery")
-	}
-	if _, err := uuid.Parse(base); err != nil {
-		t.Fatalf("derived id is not a uuid: %v", err)
-	}
-
-	distinct := map[string]string{
-		"other recipient": notificationID(TypeMention, other, msgID),
-		"other type":      notificationID(TypeThreadReply, user, msgID),
-		"other subject":   notificationID(TypeMention, user, "other"),
-	}
-	for name, id := range distinct {
-		if id == base {
-			t.Errorf("%s collided with the base id", name)
-		}
-	}
-
-	// The separator must not let two different tuples render to the same string.
-	if notificationID(TypeDM, "a", "b\x00c") == notificationID(TypeDM, "a\x00b", "c") {
-		t.Error("the id key is ambiguous across field boundaries")
-	}
-}
+// The derived-id test that used to live here moved with the mechanism: the id is
+// now inbox.EventID and is exercised in internal/inbox/id_test.go.

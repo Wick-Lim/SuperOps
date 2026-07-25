@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ws"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
@@ -144,7 +145,7 @@ type connectionCounter interface {
 	ConnectionCount() int
 }
 
-func metricsHandler(hub *ws.Hub, pool *pgxpool.Pool, token string) http.HandlerFunc {
+func metricsHandler(hub *ws.Hub, pool *pgxpool.Pool, auditSvc *audit.Service, token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Optional bearer-token guard so /metrics isn't world-readable when the
 		// endpoint is reachable outside a trusted scrape network.
@@ -176,6 +177,28 @@ func metricsHandler(hub *ws.Hub, pool *pgxpool.Pool, token string) http.HandlerF
 		fmt.Fprintf(w, "superops_http_requests_total{status=\"5xx\"} %d\n", appMetrics.requests5xx.Load())
 
 		writeLatencyHistogram(w)
+
+		// Audit health. Both of these MUST be alertable.
+		//
+		// superops_audit_dropped_total counts Tier 2 records a full buffer
+		// refused. That buffer fills exactly when the load is interesting — an
+		// incident — and silently dropping audit records is the failure that
+		// makes the entire surface worthless. It is a counted, logged drop
+		// precisely so it is not silent, and this is where "not silent" becomes
+		// "alertable".
+		//
+		// superops_audit_write_failures_total counts writes that were attempted
+		// and lost. Try swallows audit errors by design (a failed audit write
+		// must not turn a successful login into a 500), which means a broken
+		// audit path is otherwise invisible except in logs.
+		if auditSvc != nil {
+			fmt.Fprintf(w, "# HELP superops_audit_dropped_total Audit entries dropped by a full Tier 2 buffer.\n")
+			fmt.Fprintf(w, "# TYPE superops_audit_dropped_total counter\n")
+			fmt.Fprintf(w, "superops_audit_dropped_total %d\n", auditSvc.Dropped())
+			fmt.Fprintf(w, "# HELP superops_audit_write_failures_total Audit writes attempted and lost.\n")
+			fmt.Fprintf(w, "# TYPE superops_audit_write_failures_total counter\n")
+			fmt.Fprintf(w, "superops_audit_write_failures_total %d\n", auditSvc.Failures())
+		}
 
 		fmt.Fprintf(w, "# HELP superops_ws_upgrades_total WebSocket upgrades accepted (hijacked connections, excluded from HTTP latency).\n")
 		fmt.Fprintf(w, "# TYPE superops_ws_upgrades_total counter\n")

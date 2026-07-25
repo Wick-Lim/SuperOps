@@ -75,3 +75,36 @@ groups:
           severity: info
         annotations:
           summary: "Backend process restarted in the last 5 minutes"
+
+      # The Tier 2 audit buffer (file downloads, sensitive reads) drops when it
+      # is full. That is by design and it is counted rather than silent — but a
+      # buffer fills exactly when the load is interesting, i.e. during the
+      # incident whose trail you will later want to read. Any drop at all is
+      # worth waking up for, because the records are not recoverable.
+      - alert: SuperOpsAuditRecordsDropped
+        expr: increase(superops_audit_dropped_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit records were dropped by a full buffer"
+          description: >-
+            Egress and sensitive-read audit entries are being discarded and cannot be
+            recovered. Raise AUDIT_BUFFER_SIZE / AUDIT_BUFFER_WORKERS, or find what is
+            making the audit writes slow. Tier 1 (authentication, authorization changes,
+            sharing, configuration) is synchronous and is unaffected.
+
+      # audit.Try swallows write failures by design — a failed audit write must
+      # not turn a successful login into a 500 — which means a broken audit path
+      # is otherwise invisible outside the logs.
+      - alert: SuperOpsAuditWriteFailures
+        expr: increase(superops_audit_write_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit writes are failing"
+          description: >-
+            The audit trail has gaps. Most likely a missing monthly partition (the
+            worker's audit_partitions job has stopped — check its /health entry) or a
+            constraint rejection.

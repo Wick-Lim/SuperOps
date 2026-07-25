@@ -52,7 +52,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("GET /api/v1/admin/users", authMw(http.HandlerFunc(h.ListUsers)))
 	mux.Handle("PATCH /api/v1/admin/users/{user_id}", authMw(http.HandlerFunc(h.UpdateUser)))
 	mux.Handle("GET /api/v1/admin/stats", authMw(http.HandlerFunc(h.Stats)))
-	mux.Handle("GET /api/v1/admin/audit-logs", authMw(http.HandlerFunc(h.AuditLogs)))
+	// GET /api/v1/admin/audit-logs moved to internal/audit: the package that owns
+	// the table owns the query. Same path, same adminMw, same h.scope-equivalent
+	// workspace scoping — see audit.Handler.RegisterRoutes and internal/app.
 	mux.Handle("POST /api/v1/admin/invitations", authMw(http.HandlerFunc(h.CreateInvitation)))
 	mux.Handle("GET /api/v1/admin/invitations", authMw(http.HandlerFunc(h.ListInvitations)))
 }
@@ -475,80 +477,4 @@ func (h *Handler) Stats(w http.ResponseWriter, r *http.Request) {
 		"users": userCount, "workspaces": len(workspaces),
 		"channels": channelCount, "messages": messageCount,
 	})
-}
-
-func (h *Handler) AuditLogs(w http.ResponseWriter, r *http.Request) {
-	params, err := httputil.ParsePagination(r)
-	if err != nil {
-		httputil.HandleError(w, err)
-		return
-	}
-	workspaces, _, ok := h.scope(w, r)
-	if !ok {
-		return
-	}
-
-	const cols = `SELECT id, workspace_id, actor_id, action, resource_type, resource_id,
-	                     metadata::text, COALESCE(host(ip_address),''), created_at
-	                FROM audit_logs
-	               WHERE workspace_id = ANY($1)`
-
-	var rows pgx.Rows
-	if params.Cursor.IsZero() {
-		rows, err = h.pool.Query(r.Context(),
-			cols+` ORDER BY created_at DESC, id DESC LIMIT $2`,
-			workspaces, params.Limit+1)
-	} else {
-		rows, err = h.pool.Query(r.Context(),
-			cols+` AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $4`,
-			workspaces, params.Cursor.CreatedAt, params.Cursor.ID, params.Limit+1)
-	}
-	if err != nil {
-		httputil.HandleError(w, httputil.NewInternal(err))
-		return
-	}
-	defer rows.Close()
-
-	type entry struct {
-		id        string
-		createdAt time.Time
-		body      map[string]interface{}
-	}
-	entries := []entry{}
-	for rows.Next() {
-		var id, action, resourceType, metadata, ip string
-		var wsID, actorID, resourceID *string
-		var createdAt time.Time
-		if err := rows.Scan(&id, &wsID, &actorID, &action, &resourceType, &resourceID, &metadata, &ip, &createdAt); err != nil {
-			httputil.HandleError(w, httputil.NewInternal(err))
-			return
-		}
-		entries = append(entries, entry{id: id, createdAt: createdAt, body: map[string]interface{}{
-			"id": id, "workspace_id": wsID, "actor_id": actorID,
-			"action": action, "resource_type": resourceType, "resource_id": resourceID,
-			"metadata": metadata, "ip_address": ip, "created_at": createdAt,
-		}})
-	}
-	if err := rows.Err(); err != nil {
-		httputil.HandleError(w, httputil.NewInternal(err))
-		return
-	}
-
-	hasMore := len(entries) > params.Limit
-	if hasMore {
-		entries = entries[:params.Limit]
-	}
-
-	logs := make([]map[string]interface{}, 0, len(entries))
-	for _, e := range entries {
-		logs = append(logs, e.body)
-	}
-
-	var cursor string
-	if len(entries) > 0 {
-		last := entries[len(entries)-1]
-		cursor = httputil.EncodeCursor(last.createdAt, last.id)
-	}
-
-	httputil.JSONList(w, http.StatusOK, logs, cursor, hasMore)
 }

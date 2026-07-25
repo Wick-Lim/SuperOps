@@ -27,9 +27,9 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/collab"
 	"github.com/Wick-Lim/SuperOps/backend/internal/emoji"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
+	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
-	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ratelimit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/rbac"
@@ -59,6 +59,10 @@ type App struct {
 	// pool. Handlers never reach it through here; they are given the checker
 	// directly.
 	Authz *authz.Checker
+
+	// audit is closed on shutdown so the Tier 2 buffer drains instead of
+	// discarding the records for the last requests this replica served.
+	audit *audit.Service
 
 	// draining flips as soon as shutdown starts so /ready fails before the
 	// listener stops accepting: a load balancer needs a failing readiness probe
@@ -119,7 +123,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	workspaceRepo := workspace.NewRepository(pool)
 	channelRepo := channel.NewRepository(pool)
 	messageRepo := message.NewRepository(pool)
-	notificationRepo := notification.NewRepository(pool)
+	inboxRepo := inbox.NewRepository(pool)
 
 	// WebSocket Hub with NATS bridge for multi-replica support.
 	// - NATS bridge: relays client-originated ephemeral events (typing) between replicas.
@@ -146,11 +150,48 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// service exists; it cannot be passed here because that service needs the
 	// checker this call is constructing.
 	revoker := &liveRevoker{hub: hub}
+	// az is built before auditService because the checker is passed to almost
+	// everything; the auditor is attached below, once it exists, through the
+	// same option list. See authz.WithAuditor for why the hooks live inside
+	// Grant/Revoke/Move rather than at their call sites.
 	az := authz.New(pool, authz.WithRevoker(revoker))
 
 	// audit must exist before auth: auth.Service records login/logout/password
 	// events through it.
+	//
+	// The sink is constructed here and a failure is FATAL. That is the §3c rule
+	// (docs/ROADMAP.md): a transport named without its credentials must be a boot
+	// failure, not a first-use failure — an operator who sets AUDIT_SINK=http and
+	// forgets the secret has to find out at deploy time, not the first time a
+	// chain needed anchoring.
+	auditSink, err := audit.NewSink(audit.SinkConfig{
+		Transport: cfg.Audit.Sink,
+		Path:      cfg.Audit.SinkPath,
+		Endpoint:  cfg.Audit.SinkEndpoint,
+		Secret:    cfg.Audit.SinkSecret,
+		Timeout:   cfg.Audit.SinkTimeout,
+		Logger:    logger,
+	})
+	if err != nil {
+		natsClient.Close()
+		redisClient.Close()
+		pool.Close()
+		return nil, err
+	}
 	auditService := audit.NewService(pool, logger)
+	// Tier 2: egress and sensitive reads, off the request's critical path. Tier 1
+	// (authentication, authorization changes, sharing, configuration) never
+	// touches this queue — see the package comment.
+	auditService.StartBuffer(audit.BufferConfig{
+		Size:    cfg.Audit.BufferSize,
+		Workers: cfg.Audit.BufferWorkers,
+	})
+	// Authorization changes are audited from INSIDE authz.Grant/Revoke/Move, so a
+	// pillar cannot forget a hook it never had to write.
+	authz.WithAuditor(auditService)(az)
+	logger.Info("audit configured", "sink", auditSink.Name(),
+		"retention_days", cfg.Audit.RetentionDays,
+		"note", "the hash chain detects tampering; only anchored_seq is protected off-box")
 
 	// Services
 	jwtMgr := auth.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTokenTTL)
@@ -296,9 +337,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	presenceHandler := presence.NewHandler(presenceService, az, pool)
 	var fileHandler *file.Handler
 	if fileStorage != nil {
-		fileHandler = file.NewHandler(fileStorage, pool, az)
+		fileHandler = file.NewHandler(fileStorage, pool, az, auditService)
 	}
-	notificationHandler := notification.NewHandler(notificationRepo)
+	// The inbox owns notifications for the whole product (docs/plans/README.md
+	// "Resolved conflicts" §1). The API only READS it — every write happens in
+	// cmd/worker behind a durable consumer — so no Notifier is built here.
+	inboxHandler := inbox.NewHandler(inboxRepo)
 
 	// Outbound mail. Both the sender and the renderer are constructed here, and
 	// a failure is fatal: the whole point of the configuration validation is
@@ -351,6 +395,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		NATS:   natsClient,
 		Hub:    hub,
 		Authz:  az,
+		audit:  auditService,
 	}
 
 	// Router
@@ -369,7 +414,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// blast radius for "my database is briefly gone".
 	mux.HandleFunc("GET /health", liveHandler)
 	mux.HandleFunc("GET /ready", appInstance.readyHandler())
-	mux.HandleFunc("GET /metrics", metricsHandler(hub, pool, cfg.MetricsToken))
+	mux.HandleFunc("GET /metrics", metricsHandler(hub, pool, auditService, cfg.MetricsToken))
 
 	// The API limiter runs outside the mux while auth.Middleware runs inside it,
 	// so authctx is always empty at limiter time. Parse the token here without
@@ -439,7 +484,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	if fileHandler != nil {
 		fileHandler.RegisterRoutes(mux, authMw)
 	}
-	notificationHandler.RegisterRoutes(mux, authMw)
+	inboxHandler.RegisterRoutes(mux, authMw)
+	// The four shipped /api/v1/notifications routes, re-pointed at inbox_items.
+	// One of them changes MEANING — unread-count now counts unread ITEMS rather
+	// than unread EVENTS — deliberately and without versioning; see
+	// internal/inbox/compat.go for the argument and its cost.
+	inboxHandler.RegisterCompatRoutes(mux, authMw)
 	// Admin endpoints require an authenticated caller who administers a
 	// workspace. Each handler re-scopes to the workspaces that caller actually
 	// administers, so this is a cheap pre-filter, not the whole authorization.
@@ -447,6 +497,26 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 		return authMw(rbac.RequireAnyWorkspaceAdmin(az)(next))
 	}
 	adminHandler.RegisterRoutes(mux, adminMw)
+	// The audit read surface. Same paths and the same adminMw the query had when
+	// it lived in internal/admin, so nothing about the authorization changes —
+	// it moved because the package that owns the table owns the query.
+	auditHandler := audit.NewHandler(pool, auditService, az, auditSink)
+	auditHandler.RegisterRoutes(mux, adminMw)
+	// Export and the sink test get their own budget. An export is the single
+	// highest-value request in the product (one request, a lot of rows) and the
+	// sink test is an outbound call, so both carry a much lower per-IP limit than
+	// the general API's 600/min — the same treatment the mail test gets below.
+	auditHandler.RegisterExportRoutes(mux, func(next http.Handler) http.Handler {
+		if !cfg.RateLimit.Enabled {
+			return adminMw(next)
+		}
+		return ratelimit.MiddlewareByIP(redisClient, ratelimit.Config{
+			RequestsPerMinute: cfg.Audit.ExportPerMinute,
+			Window:            time.Minute,
+			TrustProxy:        cfg.RateLimit.TrustProxy,
+			TrustedProxyHops:  cfg.RateLimit.TrustedProxyHops,
+		})(adminMw(next))
+	})
 	// The mail configuration test gets its own chain. It is an outbound-mail
 	// trigger, so it carries a much lower per-IP budget than the general API
 	// limit — which at 600/min would let one admin account emit ten test
@@ -719,6 +789,13 @@ func (a *App) BeginDrain() {
 }
 
 func (a *App) Close() {
+	// Drain the audit buffer FIRST, while the pool is still open. Closing the
+	// pool underneath it would turn every queued record into a write error — the
+	// records for the last requests this replica served, which are exactly the
+	// ones an incident timeline needs.
+	if a.audit != nil {
+		a.audit.Close()
+	}
 	if a.DB != nil {
 		a.DB.Close()
 	}

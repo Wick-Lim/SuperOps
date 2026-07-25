@@ -17,6 +17,7 @@
 package integration
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
@@ -237,6 +238,46 @@ func TestAdminEndpointsAreWorkspaceScoped(t *testing.T) {
 		if l.WorkspaceID != nil && *l.WorkspaceID != a.workspaceID {
 			t.Errorf("audit log from workspace %s leaked to an admin of %s", *l.WorkspaceID, a.workspaceID)
 		}
+	}
+
+	// --- so is the EXPORT, which is the highest-value target in the product ---
+	//
+	// One request, every row, streamed. It is the endpoint an attacker with a
+	// stolen admin session reaches for, and it goes here rather than in a new
+	// file precisely because this is where the tenancy bugs that already
+	// happened once are regression-tested.
+	exported := h.exportAuditNDJSON(t, a.token, "")
+	if len(exported) == 0 {
+		t.Error("the audit export returned nothing at all; the scoping assertion below proves nothing")
+	}
+	for _, l := range exported {
+		if l.WorkspaceID == nil || *l.WorkspaceID != a.workspaceID {
+			t.Errorf("audit export leaked a row from workspace %v to an admin of %s",
+				l.WorkspaceID, a.workspaceID)
+		}
+	}
+	// Naming another tenant's workspace explicitly is a 403, not a wider export:
+	// the filter may NARROW the administered set and must never widen it.
+	h.denied(t, http.StatusForbidden, "GET",
+		"/api/v1/admin/audit-logs/export?workspace_id="+b.workspaceID, a.token, nil)
+	h.denied(t, http.StatusForbidden, "GET",
+		"/api/v1/admin/audit-logs?workspace_id="+b.workspaceID, a.token, nil)
+
+	// --- the chain status is scoped the same way ---
+	var verify struct {
+		OK     bool `json:"ok"`
+		Chains []struct {
+			WorkspaceID string `json:"workspace_id"`
+		} `json:"chains"`
+	}
+	decodeInto(t, h.req(t, http.StatusOK, "GET", "/api/v1/admin/audit-logs/verify", a.token, nil).Data, &verify)
+	for _, c := range verify.Chains {
+		if c.WorkspaceID != a.workspaceID {
+			t.Errorf("chain status for workspace %s leaked to an admin of %s", c.WorkspaceID, a.workspaceID)
+		}
+	}
+	if !verify.OK {
+		t.Error("a freshly written audit chain failed verification")
 	}
 
 	// --- a stranger cannot be deactivated, demoted or invited over ---
@@ -484,4 +525,45 @@ func TestWorkspaceRemovalRevokesAccess(t *testing.T) {
 	if got.Content != "member can post" {
 		t.Errorf("removed member's message = %q, want it intact", got.Content)
 	}
+}
+
+// exportedAuditRow is one NDJSON line from GET /admin/audit-logs/export.
+type exportedAuditRow struct {
+	ID          string  `json:"id"`
+	WorkspaceID *string `json:"workspace_id"`
+	Action      string  `json:"action"`
+}
+
+// exportAuditNDJSON drives the streaming export. It is not h.req: the response
+// is NDJSON rather than the {data,meta,error} envelope, which is itself part of
+// the contract — an export that came back wrapped would not be streamable.
+func (h *harness) exportAuditNDJSON(t *testing.T, token, query string) []exportedAuditRow {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, h.base+"/api/v1/admin/audit-logs/export"+query, nil)
+	if err != nil {
+		t.Fatalf("new export request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("audit export: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("audit export = %d, want 200", res.StatusCode)
+	}
+	if ct := res.Header.Get("Content-Type"); ct != "application/x-ndjson" {
+		t.Errorf("audit export Content-Type = %q, want application/x-ndjson", ct)
+	}
+
+	var rows []exportedAuditRow
+	dec := json.NewDecoder(res.Body)
+	for {
+		var row exportedAuditRow
+		if err := dec.Decode(&row); err != nil {
+			break
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }

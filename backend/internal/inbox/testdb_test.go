@@ -1,4 +1,4 @@
-package notification
+package inbox_test
 
 import (
 	"context"
@@ -16,14 +16,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// The push-dispatch tests run against a real Postgres, on purpose.
+// The fan-out tests run against a real Postgres, on purpose.
 //
-// What they assert is not expressible against a mocked pool: that
-// Repository.Create reports whether the INSERT actually happened (the
-// ON CONFLICT DO NOTHING row count is the whole mechanism), and that the
-// fan-out therefore pushes exactly once no matter how many times JetStream
-// redelivers the event. The rest of the package's logic is pure and is tested
-// in service_test.go without any of this.
+// What they assert is not expressible against a mocked pool: that the event
+// insert's ON CONFLICT DO NOTHING row count is what gates the item upsert (the
+// whole idempotency mechanism), that the coalesced counter therefore moves
+// EXACTLY ONCE no matter how many times JetStream redelivers the event, and that
+// the reconciler detects and repairs injected drift. The pure logic — id
+// derivation, kind ranking, preference precedence — is tested in id_test.go and
+// prefs_test.go without any of this.
+//
+// They live in package inbox_test rather than package inbox because they drive
+// the real producer (internal/notification), which imports internal/inbox: an
+// in-package test importing it back would be an import cycle.
 //
 // Reachability is decided from the standard DB_* environment. When Postgres is
 // not there the suite skips, unless SUPEROPS_REQUIRE_INFRA=1 forces it to fail
@@ -31,7 +36,7 @@ import (
 
 // testDBName is per-package and per-process: `go test ./...` runs package test
 // binaries concurrently, and two of them migrating the same database would race.
-var testDBName = fmt.Sprintf("superops_notification_test_%d", os.Getpid())
+var testDBName = fmt.Sprintf("superops_inbox_test_%d", os.Getpid())
 
 var (
 	dbOnce sync.Once
@@ -77,7 +82,7 @@ func testDB(t *testing.T) *pgxpool.Pool {
 		if requireInfra() {
 			t.Fatalf("SUPEROPS_REQUIRE_INFRA=1 but Postgres is unusable: %v", dbErr)
 		}
-		t.Skipf("postgres unavailable, skipping notification database tests: %v", dbErr)
+		t.Skipf("postgres unavailable, skipping inbox database tests: %v", dbErr)
 	}
 	return dbPool
 }

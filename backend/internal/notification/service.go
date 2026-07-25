@@ -7,84 +7,46 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"unicode/utf8"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
-	"github.com/Wick-Lim/SuperOps/backend/internal/push"
-	natspkg "github.com/Wick-Lim/SuperOps/backend/pkg/nats"
+	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 )
 
-// bodyRunes bounds the notification preview. It is a rune budget, not a byte
-// budget — see truncate.
-const bodyRunes = 140
-
-// notificationNamespace seeds the deterministic notification ids below. Any
-// fixed uuid does; this one must simply never change, or the first fan-out
-// after the change would duplicate every notification it re-derives.
-var notificationNamespace = uuid.MustParse("3d0f5e2a-6c1b-4f7e-9a1d-2b8c5f0e7a41")
-
-// notificationID derives a stable id from what the notification is *about*.
+// Deliverer is the inbox fan-out. *inbox.Notifier is the implementation; the
+// interface is here so this package's tests can observe what it decided to file
+// without standing up a database.
 //
-// The worker consumes these events from a durable JetStream consumer with
-// explicit acks, which is at-least-once: a fan-out that fails halfway through
-// (or simply outruns AckWait) is redelivered, and with random ids every
-// recipient already processed would get a second row. Deriving the id instead
-// makes the INSERT an ON CONFLICT DO NOTHING no-op the second time round, which
-// is what allows the handler to nak at all.
-//
-// The parts are length-prefixed rather than merely delimited, so no choice of
-// separator can make two different tuples hash to the same id.
-func notificationID(t Type, userID, subject string) string {
-	key := fmt.Sprintf("%d:%s|%d:%s|%d:%s", len(t), t, len(userID), userID, len(subject), subject)
-	return uuid.NewSHA1(notificationNamespace, []byte(key)).String()
-}
-
-// DeviceTokenLister resolves the push tokens registered for a user. It is
-// satisfied by user.Repository; declared here so the notification package does
-// not depend on the user package for one query.
-type DeviceTokenLister interface {
-	PushTokensForUser(ctx context.Context, userID string) ([]string, error)
-}
-
-// Pusher accepts push messages for asynchronous delivery. Enqueue must not
-// block: it is called from inside a JetStream consumer callback whose latency
-// is the consumer's ack latency. push.Dispatcher is the implementation.
-type Pusher interface {
-	Enqueue(msgs []push.Message)
+// It is the ONLY way this package writes a notification. There is deliberately
+// no second path: the coalescing, the idempotency gate and the badge all live
+// behind Deliver, and a producer that wrote rows itself would be re-deriving
+// them.
+type Deliverer interface {
+	Deliver(ctx context.Context, req inbox.Request) ([]inbox.Delivered, error)
 }
 
 type Service struct {
-	repo   *Repository
-	pool   *pgxpool.Pool
-	authz  *authz.Checker
-	nats   *natspkg.Client
-	logger *slog.Logger
+	pool  *pgxpool.Pool
+	authz *authz.Checker
+	inbox Deliverer
 
-	// devices and pusher are both nil when PUSH_ENABLED is off, which is the
-	// default. Every push path checks for that rather than the config, so
-	// "push is disabled" and "push is misconfigured" collapse to the same
-	// no-op instead of a nil dereference in the fan-out.
-	devices DeviceTokenLister
-	pusher  Pusher
+	// logger is carried but not written to from this package any more: every
+	// failure here is RETURNED, because the caller is a durable consumer and the
+	// return value is its ack decision. It is kept so a future producer-side
+	// diagnostic has somewhere to go without changing NewService's signature,
+	// and because handler_events_test builds a Service with nothing else.
+	logger *slog.Logger
 }
 
-// NewService builds the fan-out. devices and pusher may both be nil, which
-// disables push delivery and leaves the in-app notification path untouched.
-func NewService(
-	repo *Repository,
-	pool *pgxpool.Pool,
-	az *authz.Checker,
-	nats *natspkg.Client,
-	devices DeviceTokenLister,
-	pusher Pusher,
-	logger *slog.Logger,
-) *Service {
-	return &Service{repo: repo, pool: pool, authz: az, nats: nats, devices: devices, pusher: pusher, logger: logger}
+// NewService builds the message-domain fan-out.
+func NewService(pool *pgxpool.Pool, az *authz.Checker, notifier Deliverer, logger *slog.Logger) *Service {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Service{pool: pool, authz: az, inbox: notifier, logger: logger}
 }
 
 type MessageEvent struct {
@@ -119,14 +81,19 @@ type memberPref struct {
 }
 
 // wants reports whether this member should receive a notification of the given
-// type. channel_members.muted and notification_pref were previously read by
-// nothing at all, so muting a channel changed nothing.
-func (p memberPref) wants(t Type) bool {
+// kind.
+//
+// This is the MOST SPECIFIC rung of the preference ladder and it is applied
+// here, before inbox.Notifier ever sees the recipient — so a muted channel
+// produces no item at all rather than a suppressed one. internal/inbox's
+// notification_prefs sit below it and cover kinds rather than channels; see
+// inbox.PrefSet.Resolve.
+func (p memberPref) wants(kind string) bool {
 	if p.muted || p.pref == "none" {
 		return false
 	}
 	if p.pref == "mentions" {
-		return t == TypeMention
+		return kind == KindMention
 	}
 	return true
 }
@@ -138,52 +105,40 @@ type fanout struct {
 	prefs   map[string]memberPref
 }
 
-func (f *fanout) skip(uid string, t Type) bool {
+func (f *fanout) skip(uid, kind string) bool {
 	if uid == "" || f.seen[uid] || f.blocked[uid] {
 		return true
 	}
-	return !f.prefs[uid].wants(t)
+	return !f.prefs[uid].wants(kind)
 }
 
-// HandleMessage consumes a message.created event and creates the appropriate
-// notifications (DM, mention, thread_reply), pushing each to the recipient in
-// real time via NATS so the WebSocket relay can deliver it.
+// HandleMessage consumes a message.created event and files the directed
+// notifications it implies — a DM, a thread reply, a mention.
 //
-// It returns an error because its caller is a durable JetStream consumer and
-// the return value is the ack decision. Handlers here used to log and return
+// # What it deliberately does NOT file
+//
+// An inbox item for every message in a channel. That is the channel unread
+// badge's job (internal/channel/unread.go and the unread-fanout durable), it
+// already works, and duplicating it here would both double-count the badge and
+// create the hot-row failure the plan names: 1000 messages/hour x 500 members is
+// 500k updates/hour on rows that all share an index on last_at. Only DIRECTED
+// events produce items, which is what lets the two systems be trusted together.
+//
+// # The error contract
+//
+// It returns an error because its caller is a durable JetStream consumer and the
+// return value is the ack decision. Handlers here used to log and return
 // nothing, so a Postgres blip mid-fan-out acked the event and the recipients
-// were simply never told — nothing replays these events. A plain error means
-// "retry me"; a *PermanentError means the event is unprocessable and must be
-// terminated instead of redelivered five times.
+// were simply never told — nothing replays these. A plain error means "retry
+// me"; a *PermanentError means the event is unprocessable and must be terminated
+// instead of redelivered five times.
 //
-// Retrying is safe because every notification id is derived from the event (see
-// notificationID) and Repository.Create is an upsert-or-nothing.
+// Retrying is safe because every event id is derived from the event
+// (inbox.EventID) and the item upsert is gated on the event insert actually
+// having happened.
 func (s *Service) HandleMessage(ctx context.Context, msg *nats.Msg) error {
-	var envelope struct {
-		Type string          `json:"type"`
-		Data json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(msg.Data, &envelope); err != nil {
-		return &PermanentError{Reason: "malformed event envelope on " + msg.Subject, Err: err}
-	}
-	if envelope.Type != "message.new" {
-		return nil
-	}
-
-	var event MessageEvent
-	if err := json.Unmarshal(envelope.Data, &event); err != nil {
-		return &PermanentError{Reason: "malformed message.new payload", Err: err}
-	}
-	// The message id is required, not just useful: it is what makes every
-	// notification this fan-out produces identifiable, and therefore what makes
-	// a redelivery idempotent. Without it two different messages would derive
-	// the same id and the second would silently vanish.
-	if event.ID == "" || event.ChannelID == "" || event.UserID == "" {
-		return &PermanentError{Reason: "message.new event has no id, channel_id or user_id"}
-	}
-
-	workspaceID, err := workspaceFromSubject(msg.Subject)
-	if err != nil {
+	event, workspaceID, err := decodeMessage(msg)
+	if err != nil || event == nil {
 		return err
 	}
 
@@ -194,39 +149,41 @@ func (s *Service) HandleMessage(ctx context.Context, msg *nats.Msg) error {
 		return fmt.Errorf("resolve fan-out state for channel %s: %w", event.ChannelID, err)
 	}
 
-	data, err := marshalData(map[string]string{"channel_id": event.ChannelID, "message_id": event.ID})
-	if err != nil {
-		return &PermanentError{Reason: "notification payload is not encodable", Err: err}
-	}
-	body := truncate(event.Content, bodyRunes)
+	data := map[string]string{"channel_id": event.ChannelID, "message_id": event.ID}
 
 	chType, err := s.channelType(ctx, event.ChannelID)
 	if err != nil {
 		return err
 	}
 	if chType == "dm" || chType == "group_dm" {
-		// Notify every other member of the conversation.
 		members, err := s.channelMemberIDs(ctx, event.ChannelID)
 		if err != nil {
 			return err
 		}
+		recipients := make([]string, 0, len(members))
 		for _, uid := range members {
-			if f.skip(uid, TypeDM) {
+			if f.skip(uid, KindDM) {
 				continue
 			}
 			f.seen[uid] = true
-			if err := s.createAndPush(ctx, workspaceID, &Notification{
-				ID:     notificationID(TypeDM, uid, event.ID),
-				UserID: uid,
-				Type:   TypeDM,
-				Title:  "New message",
-				Body:   body,
-				Data:   data,
-			}); err != nil {
-				return err
-			}
+			recipients = append(recipients, uid)
 		}
-		return nil
+		// One Deliver for the whole conversation, not one per member. At a
+		// 500-member group DM the loop this replaced was 500 round trips inside
+		// cmd/worker's 25-second handler budget.
+		return s.deliver(ctx, inbox.Request{
+			WorkspaceID: workspaceID,
+			Kind:        KindDM,
+			ObjectType:  "message",
+			ObjectID:    event.ID,
+			SubjectType: inbox.SubjectChannel,
+			SubjectID:   event.ChannelID,
+			ActorID:     event.UserID,
+			Title:       "New message",
+			Body:        event.Content,
+			Data:        data,
+			Recipients:  recipients,
+		})
 	}
 
 	// Thread reply → notify the parent message author.
@@ -235,15 +192,20 @@ func (s *Service) HandleMessage(ctx context.Context, msg *nats.Msg) error {
 		if err != nil {
 			return err
 		}
-		if !f.skip(author, TypeThreadReply) {
+		if !f.skip(author, KindThreadReply) {
 			f.seen[author] = true
-			if err := s.createAndPush(ctx, workspaceID, &Notification{
-				ID:     notificationID(TypeThreadReply, author, event.ID),
-				UserID: author,
-				Type:   TypeThreadReply,
-				Title:  "New reply to your thread",
-				Body:   body,
-				Data:   data,
+			if err := s.deliver(ctx, inbox.Request{
+				WorkspaceID: workspaceID,
+				Kind:        KindThreadReply,
+				ObjectType:  "message",
+				ObjectID:    event.ID,
+				SubjectType: inbox.SubjectChannel,
+				SubjectID:   event.ChannelID,
+				ActorID:     event.UserID,
+				Title:       "New reply to your thread",
+				Body:        event.Content,
+				Data:        data,
+				Recipients:  []string{author},
 			}); err != nil {
 				return err
 			}
@@ -251,12 +213,13 @@ func (s *Service) HandleMessage(ctx context.Context, msg *nats.Msg) error {
 	}
 
 	// @mentions → notify mentioned users that are members of the channel.
+	mentioned := make([]string, 0, 4)
 	for _, username := range extractMentions(event.Content) {
 		uid, err := s.userIDByUsername(ctx, username)
 		if err != nil {
 			return err
 		}
-		if f.skip(uid, TypeMention) {
+		if f.skip(uid, KindMention) {
 			continue
 		}
 		member, err := s.isChannelMember(ctx, event.ChannelID, uid)
@@ -267,22 +230,25 @@ func (s *Service) HandleMessage(ctx context.Context, msg *nats.Msg) error {
 			continue
 		}
 		f.seen[uid] = true
-		if err := s.createAndPush(ctx, workspaceID, &Notification{
-			ID:     notificationID(TypeMention, uid, event.ID),
-			UserID: uid,
-			Type:   TypeMention,
-			Title:  "You were mentioned",
-			Body:   body,
-			Data:   data,
-		}); err != nil {
-			return err
-		}
+		mentioned = append(mentioned, uid)
 	}
-	return nil
+	return s.deliver(ctx, inbox.Request{
+		WorkspaceID: workspaceID,
+		Kind:        KindMention,
+		ObjectType:  "message",
+		ObjectID:    event.ID,
+		SubjectType: inbox.SubjectChannel,
+		SubjectID:   event.ChannelID,
+		ActorID:     event.UserID,
+		Title:       "You were mentioned",
+		Body:        event.Content,
+		Data:        data,
+		Recipients:  mentioned,
+	})
 }
 
-// HandleReaction notifies the author of a message someone reacted to. Reactions
-// previously notified nobody. See HandleMessage for the error contract.
+// HandleReaction notifies the author of a message someone reacted to. See
+// HandleMessage for the error contract.
 func (s *Service) HandleReaction(ctx context.Context, msg *nats.Msg) error {
 	var envelope struct {
 		Type string          `json:"type"`
@@ -320,31 +286,31 @@ func (s *Service) HandleReaction(ctx context.Context, msg *nats.Msg) error {
 	if err != nil {
 		return fmt.Errorf("resolve fan-out state for channel %s: %w", event.ChannelID, err)
 	}
-	if f.skip(author, TypeSystem) {
+	if f.skip(author, KindReaction) {
 		return nil
 	}
 
-	data, err := marshalData(map[string]string{"channel_id": event.ChannelID, "message_id": event.MessageID})
-	if err != nil {
-		return &PermanentError{Reason: "notification payload is not encodable", Err: err}
-	}
-
-	// The reactor and the emoji are part of the identity: two people reacting to
-	// the same message are two notifications, the same person re-reacting with
-	// the same emoji is not.
-	return s.createAndPush(ctx, workspaceID, &Notification{
-		ID:     notificationID(TypeSystem, author, event.MessageID+"\x00"+event.UserID+"\x00"+event.Emoji),
-		UserID: author,
-		Type:   TypeSystem,
-		Title:  "New reaction",
-		Body:   truncate(event.Emoji, bodyRunes),
-		Data:   data,
+	return s.deliver(ctx, inbox.Request{
+		WorkspaceID: workspaceID,
+		Kind:        KindReaction,
+		ObjectType:  "message",
+		ObjectID:    event.MessageID,
+		SubjectType: inbox.SubjectChannel,
+		SubjectID:   event.ChannelID,
+		ActorID:     event.UserID,
+		Title:       "New reaction",
+		Body:        event.Emoji,
+		Data:        map[string]string{"channel_id": event.ChannelID, "message_id": event.MessageID},
+		// The reactor and the emoji are part of the event's identity: two people
+		// reacting to the same message are two events, the same person
+		// re-reacting with the same emoji is not.
+		Discriminator: event.UserID + "\x00" + event.Emoji,
+		Recipients:    []string{author},
 	})
 }
 
-// HandleChannelMemberAdded produces the channel_invite notification. The type
-// has existed in the enum since migration 005 and was never emitted by anything.
-// See HandleMessage for the error contract.
+// HandleChannelMemberAdded produces the channel.invited event. See HandleMessage
+// for the error contract.
 func (s *Service) HandleChannelMemberAdded(ctx context.Context, msg *nats.Msg) error {
 	var envelope struct {
 		Type string          `json:"type"`
@@ -387,11 +353,6 @@ func (s *Service) NotifyChannelInvite(ctx context.Context, workspaceID string, e
 		return nil
 	}
 
-	data, err := marshalData(map[string]string{"channel_id": event.ChannelID})
-	if err != nil {
-		return err
-	}
-
 	name := event.ChannelName
 	if name == "" {
 		name, err = s.channelName(ctx, event.ChannelID)
@@ -400,144 +361,68 @@ func (s *Service) NotifyChannelInvite(ctx context.Context, workspaceID string, e
 		}
 	}
 
-	return s.createAndPush(ctx, workspaceID, &Notification{
-		ID:     notificationID(TypeChannelInvite, event.UserID, event.ChannelID+"\x00"+event.ActorID),
-		UserID: event.UserID,
-		Type:   TypeChannelInvite,
-		Title:  "You were added to a channel",
-		Body:   truncate("#"+name, bodyRunes),
-		Data:   data,
+	return s.deliver(ctx, inbox.Request{
+		WorkspaceID: workspaceID,
+		Kind:        KindInvite,
+		ObjectType:  "channel",
+		ObjectID:    event.ChannelID,
+		SubjectType: inbox.SubjectChannel,
+		SubjectID:   event.ChannelID,
+		ActorID:     event.ActorID,
+		Title:       "You were added to a channel",
+		Body:        "#" + name,
+		Data:        map[string]string{"channel_id": event.ChannelID},
+		// Two different people adding the same person to the same channel are
+		// two events; the same person doing it twice is not.
+		Discriminator: event.ActorID,
+		Recipients:    []string{event.UserID},
 	})
 }
 
-// createAndPush persists a notification, relays it to any live WebSocket, and
-// enqueues it for delivery to the recipient's devices.
-//
-// A failed INSERT is returned, not logged and shrugged off: the caller is a
-// durable consumer that decides whether to ack on the strength of it. A failed
-// *relay* or *push* is only logged — the row is committed, the recipient will
-// see it on their next fetch, and naking the event to retry a fire-and-forget
-// publish would be a worse trade.
-func (s *Service) createAndPush(ctx context.Context, workspaceID string, n *Notification) error {
-	created, err := s.repo.Create(ctx, n)
-	if err != nil {
-		return fmt.Errorf("create %s notification for %s: %w", n.Type, n.UserID, err)
+// deliver hands one request to the inbox, skipping the call entirely when the
+// fan-out resolved to nobody.
+func (s *Service) deliver(ctx context.Context, req inbox.Request) error {
+	if len(req.Recipients) == 0 {
+		return nil
 	}
-	if s.nats != nil && workspaceID != "" {
-		if err := s.nats.Publish("superops."+workspaceID+".notification.created",
-			natspkg.Event{Type: "notification.new", Data: n}); err != nil {
-			s.logger.Warn("notification: relay", "error", err, "user_id", n.UserID, "type", string(n.Type))
-		}
-	}
-	// Only on a genuinely new row. The realtime relay above is republished on a
-	// redelivery because a client that already has the frame ignores a duplicate
-	// id, but a duplicate push is a second buzz in the recipient's pocket for a
-	// message they have already read.
-	if created {
-		s.enqueuePush(ctx, n)
+	if _, err := s.inbox.Deliver(ctx, req); err != nil {
+		return fmt.Errorf("file %s for %d recipient(s): %w", req.Kind, len(req.Recipients), err)
 	}
 	return nil
 }
 
-// enqueuePush addresses a committed notification to the recipient's devices.
-//
-// # On not checking whether the user is already connected
-//
-// The tempting optimisation is to skip the push when the recipient has a live
-// WebSocket. It is technically reachable from here — internal/presence keeps a
-// refcount of live connections per user in Redis (`presence-conns:{user_id}`),
-// shared across replicas, so the worker could consult it despite being a
-// different process from the hub. It is deliberately not done, for two reasons:
-//
-//   - The refcount is per *user*, not per device. A desktop web tab left open
-//     in an office would suppress the push to the phone in the user's pocket —
-//     silencing precisely the device push notifications exist for.
-//   - "Has a socket" is not "is looking at this channel". Suppression is a
-//     presentation decision, and the only process with the facts (is the app
-//     foregrounded? is this channel on screen?) is the client. It makes that
-//     decision in app/src/lib/push.ts's notification handler, where being wrong
-//     costs a redundant banner rather than a message the user never learns about.
-//
-// # On who gets a push
-//
-// Exactly the audience that gets the notification row, and no separate gate.
-// Muted channels, notification_pref, blocks and self-exclusion are all decided
-// by the fan-out before this is reached, so there is no second audience query
-// here that could drift away from the first one.
-//
-// There is deliberately no per-user "push off" preference either. The schema
-// had one — user_preferences.notifications_push — but migration 009 dropped
-// that table as dead schema and nothing has read it since. The opt-outs that
-// exist and work are per-channel mute, the OS notification permission, and
-// deregistering the device (DELETE /users/me/devices/{token}), which is what
-// the client does on logout.
-func (s *Service) enqueuePush(ctx context.Context, n *Notification) {
-	if s.pusher == nil || s.devices == nil {
-		return
+// decodeMessage validates a message.created envelope and resolves its
+// workspace. It returns (nil, "", nil) for an envelope this consumer is not
+// interested in.
+func decodeMessage(msg *nats.Msg) (*MessageEvent, string, error) {
+	var envelope struct {
+		Type string          `json:"type"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(msg.Data, &envelope); err != nil {
+		return nil, "", &PermanentError{Reason: "malformed event envelope on " + msg.Subject, Err: err}
+	}
+	if envelope.Type != "message.new" {
+		return nil, "", nil
 	}
 
-	tokens, err := s.devices.PushTokensForUser(ctx, n.UserID)
+	var event MessageEvent
+	if err := json.Unmarshal(envelope.Data, &event); err != nil {
+		return nil, "", &PermanentError{Reason: "malformed message.new payload", Err: err}
+	}
+	// The message id is required, not just useful: it is what makes every event
+	// this fan-out produces identifiable, and therefore what makes a redelivery
+	// idempotent. Without it two different messages would derive the same event
+	// id and the second would silently vanish.
+	if event.ID == "" || event.ChannelID == "" || event.UserID == "" {
+		return nil, "", &PermanentError{Reason: "message.new event has no id, channel_id or user_id"}
+	}
+
+	workspaceID, err := workspaceFromSubject(msg.Subject)
 	if err != nil {
-		s.logger.Warn("notification: list device tokens", "error", err, "user_id", n.UserID)
-		return
+		return nil, "", err
 	}
-	if len(tokens) == 0 {
-		return
-	}
-
-	msgs := make([]push.Message, 0, len(tokens))
-	data := s.pushData(n)
-	badge := s.badgeFor(ctx, n.UserID)
-	for _, token := range tokens {
-		msgs = append(msgs, push.Message{
-			Token: token,
-			Title: n.Title,
-			Body:  n.Body,
-			Data:  data,
-			Badge: badge,
-		})
-	}
-	s.pusher.Enqueue(msgs)
-}
-
-// pushData is the payload the client receives on tap. It is the notification's
-// own data (channel_id, message_id) plus enough to identify the notification
-// itself, so the app can mark it read and route without a round trip.
-func (s *Service) pushData(n *Notification) map[string]string {
-	data := map[string]string{
-		"notification_id": n.ID,
-		"type":            string(n.Type),
-	}
-	var stored map[string]string
-	if err := json.Unmarshal([]byte(n.Data), &stored); err != nil {
-		// Non-fatal: the notification still arrives, it just cannot deep-link.
-		s.logger.Warn("notification: push payload is not an object", "error", err, "notification_id", n.ID)
-		return data
-	}
-	for k, v := range stored {
-		// The two synthesised keys win; a channel_id from the row is what we
-		// want, a "type" from it would shadow the notification type.
-		if _, taken := data[k]; !taken {
-			data[k] = v
-		}
-	}
-	return data
-}
-
-// badgeFor resolves the app-icon badge: the recipient's total unread
-// notification count, not a per-message increment. Setting it server-side is
-// what keeps the badge right while the app is not running at all — the client
-// can only correct it once it launches.
-//
-// A failure yields nil, which leaves the existing badge alone rather than
-// clearing it to zero.
-func (s *Service) badgeFor(ctx context.Context, userID string) *int {
-	count, err := s.repo.UnreadCount(ctx, userID)
-	if err != nil {
-		s.logger.Warn("notification: unread count for badge", "error", err, "user_id", userID)
-		return nil
-	}
-	return &count
+	return &event, workspaceID, nil
 }
 
 // newFanout resolves the author exclusion, the block list and the channel
@@ -678,45 +563,11 @@ func extractMentions(content string) []string {
 	return mentions
 }
 
-// marshalData renders the notification payload as JSON. It used to be built
-// with fmt.Sprintf and %q, which is Go quoting, not JSON escaping — it only
-// happened to survive because every interpolated value was a UUID.
-func marshalData(v map[string]string) (string, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-// truncate caps a preview at maxRunes runes.
-//
-// It must not slice by bytes: this deployment is Korean-language, so almost
-// every message over 140 bytes was being cut mid-rune, producing invalid UTF-8
-// that Postgres rejects on INSERT. createAndPush only logs that failure, so the
-// recipient silently received no notification at all.
-func truncate(s string, maxRunes int) string {
-	if maxRunes <= 0 {
-		return ""
-	}
-	if utf8.RuneCountInString(s) <= maxRunes {
-		return s
-	}
-	count := 0
-	for i := range s {
-		if count == maxRunes {
-			return s[:i] + "..."
-		}
-		count++
-	}
-	return s
-}
-
 // workspaceFromSubject pulls the workspace id out of superops.{workspace_id}.*.
 //
 // A subject without one cannot have come from any publisher in this tree, and
-// the realtime push would be addressed to "superops..notification.created" —
-// a subject nothing subscribes to. That is a permanently broken event, not a
+// the realtime push would be addressed to "superops..notification.created" — a
+// subject nothing subscribes to. That is a permanently broken event, not a
 // transient fault.
 func workspaceFromSubject(subject string) (string, error) {
 	parts := strings.Split(subject, ".")

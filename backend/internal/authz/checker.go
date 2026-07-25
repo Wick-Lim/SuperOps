@@ -887,7 +887,7 @@ func (c *Checker) Grant(ctx context.Context, actor, subject SubjectRef, obj Obje
 		}
 	}
 
-	return database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+	if err := database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
 		st, err := lockObject(ctx, tx, ref)
 		if err != nil {
 			return err
@@ -907,7 +907,13 @@ func (c *Checker) Grant(ctx context.Context, actor, subject SubjectRef, obj Obje
 			return fmt.Errorf("write grant: %w", err)
 		}
 		return rewriteSubtreeKeys(ctx, tx, st.path)
-	})
+	}); err != nil {
+		return err
+	}
+
+	c.audit(ctx, actor, "acl.granted", ref, &sub,
+		map[string]interface{}{"capability": string(capability)})
+	return nil
 }
 
 // Revoke removes an explicit grant. Revoking one that does not exist is not an
@@ -921,8 +927,6 @@ func (c *Checker) Grant(ctx context.Context, actor, subject SubjectRef, obj Obje
 // the subtree, so a subscription authorized before the revocation stops
 // delivering rather than surviving until its periodic recheck.
 func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj ObjectRef) error {
-	_ = actor // revocation records no attribution today; the row is deleted, not tombstoned
-
 	sub, ok, err := subject.normalize()
 	if err != nil {
 		return err
@@ -965,6 +969,7 @@ func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj Obj
 	}
 
 	c.revokeLive(&sub, live, truncated, "revoke "+sub.String()+" on "+ref.String())
+	c.audit(ctx, actor, "acl.revoked", ref, &sub, nil)
 	return nil
 }
 
@@ -985,8 +990,6 @@ func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj Obj
 // re-authorizes against the new position. That is the plan's revocation-latency
 // risk, closed.
 func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent ObjectRef) error {
-	_ = actor // the move itself is not attributed; internal/audit records the action
-
 	ref, ok, err := obj.normalize()
 	if err != nil {
 		return err
@@ -1072,6 +1075,8 @@ func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent Obj
 	}
 
 	c.revokeLive(nil, live, truncated, "move "+ref.String()+" under "+parentRef.String())
+	c.audit(ctx, actor, "acl.moved", ref, nil,
+		map[string]interface{}{"new_parent_type": string(parentRef.Type), "new_parent_id": parentRef.ID})
 	return nil
 }
 

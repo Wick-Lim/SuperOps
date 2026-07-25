@@ -41,10 +41,12 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/app"
+	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
+	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
@@ -63,6 +65,10 @@ const (
 	jobRetention      = "retention"
 	jobObjectGC       = "object_gc"
 	jobACLDrift       = "acl_drift"
+	jobInboxDigest    = "inbox_digest"
+	jobInboxReconcile = "inbox_reconcile"
+	jobAuditPartition = "audit_partitions"
+	jobAuditVerify    = "audit_verify"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -76,6 +82,16 @@ const (
 	objectGCStartDelay     = 5 * time.Minute
 	aclDriftInterval       = time.Hour
 	aclDriftStartDelay     = 3 * time.Minute
+	inboxDigestInterval    = 5 * time.Minute
+	inboxDigestStartDelay  = 90 * time.Second
+	inboxReconcileInterval = 15 * time.Minute
+	inboxReconcileDelay    = 4 * time.Minute
+	// Hourly, and the lead time is two months, so a run that is missed — or a
+	// worker that is down for a week — cannot reach a month with no partition.
+	auditPartitionInterval = time.Hour
+	auditPartitionDelay    = 30 * time.Second
+	auditVerifyInterval    = 30 * time.Minute
+	auditVerifyStartDelay  = 6 * time.Minute
 )
 
 // Advisory-lock keys. Distinct 64-bit constants; any other application taking
@@ -85,6 +101,13 @@ const (
 	lockRetention      int64 = 0x50_0002
 	lockObjectGC       int64 = 0x50_0003
 	lockACLDrift       int64 = 0x50_0004
+	// 0x50_0004 was already taken by acl_drift when plan 01 was written, which
+	// allocated it to inbox_digest. These take the next free values instead;
+	// two jobs sharing an advisory lock would silently serialise them.
+	lockInboxDigest    int64 = 0x50_0005
+	lockInboxReconcile int64 = 0x50_0006
+	lockAuditPartition int64 = 0x50_0007
+	lockAuditVerify    int64 = 0x50_0008
 )
 
 // aclDriftSamples bounds how many concrete disagreements one drift report
@@ -228,10 +251,24 @@ func run() int {
 	// where notifications are created; the API never sees the fan-out.
 	devices, pusher, pushDispatcher := buildPush(cfg, pool, l)
 
-	notifSvc := notification.NewService(notification.NewRepository(pool), pool, az, natsClient, devices, pusher, l)
+	// The unified inbox. internal/notification is now only the MESSAGE-DOMAIN
+	// producer — DM roster, mention extraction, thread parent, block list,
+	// channel mute — and hands every event to this notifier, which owns the
+	// coalescing, the idempotency gate, the badge and the preferences for every
+	// pillar (docs/plans/README.md "Resolved conflicts" §1).
+	inboxRepo := inbox.NewRepository(pool)
+	notifier := inbox.NewNotifier(inboxRepo, natsClient, devices, pusher, l)
+
+	notifSvc := notification.NewService(pool, az, notifier, l)
 	bind(durableSpec{durable: "notifier-message", filter: "superops.*.message.created", handle: notifSvc.HandleMessage})
 	bind(durableSpec{durable: "notifier-reaction", filter: "superops.*.reaction.added", handle: notifSvc.HandleReaction})
 	bind(durableSpec{durable: "notifier-channel-invite", filter: "superops.*.channel.member_added", handle: notifSvc.HandleChannelMemberAdded})
+
+	// The pillar-neutral entry point. A pillar that wants to file into the inbox
+	// publishes superops.{ws}.inbox.requested with a kind and an explicit
+	// recipient list; this one durable serves all of them, so adding a pillar
+	// costs zero durables and zero lines in this file.
+	bind(durableSpec{durable: inbox.DurableFanout, filter: inbox.FilterRequested, handle: notifier.HandleRequested})
 
 	// Unread badges. Deliberately a separate durable from notifier-message
 	// rather than another branch inside it: they have different audiences (a
@@ -293,6 +330,60 @@ func run() int {
 	start(jobACLDrift, aclDriftStartDelay, aclDriftInterval, func(c context.Context) error {
 		return runACLDrift(c, pool, az, l)
 	})
+
+	// --- unified inbox jobs ---------------------------------------------------
+
+	// The digest renders IN THE WORKER, before queueing. mail.Request carries a
+	// fully rendered Message so the mail consumer needs no database access; a
+	// digest has to aggregate at send time, which looks like a violation and is
+	// not — the digest JOB aggregates and hands the consumer a finished message,
+	// so "nothing unrendered goes on the mail queue" still holds.
+	mailRenderer, err := app.NewMailRenderer(cfg)
+	if err != nil {
+		l.Error("mail renderer unavailable; refusing to start with a digest job that cannot render", "error", err)
+		return 1
+	}
+	digester := inbox.NewDigester(inboxRepo, mailRenderer, mail.NewPublisher(natsClient, l), inbox.DigestConfig{
+		QuietPeriod: cfg.Inbox.DigestQuietPeriod,
+		MinInterval: cfg.Inbox.DigestMinInterval,
+	}, l)
+	start(jobInboxDigest, inboxDigestStartDelay, inboxDigestInterval, func(c context.Context) error {
+		return runInboxDigest(c, pool, digester, l)
+	})
+
+	reconciler := inbox.NewReconciler(inboxRepo, l)
+	start(jobInboxReconcile, inboxReconcileDelay, inboxReconcileInterval, func(c context.Context) error {
+		return runInboxReconcile(c, pool, reconciler, l)
+	})
+
+	// --- audit jobs -----------------------------------------------------------
+
+	// A missing partition is a failed INSERT, i.e. a LOST AUDIT RECORD, so this
+	// job's failure has to be loud: runLoop records it in /health's last_error,
+	// which is the only place an operator would otherwise learn about it.
+	start(jobAuditPartition, auditPartitionDelay, auditPartitionInterval, func(c context.Context) error {
+		return runAuditPartitions(c, pool, cfg.Audit.RetentionDays, l)
+	})
+
+	auditSink, err := audit.NewSink(audit.SinkConfig{
+		Transport: cfg.Audit.Sink,
+		Path:      cfg.Audit.SinkPath,
+		Endpoint:  cfg.Audit.SinkEndpoint,
+		Secret:    cfg.Audit.SinkSecret,
+		Timeout:   cfg.Audit.SinkTimeout,
+		Logger:    l,
+	})
+	if err != nil {
+		// The same §3c rule the API follows: a transport named without its
+		// credentials is a boot failure, not a first-use failure.
+		l.Error("audit sink unavailable; refusing to start with a chain nothing will anchor", "error", err)
+		return 1
+	}
+	verifier := audit.NewVerifier(pool, auditSink, l)
+	start(jobAuditVerify, auditVerifyStartDelay, auditVerifyInterval, func(c context.Context) error {
+		return runAuditVerify(c, pool, verifier, l)
+	})
+	l.Info("audit anchoring ready", "sink", auditSink.Name())
 
 	if storage := openStorage(cfg, l); storage != nil {
 		fileRepo := file.NewRepository(pool)
@@ -432,7 +523,7 @@ func buildPush(
 	cfg *app.Config,
 	pool *pgxpool.Pool,
 	l *slog.Logger,
-) (notification.DeviceTokenLister, notification.Pusher, *push.Dispatcher) {
+) (inbox.DeviceTokenLister, inbox.Pusher, *push.Dispatcher) {
 	if !cfg.Push.IsEnabled() {
 		l.Info("push notifications disabled by configuration (PUSH_ENABLED)")
 		return nil, nil, nil
@@ -1177,6 +1268,127 @@ func runACLDrift(ctx context.Context, pool *pgxpool.Pool, az *authz.Checker, l *
 			"kind", s.Kind, "object_type", s.ObjectType, "object_id", s.ObjectID, "detail", s.Detail)
 	}
 	return errors.New(report.String())
+}
+
+// --- unified inbox ---------------------------------------------------------------
+
+// runInboxDigest batches unread items into one email per (user, workspace).
+//
+// Advisory-locked so one replica runs it: two replicas selecting the same
+// candidates would both claim and both send, which is the exact failure the
+// claim-then-send ordering inside Digester.Run exists to make impossible for a
+// single runner.
+func runInboxDigest(ctx context.Context, pool *pgxpool.Pool, d *inbox.Digester, l *slog.Logger) error {
+	var sent int
+	ran, err := withSingletonLock(ctx, pool, lockInboxDigest, func(ctx context.Context) error {
+		var err error
+		sent, err = d.Run(ctx)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if !ran {
+		l.Debug("inbox digest skipped: another replica holds the lock")
+		return nil
+	}
+	if sent > 0 {
+		l.Info("inbox digest: queued", "messages", sent)
+	}
+	return nil
+}
+
+// runInboxReconcile recomputes a rotating slice of users' inbox counters from
+// inbox_events, repairs what disagrees and reports it.
+//
+// It returns the drift as an error so runLoop records it in /health's
+// last_error, exactly as runACLDrift does — and, exactly as runACLDrift does, it
+// deliberately does NOT fail the readiness probe. Restarting the worker repairs
+// nothing here, and a counter that was wrong for fifteen minutes is a wrong
+// answer to a question the user asked, not an outage.
+func runInboxReconcile(ctx context.Context, pool *pgxpool.Pool, r *inbox.Reconciler, l *slog.Logger) error {
+	var reconcileErr error
+	ran, err := withSingletonLock(ctx, pool, lockInboxReconcile, func(ctx context.Context) error {
+		reconcileErr = r.Run(ctx)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !ran {
+		l.Debug("inbox reconcile skipped: another replica holds the lock")
+		return nil
+	}
+	return reconcileErr
+}
+
+// --- audit -----------------------------------------------------------------------
+
+// runAuditPartitions keeps the monthly partition window ahead of NOW() and drops
+// the ones that have aged out of AUDIT_RETENTION_DAYS.
+//
+// This is where audit retention differs from message retention, and the
+// difference is the whole point of migration 021. runRetention above is batched,
+// capped and locked because an unbounded DELETE on a large table was a
+// production problem. Here retention is a DROP TABLE: milliseconds, no locks
+// held over user rows, disk returned immediately.
+func runAuditPartitions(ctx context.Context, pool *pgxpool.Pool, retentionDays int, l *slog.Logger) error {
+	ran, err := withSingletonLock(ctx, pool, lockAuditPartition, func(ctx context.Context) error {
+		return audit.RunPartitions(ctx, pool, retentionDays, l)
+	})
+	if err != nil {
+		return fmt.Errorf("audit partitions: %w", err)
+	}
+	if !ran {
+		l.Debug("audit partition maintenance skipped: another replica holds the lock")
+	}
+	return nil
+}
+
+// runAuditVerify walks each workspace's hash chain and ships the head of every
+// clean one off-box.
+//
+// A break is reported here, logged at ERROR by the verifier, and surfaced on
+// /health through this function's return value. It is deliberately never a 500
+// on a user-facing route: a corrupted audit log must not be a denial of service,
+// or corrupting it becomes an attack rather than something an attack leaves
+// behind.
+func runAuditVerify(ctx context.Context, pool *pgxpool.Pool, v *audit.Verifier, l *slog.Logger) error {
+	var statuses []audit.ChainStatus
+	var anchorErr error
+	ran, err := withSingletonLock(ctx, pool, lockAuditVerify, func(ctx context.Context) error {
+		statuses, anchorErr = v.Anchor(ctx)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !ran {
+		l.Debug("audit verify skipped: another replica holds the lock")
+		return nil
+	}
+	if anchorErr != nil {
+		return anchorErr
+	}
+
+	broken := 0
+	unanchored := int64(0)
+	for _, st := range statuses {
+		if !st.OK {
+			broken++
+		}
+		unanchored += st.HeadSeq - st.AnchoredSeq
+	}
+	if broken > 0 {
+		return fmt.Errorf("audit: %d of %d workspace chains failed verification", broken, len(statuses))
+	}
+	if unanchored > 0 {
+		// Not an error: the sink may simply be slower than the write rate. It is
+		// the number that says how much of the log is protected by nothing but a
+		// chain in the same database an administrator can rewrite.
+		l.Info("audit chains verified", "workspaces", len(statuses), "entries_not_yet_anchored", unanchored)
+	}
+	return nil
 }
 
 // --- orphaned object GC --------------------------------------------------------

@@ -1,6 +1,7 @@
 package file
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
@@ -34,14 +36,22 @@ const (
 	sniffLen = 512
 )
 
+// Auditor records egress. *audit.Service is the implementation; the interface
+// keeps this package from importing it for one method and makes "nil means no
+// auditing" a compile-time-visible choice rather than a config lookup.
+type Auditor interface {
+	Buffer(ctx context.Context, e audit.Entry)
+}
+
 type Handler struct {
 	storage *Storage
 	pool    *pgxpool.Pool
 	authz   *authz.Checker
+	audit   Auditor
 }
 
-func NewHandler(storage *Storage, pool *pgxpool.Pool, az *authz.Checker) *Handler {
-	return &Handler{storage: storage, pool: pool, authz: az}
+func NewHandler(storage *Storage, pool *pgxpool.Pool, az *authz.Checker, auditor Auditor) *Handler {
+	return &Handler{storage: storage, pool: pool, authz: az, audit: auditor}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -294,6 +304,32 @@ func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer reader.Close()
+
+	// Egress. This is the category an auditor actually asks about and the one
+	// that had no coverage at all before plan 01.
+	//
+	// Buffered (Tier 2), because a synchronous INSERT here is a latency
+	// regression on a content path. Coalesced, because fifty downloads of one
+	// file in an afternoon is one fact with a count, not fifty rows — and that
+	// single decision is most of what keeps audit_logs smaller than `messages`.
+	// It is recorded AFTER the authorization check and BEFORE the bytes go out,
+	// so a download that fails mid-stream is still recorded as attempted.
+	if h.audit != nil {
+		h.audit.Buffer(r.Context(), audit.Entry{
+			WorkspaceID:  f.WorkspaceID,
+			ActorID:      userID,
+			Action:       audit.ActionFileDownloaded,
+			ResourceType: "file",
+			ResourceID:   f.ID,
+			Metadata: map[string]interface{}{
+				// The name and size, never the contents. metadata carries no
+				// content, ever: it lives in an append-only table with a
+				// 365-day retention and no redaction path.
+				"name": f.Name, "content_type": f.ContentType,
+			},
+			Coalesce: true,
+		})
+	}
 
 	// Serve the type we sniffed at upload time, never the one MinIO echoes back
 	// from the original request, and never without nosniff.

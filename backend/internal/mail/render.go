@@ -34,6 +34,14 @@ var templateFS embed.FS
 const (
 	KindInvitation = "invitation"
 	KindConfigTest = "config_test"
+	// KindDigest is the unified inbox's batched summary. Unlike the other two it
+	// is rendered in the WORKER, by the inbox_digest job, rather than in an HTTP
+	// handler — a digest has to aggregate at send time. That looks like a
+	// violation of Request's "fully rendered, the consumer needs no database"
+	// rule and is not: the digest JOB does the aggregating and hands the mail
+	// consumer a finished Message, so the invariant "nothing unrendered goes on
+	// the mail queue" still holds.
+	KindDigest = "digest"
 )
 
 // layoutFile is parsed alongside every HTML template and supplies "layout".
@@ -150,6 +158,31 @@ type InvitationData struct {
 	ExpiresAt  time.Time
 }
 
+// DigestData is the unified inbox digest's view model.
+//
+// Titles, counts and deep links — deliberately NOT message bodies. A digest sits
+// in an external mailbox forever and access can be revoked between the moment it
+// is claimed and the moment it is delivered, so quoting content the recipient
+// may no longer be allowed to read is the one thing this message must not do.
+// DigestItem.Preview is empty for any item whose subject is a private channel;
+// see internal/inbox's digest job.
+type DigestData struct {
+	UserName      string
+	WorkspaceName string
+	TotalUnread   int
+	Items         []DigestItem
+}
+
+// DigestItem is one line of a digest.
+type DigestItem struct {
+	Title       string
+	Preview     string
+	UnreadCount int
+	// Link is a path, not a URL. templateData.URL makes it absolute; a caller
+	// must not pre-join the origin itself.
+	Link string
+}
+
 // ConfigTestData is the admin verification message's view model.
 type ConfigTestData struct {
 	Transport   string
@@ -169,6 +202,10 @@ func (r *Renderer) ConfigTest(to Address, d ConfigTestData) (*Message, error) {
 //
 // Every failure is permanent: a template that does not execute against its data
 // will not execute against the same data a minute later.
+func (r *Renderer) Digest(to Address, d DigestData) (*Message, error) {
+	return r.Render(KindDigest, []Address{to}, d)
+}
+
 func (r *Renderer) Render(kind string, to []Address, data any) (*Message, error) {
 	subjectTmpl, ok := r.subject[kind]
 	if !ok {

@@ -50,8 +50,14 @@ var (
 type suite struct {
 	pool *pgxpool.Pool
 	h    *Handler
-	f    *fixture
-	mail *fakeMailQueue
+	// auditH serves GET /api/v1/admin/audit-logs. The query moved to
+	// internal/audit (the package that owns the table owns the query) but the
+	// path, the middleware and the workspace scoping are unchanged — which is
+	// exactly what the scoping tests below assert, so they are still driven from
+	// here rather than being duplicated into two packages.
+	auditH *audit.Handler
+	f      *fixture
+	mail   *fakeMailQueue
 }
 
 // fakeMailQueue records what the handler tried to send, so the invitation tests
@@ -105,7 +111,14 @@ func setup(t *testing.T) *suite {
 		Renderer:  renderer,
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	return &suite{pool: pool, h: NewHandler(pool, auditSvc, authz.New(pool), deps), f: fix, mail: queue}
+	az := authz.New(pool)
+	return &suite{
+		pool:   pool,
+		h:      NewHandler(pool, auditSvc, az, deps),
+		auditH: audit.NewHandler(pool, auditSvc, az, nil),
+		f:      fix,
+		mail:   queue,
+	}
 }
 
 func buildFixture(ctx context.Context, pool *pgxpool.Pool) (*fixture, error) {
@@ -205,6 +218,7 @@ func (e *suite) do(t *testing.T, method, path, actor string, body any) (int, env
 	// what is under test here is the handler's own authorization, which is the
 	// same either way.
 	e.h.RegisterMailRoutes(mux, authMw)
+	e.auditH.RegisterRoutes(mux, authMw)
 
 	var rdr io.Reader
 	if body != nil {

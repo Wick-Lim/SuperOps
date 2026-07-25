@@ -129,6 +129,46 @@ data:
   SSO_JWKS_CACHE_TTL: {{ $sso.jwksCacheTTL | default "1h" | quote }}
   SSO_CLOCK_SKEW: {{ $sso.clockSkew | default "2m" | quote }}
   {{- end }}
+  {{- /*
+  Unified inbox digest. Both windows are deployment policy: a support team wants
+  a tighter loop than a company that mails once a day.
+  */ -}}
+  {{- $inbox := .Values.inbox | default dict }}
+  INBOX_DIGEST_QUIET_PERIOD: {{ $inbox.digestQuietPeriod | default "10m" | quote }}
+  INBOX_DIGEST_MIN_INTERVAL: {{ $inbox.digestMinInterval | default "1h" | quote }}
+  {{- /*
+  Audit. AUDIT_SINK_SECRET is in the Secret template, never here — an anchor the
+  receiver cannot authenticate is one anybody can forge, so that HMAC key is a
+  credential.
+
+  The chain is tamper-EVIDENT, not tamper-proof, and only for the entries at or
+  below anchored_seq. See values.yaml and
+  GET /api/v1/admin/audit-logs/verify.
+  */ -}}
+  {{- $audit := .Values.audit | default dict }}
+  {{- $sink := $audit.sink | default "log" }}
+  AUDIT_RETENTION_DAYS: {{ $audit.retentionDays | default 365 | toString | quote }}
+  AUDIT_SINK: {{ $sink | quote }}
+  AUDIT_SINK_TIMEOUT: {{ $audit.sinkTimeout | default "10s" | quote }}
+  AUDIT_EXPORT_PER_MIN: {{ $audit.exportPerMinute | default 6 | toString | quote }}
+  {{- if eq $sink "file" }}
+  AUDIT_SINK_PATH: {{ required "audit.sinkPath is required when audit.sink is \"file\" — and it only anchors anything if that path is on a volume the application cannot rewrite" $audit.sinkPath | quote }}
+  {{- end }}
+  {{- if eq $sink "http" }}
+  AUDIT_SINK_ENDPOINT: {{ required "audit.sinkEndpoint is required when audit.sink is \"http\"" $audit.sinkEndpoint | quote }}
+  {{- if not $audit.sinkSecret }}
+  {{- fail "audit.sinkSecret is required when audit.sink is \"http\": an anchor the receiver cannot authenticate is an anchor anybody can forge" }}
+  {{- end }}
+  {{- end }}
+  {{- if $audit.bufferSize }}
+  AUDIT_BUFFER_SIZE: {{ $audit.bufferSize | toString | quote }}
+  {{- end }}
+  {{- if $audit.bufferWorkers }}
+  AUDIT_BUFFER_WORKERS: {{ $audit.bufferWorkers | toString | quote }}
+  {{- end }}
+  {{- if or (hasKey (.Values.backend.env | default dict) "AUDIT_SINK_SECRET") (hasKey (.Values.backend.extraEnv | default dict) "AUDIT_SINK_SECRET") }}
+  {{- fail "AUDIT_SINK_SECRET must be given as audit.sinkSecret, which renders into the release Secret. backend.env / backend.extraEnv render into this ConfigMap, which anything with get/list on the namespace can read" }}
+  {{- end }}
   {{- range $k, $v := .Values.backend.env }}
   {{- /* Keys this template emits itself; a passthrough copy would be a
   duplicate map key in the rendered ConfigMap. Use `push.*` / `mail.*` for
@@ -139,7 +179,10 @@ data:
       "MAIL_SMTP_USERNAME" "MAIL_SMTP_HELO" "MAIL_DIRECT_HELO" "MAIL_DIRECT_PORT" "MAIL_DKIM_DOMAIN" "MAIL_DKIM_SELECTOR"
       "MAIL_RESEND_ENDPOINT"
       "SSO_ALLOW_INSECURE_ISSUER" "SSO_HTTP_TIMEOUT" "SSO_AUTH_REQUEST_TTL" "SSO_PENDING_TTL" "SSO_JWKS_CACHE_TTL"
-      "SSO_CLOCK_SKEW")) }}
+      "SSO_CLOCK_SKEW"
+      "INBOX_DIGEST_QUIET_PERIOD" "INBOX_DIGEST_MIN_INTERVAL"
+      "AUDIT_RETENTION_DAYS" "AUDIT_SINK" "AUDIT_SINK_PATH" "AUDIT_SINK_ENDPOINT" "AUDIT_SINK_TIMEOUT"
+      "AUDIT_EXPORT_PER_MIN" "AUDIT_BUFFER_SIZE" "AUDIT_BUFFER_WORKERS")) }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}
   {{- end }}

@@ -28,6 +28,8 @@ type Config struct {
 	Push         PushConfig
 	Mail         MailConfig
 	SSO          SSOConfig
+	Inbox        InboxConfig
+	Audit        AuditConfig
 	MetricsToken string // METRICS_TOKEN — if set, GET /metrics requires this bearer token
 	LogLevel     string
 }
@@ -296,6 +298,49 @@ type PushConfig struct {
 // for symmetry with MinIOConfig/MeiliConfig, so no caller tests the raw field.
 func (c PushConfig) IsEnabled() bool { return c.Enabled }
 
+// InboxConfig tunes the unified inbox's batched email digest. Both windows are
+// deployment policy rather than product design: a support team wants a tighter
+// loop than a company that mails once a day.
+type InboxConfig struct {
+	// DigestQuietPeriod is how long an item must sit untouched before it is
+	// mailable. It is what collapses a burst — an item still receiving events is
+	// pushed back out of the window on every new event.
+	DigestQuietPeriod time.Duration
+	// DigestMinInterval is the hard ceiling on mail volume per person per
+	// workspace, and it also gates email='immediate' so choosing that cannot
+	// exceed the digest's budget.
+	DigestMinInterval time.Duration
+}
+
+// AuditConfig covers retention and off-box anchoring.
+//
+// The Sink is a §3c deployment-dependent capability: one interface, transport by
+// configuration, validated at boot, safe default. See internal/audit/sink.go for
+// why the default ('log') is useful rather than a placeholder and why an `s3`
+// transport was cut.
+type AuditConfig struct {
+	// RetentionDays is deployment-wide. Enforced by DROPPING PARTITIONS, not by
+	// a batched DELETE. Zero disables retention.
+	RetentionDays int
+
+	// Sink is one of audit.SinkLog (default), audit.SinkFile, audit.SinkHTTP.
+	Sink         string
+	SinkPath     string // AUDIT_SINK=file
+	SinkEndpoint string // AUDIT_SINK=http
+	SinkSecret   string // AUDIT_SINK=http — HMAC key; required, see sink.go
+	SinkTimeout  time.Duration
+
+	// BufferSize and BufferWorkers size the Tier 2 queue (egress and sensitive
+	// reads). Zero means the audit package's defaults.
+	BufferSize    int
+	BufferWorkers int
+
+	// ExportPerMinute is the per-IP budget for GET /admin/audit-logs/export and
+	// POST /admin/audit-sink/test. Both are one-request-a-lot-of-consequence
+	// endpoints, which is the same argument MAIL_TEST_PER_MIN makes.
+	ExportPerMinute int
+}
+
 type MeiliConfig struct {
 	Enabled   bool
 	Host      string
@@ -451,6 +496,21 @@ func LoadConfig() (*Config, error) {
 			JWKSCacheTTL:        e.duration("SSO_JWKS_CACHE_TTL", time.Hour),
 			ClockSkew:           e.duration("SSO_CLOCK_SKEW", 2*time.Minute),
 		},
+		Inbox: InboxConfig{
+			DigestQuietPeriod: e.duration("INBOX_DIGEST_QUIET_PERIOD", 10*time.Minute),
+			DigestMinInterval: e.duration("INBOX_DIGEST_MIN_INTERVAL", time.Hour),
+		},
+		Audit: AuditConfig{
+			RetentionDays:   e.int("AUDIT_RETENTION_DAYS", 365),
+			Sink:            strings.ToLower(strings.TrimSpace(e.str("AUDIT_SINK", "log"))),
+			SinkPath:        e.str("AUDIT_SINK_PATH", ""),
+			SinkEndpoint:    e.str("AUDIT_SINK_ENDPOINT", ""),
+			SinkSecret:      e.str("AUDIT_SINK_SECRET", ""),
+			SinkTimeout:     e.duration("AUDIT_SINK_TIMEOUT", 10*time.Second),
+			BufferSize:      e.int("AUDIT_BUFFER_SIZE", 0),
+			BufferWorkers:   e.int("AUDIT_BUFFER_WORKERS", 0),
+			ExportPerMinute: e.int("AUDIT_EXPORT_PER_MIN", 6),
+		},
 		MetricsToken: e.str("METRICS_TOKEN", ""),
 		LogLevel:     e.str("LOG_LEVEL", "info"),
 	}
@@ -526,6 +586,28 @@ func (c *Config) validate() error {
 		if c.Push.Workers < 0 {
 			errs = append(errs, fmt.Errorf("PUSH_WORKERS must not be negative (got %d)", c.Push.Workers))
 		}
+	}
+
+	if c.Inbox.DigestQuietPeriod <= 0 {
+		errs = append(errs, fmt.Errorf("INBOX_DIGEST_QUIET_PERIOD must be positive (got %s)", c.Inbox.DigestQuietPeriod))
+	}
+	if c.Inbox.DigestMinInterval <= 0 {
+		errs = append(errs, fmt.Errorf("INBOX_DIGEST_MIN_INTERVAL must be positive (got %s)", c.Inbox.DigestMinInterval))
+	}
+	if c.Audit.RetentionDays < 0 {
+		errs = append(errs, fmt.Errorf("AUDIT_RETENTION_DAYS must not be negative (got %d)", c.Audit.RetentionDays))
+	}
+	if c.Audit.ExportPerMinute <= 0 {
+		errs = append(errs, fmt.Errorf("AUDIT_EXPORT_PER_MIN must be positive (got %d)", c.Audit.ExportPerMinute))
+	}
+	// The sink itself is validated by audit.NewSink, which both binaries call at
+	// boot: a transport named without its credentials is a boot failure, not a
+	// first-use failure. Only the enum is checked here, so a typo is reported
+	// alongside every other malformed variable instead of on its own.
+	switch c.Audit.Sink {
+	case "", "log", "file", "http":
+	default:
+		errs = append(errs, fmt.Errorf("AUDIT_SINK must be one of \"log\", \"file\", \"http\" (got %q)", c.Audit.Sink))
 	}
 
 	errs = append(errs, c.Mail.validate()...)

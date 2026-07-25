@@ -422,3 +422,79 @@ search:
 externalMeilisearch:
   host: ""       # e.g. http://meilisearch.search.svc.cluster.local:7700
   masterKey: ""
+
+# --- Unified inbox -----------------------------------------------------------
+# One "what needs my attention" list across every pillar, coalesced per subject.
+# The only tuning it has is the digest's two windows; everything else about it is
+# per-user preference (PUT /api/v1/notification-prefs) rather than deployment
+# configuration.
+inbox:
+  # How long an item must sit untouched before it is eligible for a digest. This
+  # is what collapses a burst: any new event resets the item's clock and pushes
+  # it back out of the window, so forty mentions in one channel become one line
+  # in one email rather than forty emails.
+  digestQuietPeriod: 10m
+  # Hard ceiling on digest volume per person per workspace. A user who chooses
+  # email="immediate" for a notification kind is gated by the same counter, so
+  # that choice cannot exceed this budget.
+  digestMinInterval: 1h
+
+# --- Audit -------------------------------------------------------------------
+audit:
+  # Deployment-wide retention, enforced by DROPPING monthly partitions rather
+  # than by a batched DELETE (migration 021). 0 disables retention.
+  #
+  # There is deliberately no per-workspace setting: rows with different lifetimes
+  # sharing a partition would turn the DROP back into the DELETE this design
+  # exists to avoid. A self-hosted company's retention policy is a property of
+  # the company.
+  retentionDays: 365
+
+  # Off-box anchoring of the per-workspace audit hash chain.
+  #
+  # READ THIS BEFORE RELYING ON TAMPER-EVIDENCE. The chain lives in the same
+  # database as the rows it protects, so anyone who can UPDATE audit_logs can
+  # recompute the whole chain. It becomes meaningful only for the entries whose
+  # head has been shipped somewhere that person cannot rewrite.
+  # GET /api/v1/admin/audit-logs/verify reports head_seq and anchored_seq per
+  # workspace; everything ABOVE anchored_seq is protected by nothing but a chain
+  # in a database an administrator can edit.
+  #
+  #   log   (default) — writes the anchor to the pod's log. A real anchor in any
+  #                     cluster whose log pipeline already ships off-cluster,
+  #                     which is most of them. If yours does not, this is not an
+  #                     anchor and you should say so out loud rather than
+  #                     assuming otherwise.
+  #   file            — appends NDJSON to sinkPath. Meaningful only if that path
+  #                     is a volume the application cannot rewrite; mount it
+  #                     read-only-after-write or on WORM storage, or it is the
+  #                     log transport with extra steps.
+  #   http            — POSTs to sinkEndpoint, HMAC-SHA256 signed with
+  #                     sinkSecret in X-SuperOps-Signature. sinkSecret is
+  #                     REQUIRED and renders into the release Secret.
+  #
+  # A transport named without its credentials FAILS THE BOOT of both the backend
+  # and the worker, rather than failing quietly the first time a chain needed
+  # anchoring.
+  sink: log
+  # sinkPath: /var/log/superops/audit-anchors.ndjson
+  # sinkEndpoint: https://siem.example.com/superops/anchors
+  # sinkSecret: ""  # -> Secret, when sink is "http"
+  sinkTimeout: 10s
+
+  # Per-IP budget for GET /admin/audit-logs/export and
+  # POST /admin/audit-sink/test. The export is one request that can return a lot
+  # of rows — the highest-value single request in the product — so it carries its
+  # own limit rather than the general API's 600/min.
+  exportPerMinute: 6
+
+  # Tier 2 buffer (file downloads, sensitive reads), off the request's critical
+  # path. Empty uses the built-in defaults (4096 deep, 2 workers).
+  #
+  # A full buffer DROPS — counted, logged, and exported on /metrics as
+  # superops_audit_dropped_total. ALERT ON IT. The buffer fills exactly when the
+  # load is interesting, and silently dropping audit records during an incident
+  # is the failure that makes the whole surface worthless. Tier 1 (authentication,
+  # authorization changes, sharing, configuration) never touches this queue.
+  # bufferSize: 4096
+  # bufferWorkers: 2

@@ -23,13 +23,18 @@ A React Native (Expo) client for **iOS, Android and the web**, and a Go backend 
 - Per-channel unread counts and read tracking
 - Mobile push notifications via Expo (opt-in; needs your own APNs/FCM credentials — see [Push notifications](#push-notifications))
 - User blocking, custom emoji, incoming webhooks
+- **Unified inbox** — one "what needs my attention" list across every product area, coalesced per
+  subject (forty mentions in one channel are one row saying 40), three states (unread/read/done),
+  per-kind delivery preferences, and a batched email digest
 
 **Administration**
 - Admin dashboard (stats, user management, audit logs, invitations) — every endpoint scoped to the workspaces you administer
 - Role-based access control (owner/admin/member/guest)
 - TOTP two-factor authentication with single-use backup codes
 - Redis sliding-window rate limiting
-- Audit logging
+- Audit logging: two-tier writes, hourly coalescing of repeat reads, monthly partitions with
+  DROP-based retention, a per-workspace hash chain and off-box anchoring — see
+  [Audit trust boundary](#audit-trust-boundary) for what that does and does not prove
 
 **Infrastructure**
 - Horizontal scaling with a NATS-bridged WebSocket hub — no sticky sessions
@@ -237,10 +242,12 @@ Request bodies reject unknown fields.
 | **Typing** | `GET /channels/{id}/typing` |
 | **Files** | `POST /files/upload` (multipart), `GET/DELETE /files/{id}` |
 | **Search** | `GET /workspaces/{id}/search?q=&channel=&from=` |
-| **Notifications** | `GET /notifications`, `PUT .../{id}/read`, `/read-all`, `GET .../unread-count` |
+| **Inbox** | `GET /inbox`, `GET /inbox/count`, `GET /inbox/{id}/events`, `PUT /inbox/{id}/read\|unread\|done\|undone`, `POST /inbox/read-all`, `GET/PUT /notification-prefs` |
+| **Notifications** (compat) | `GET /notifications`, `PUT .../{id}/read`, `/read-all`, `GET .../unread-count` — projections of the inbox, kept for the shipped RN client |
 | **Blocks / Emoji** | `GET/POST /blocks`, `DELETE /blocks/{blocked_id}`, `GET/POST /workspaces/{id}/emojis`, `DELETE .../emojis/{emoji_id}` |
 | **Webhooks** | `POST/GET /webhooks`, `PATCH/DELETE /webhooks/{id}`, `PUT /webhooks/{id}/token` (rotate), `POST /webhooks/incoming` |
-| **Admin** | `GET /admin/stats`, `/admin/users`, `PATCH /admin/users/{id}`, `GET /admin/audit-logs`, `GET/POST /admin/invitations` |
+| **Admin** | `GET /admin/stats`, `/admin/users`, `PATCH /admin/users/{id}`, `GET/POST /admin/invitations` |
+| **Audit** | `GET /admin/audit-logs` (filters: `actor_id`, `action` — trailing `.` is a prefix match — `resource_type`, `resource_id`, `from`, `to`), `GET /admin/audit-logs/export` (NDJSON), `GET /admin/audit-logs/verify`, `POST /admin/audit-sink/test` |
 | **WebSocket** | `GET /api/v1/ws?token={jwt}` |
 | **Ops** | `GET /health` (liveness, no dependencies), `GET /ready` (Postgres/Redis/NATS), `GET /metrics` |
 
@@ -289,10 +296,66 @@ defaults. Notes that bite:
   a multi-host DSN or `target_session_attrs`.
 - `METRICS_TOKEN` guards `/metrics`; if you set it, add a matching
   `authorization` block to `deploy/docker/prometheus.yml` or scrapes will 401.
+- `AUDIT_SINK` (`log` / `file` / `http`) chooses where audit chain anchors are shipped. A transport
+  named without its credentials is a **boot failure** on both the backend and the worker. See
+  [Audit trust boundary](#audit-trust-boundary).
+- `AUDIT_RETENTION_DAYS` (default 365) is deployment-wide and enforced by **dropping monthly
+  partitions**. `0` disables retention.
+- `INBOX_DIGEST_QUIET_PERIOD` / `INBOX_DIGEST_MIN_INTERVAL` tune the inbox email digest.
+- **Alert on `superops_audit_dropped_total`.** The Tier 2 audit buffer drops under pressure, by
+  design and counted — and it fills exactly when the load is interesting.
 
 Client configuration: `EXPO_PUBLIC_API_URL` (and optionally
 `EXPO_PUBLIC_WS_URL`, `EXPO_PUBLIC_EXPO_PROJECT_ID`). See
 [`app/src/config.ts`](app/src/config.ts).
+
+## Audit trust boundary
+
+`audit_logs` carries a per-workspace hash chain: each row hashes its own contents
+plus its predecessor, so an in-place `UPDATE` or a `DELETE` is **detectable**.
+`GET /api/v1/admin/audit-logs/verify` walks it and reports breaks by sequence
+number, and it answers 200 with the breaks in the body rather than 500 — a
+corrupted audit log must not be a denial of service, or corrupting it becomes an
+attack rather than something an attack leaves behind.
+
+**Be clear about what that proves.** The chain lives in the same database as the
+rows it protects. Anyone with `UPDATE` on `audit_logs` — which includes anyone
+holding the application's database credentials — can edit a row and recompute
+every hash after it. A chain guarded by an administrator with `psql` is
+tamper-evidence theatre on its own.
+
+It becomes real at exactly one point: when the chain head is shipped somewhere
+that administrator cannot rewrite. `audit_chain_heads.anchored_seq` records how
+far that has got, and the verify endpoint reports it beside `head_seq`:
+
+- entries **at or below `anchored_seq`** are covered by a hash that exists off-box;
+- entries **above it** are protected by nothing but a chain in a database an
+  administrator can edit.
+
+`AUDIT_SINK` chooses the transport (`log` into your existing log pipeline,
+`file` onto an append-only volume, `http` to a SIEM with an HMAC-signed body).
+The default is `log` because in most deployments the log pipeline already leaves
+the host; **if yours does not, you do not have an anchor**, and the honest thing
+is to say so rather than to point at the chain.
+
+Three further layers, priced honestly:
+
+- **No API surface mutates `audit_logs`.** There is none, and there must never be
+  one. Disabling auditing is startup configuration, so turning it off lands in
+  the deploy trail instead of in the product.
+- **Reads of the audit log are themselves audited**, with the filter recorded
+  (`audit.read`). That is the row that catches an administrator going looking.
+- **Append-only at the database role is NOT implemented.** The intended shape is
+  the application connecting as a role with `INSERT, SELECT` on `audit_logs` and
+  no `UPDATE`/`DELETE`, with migrations and retention on a separate role. It is
+  deferred, and the cost of deferring it is concrete: the application's own
+  credentials are sufficient to rewrite the log, so the compromise of a backend
+  pod — not just of a human administrator — is enough to edit history up to
+  `anchored_seq`. Implementing it is not only a Go change: coalescing repeat
+  reads is an `ON CONFLICT DO UPDATE`, and partition retention is a `DROP TABLE`,
+  so the split needs a second connection string, a Compose service definition, a
+  Helm Secret and an operator runbook for rotating two roles instead of one. It
+  is tracked as the next thing to land in this area.
 
 ## Push notifications
 
@@ -416,7 +479,16 @@ Things this does **not** do, so you can decide before deploying:
 - **No outgoing webhooks.** Incoming only; the `outgoing` type is rejected.
 - **No reconnect backfill.** `seq` makes a gap *detectable*; recovery is a REST
   refetch, not a server-side replay.
-- **No SSO/OAuth/SCIM.**
+- **No SSO/OAuth/SCIM.** (OIDC SSO is in the tree behind `SSO_SECRET_KEY`; SCIM is not.)
+- **Audit is tamper-evident, not tamper-proof, and only up to `anchored_seq`.** The
+  append-only database role is not implemented — see [Audit trust boundary](#audit-trust-boundary).
+- **The inbox has no watch/subscribe.** Recipients are directed: the person mentioned, the
+  assignee, the DM participant, the thread author. "Notify me about everything in this document"
+  is a subscription model and is not built.
+- **`GET /notifications/unread-count` changed meaning** in the release that added the inbox: it
+  counts unread *items* rather than unread *events*, so a burst that used to report 40 now reports
+  1. That is deliberate (the badge is what a user compares against the list, and the list is
+  coalesced) and it is not versioned.
 - **Single-region.** The app uses one Postgres connection pool and one Redis
   address; it does not follow a Sentinel failover or route reads to a replica.
   Use `DATABASE_URL` with a pooler if you need more.

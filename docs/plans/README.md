@@ -7,7 +7,7 @@ named, and explicit cuts.
 | Plan | Phase | Status |
 |---|---|---|
 | [00-permissions](00-permissions.md) | Phase 0 — object-level permissions | Design. **Blocks everything.** |
-| [01-phase0-remainder](01-phase0-remainder.md) | Phase 0 — unified inbox + audit | Plan |
+| [01-phase0-remainder](01-phase0-remainder.md) | Phase 0 — unified inbox + audit | **Implemented** (`020`, `021`) |
 | [02-drive](02-drive.md) | Phase 1 — Drive + editor registry | Plan |
 | [03-work-tracking](03-work-tracking.md) | Phase 2 — issues, boards, cycles | Plan |
 | [04-docs](04-docs.md) | Phase 3 — block editor | Plan |
@@ -39,7 +39,7 @@ without colliding with a phase that has not started:
 | `014` | SSO (`internal/sso`) |
 | `015` | collaboration layer (`internal/collab`) |
 | `016`–`019` | object permissions (plan 00) — `016` taken (`acl_object`, `acl_grant`, `acl_key`, the two expected-state views and the backfill); `017`–`019` free |
-| `020`–`024` | unified inbox + audit (plan 01) |
+| `020`–`024` | unified inbox + audit (plan 01) — `020` taken (`inbox_events`, `inbox_items`, `notification_prefs`, `inbox_digest_state`, backfill), `021` taken (`audit_logs` → TEXT `resource_id`, monthly partitions, `dedupe_key`, chain, `audit_chain_heads`); `022`–`024` free |
 | `025`–`029` | Drive + editor registry (plan 02) |
 | `030`–`034` | work tracking (plan 03) |
 | `035`–`039` | docs (plan 04) |
@@ -85,6 +85,46 @@ landed second would fail outright.
 string and an explicit recipient list. Delete the notification half of plan
 03's migration. This must be settled before plan 03 starts, because plan 03 is
 sequenced ahead of the rest of plan 01.
+
+**Landed** in migration `020` + `internal/inbox`. The contract a pillar codes
+against, verbatim:
+
+```go
+// In-process (you already have the fan-out state):
+notifier.Deliver(ctx, inbox.Request{
+    WorkspaceID: ws,
+    Kind:        "issue.assigned",   // '<resource>.<verb>', TEXT, no migration
+    ObjectType:  "issue", ObjectID: issueID,   // what it is about
+    SubjectType: "issue", SubjectID: issueID,  // what it coalesces under
+    ActorID:     actor,
+    Title:       "PROJ-14 assigned to you",
+    Body:        "by Alice",
+    Data:        map[string]string{"issue_id": issueID},
+    Recipients:  []string{assignee},           // EXPLICIT, deduped, ≤2000
+})
+
+// Out-of-process (you are on the API side, or you have no consumer yet):
+inbox.Publish(ctx, natsClient, inbox.Request{ /* same struct */ })
+// → superops.{ws}.inbox.requested, consumed by the `inbox-fanout` durable.
+// A new pillar adds zero durables and zero lines in cmd/worker.
+```
+
+Four rules that are not negotiable, because the badge stops being trustworthy
+the moment one of them is broken:
+
+1. **The recipient list is directed and explicit.** No watch/subscribe, no "everyone
+   in the container". An undirected event is the channel-unread-badge shape and
+   creates the hot-row failure plan 01 names.
+2. **Suppression happens before `Deliver`.** Domain-specific mutes (the
+   equivalent of `channel_members.muted`) are the producer's job; `in_app=false`
+   in `notification_prefs` creates no item at all rather than a hidden one.
+3. **`Deliver` is the only writer.** Its `inbox_events` insert is the idempotency
+   gate for the coalesced counter; a pillar that writes rows itself re-derives
+   that gate and gets it wrong.
+4. **If your pillar owns a "mark this container read" action**, call
+   `inbox.MarkSubjectRead` inside the same transaction, as
+   `channel.Repository.UpdateReadAt` does. That is the only place two unread
+   systems are allowed to overlap.
 
 ### 2. Orphan GC — plan 02 owns the predicate (high)
 
