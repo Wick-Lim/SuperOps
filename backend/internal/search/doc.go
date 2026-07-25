@@ -46,6 +46,36 @@ func (t ObjectType) Valid() bool {
 	return false
 }
 
+// fileObjectTypes maps a Drive registry kind onto the search type it is indexed
+// as. CLOSED, on purpose, and the default is TypeFile.
+//
+// The obvious implementation — ParseObjectType(fileType) — is wrong twice over.
+// files.file_type is checked only against `^[a-z][a-z0-9_]{0,31}$` (migration
+// 025), so it is effectively free text as far as this package is concerned, and
+// ParseObjectType would happily turn a file whose type is "message" into a
+// message document. And a deployment that registers a kind this table does not
+// know must index it as a file rather than not at all: a file missing from
+// search is a bug a user reports, and a file indexed under an invented type is
+// a filter that silently returns nothing.
+var fileObjectTypes = map[string]ObjectType{
+	"document":    TypeDocument,
+	"spreadsheet": TypeSpreadsheet,
+	"design":      TypeDesign,
+}
+
+// FileObjectType is the type a Drive file of this kind is indexed as.
+//
+// It is the ONLY place the mapping exists, because the index arm and the delete
+// arm must agree. DocID is "<type>_<uuid>": if a document is written as
+// document_<id> and deleted as file_<id>, trashing it leaves it fully
+// searchable — a leak, not an inconvenience.
+func FileObjectType(fileType string) ObjectType {
+	if t, ok := fileObjectTypes[strings.ToLower(strings.TrimSpace(fileType))]; ok {
+		return t
+	}
+	return TypeFile
+}
+
 // ParseObjectType turns caller input into a type, rejecting anything unknown.
 func ParseObjectType(s string) (ObjectType, bool) {
 	t := ObjectType(strings.ToLower(strings.TrimSpace(s)))
@@ -332,7 +362,10 @@ func (m MessageDoc) Doc() Doc {
 type FileDoc struct {
 	ID          string `json:"id"`
 	WorkspaceID string `json:"workspace_id"`
-	ChannelID   string `json:"channel_id"`
+	// Type is what this file is indexed as, from FileObjectType. Empty means
+	// TypeFile, so a caller that predates the editors keeps working.
+	Type      ObjectType `json:"-"`
+	ChannelID string     `json:"channel_id"`
 	// FolderID is set for a Drive file. It backs the "search inside this folder"
 	// narrowing and is not an access decision.
 	FolderID string `json:"folder_id"`
@@ -370,8 +403,12 @@ func (f FileDoc) Doc() Doc {
 			acl = keySet(UserKey(f.UserID))
 		}
 	}
+	typ := f.Type
+	if typ == "" {
+		typ = TypeFile
+	}
 	return Doc{
-		Type:        TypeFile,
+		Type:        typ,
 		ID:          f.ID,
 		WorkspaceID: f.WorkspaceID,
 		ChannelID:   f.ChannelID,

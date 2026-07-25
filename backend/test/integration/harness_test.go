@@ -631,6 +631,26 @@ func (h *harness) searchHits(t *testing.T, token, workspaceID, query string) []s
 	return ids
 }
 
+// searchHitsOfType is searchHits narrowed to one facet, which is how a caller
+// proves an object is indexed under the type it claims rather than merely
+// present somewhere in the index.
+func (h *harness) searchHitsOfType(t *testing.T, token, workspaceID, query, typ string) []string {
+	t.Helper()
+	r := h.req(t, http.StatusOK, "GET",
+		"/api/v1/workspaces/"+workspaceID+"/search?q="+query+"&type="+typ, token, nil)
+	var res struct {
+		Hits []struct {
+			ID string `json:"id"`
+		} `json:"hits"`
+	}
+	decodeInto(t, r.Data, &res)
+	ids := make([]string, 0, len(res.Hits))
+	for _, hit := range res.Hits {
+		ids = append(ids, hit.ID)
+	}
+	return ids
+}
+
 // --- WebSocket ---
 
 // wsScheme converts the httptest http URL to a ws URL for the WS endpoint.

@@ -28,10 +28,17 @@ type MessageEvent struct {
 // A file that is attached to a message after upload must be republished (as
 // file.updated) with the channel filled in, or it stays uploader-only in the
 // index.
+//
+// FileType is the Drive registry kind — "document", "spreadsheet", "design", or
+// "file" for a plain upload. It decides the search type and therefore the
+// document id, so a publisher that omits it indexes an editor object as a plain
+// file. That is the safe direction (it stays findable, under the wrong facet)
+// and it is why FileObjectType defaults to TypeFile rather than erroring.
 type FileEvent struct {
 	ID        string `json:"id"`
 	ChannelID string `json:"channel_id"`
 	FolderID  string `json:"folder_id"`
+	FileType  string `json:"file_type"`
 	UserID    string `json:"user_id"`
 	Name      string `json:"name"`
 	CreatedAt string `json:"created_at"`
@@ -134,9 +141,8 @@ func (idx *Indexer) HandleMessage(ctx context.Context, msg *nats.Msg) error {
 // superops.{workspace_id}.file.{action}, and the ack decision is the returned
 // error.
 //
-// NOTE: nothing publishes file events yet — internal/file has no NATS client —
-// so this handler is unbound until that lands. Until then files enter the index
-// only through cmd/reindex. See the wiring notes.
+// internal/drive publishes these (events.go) and cmd/worker binds them to the
+// file-indexer durable.
 func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
 	envelope, ok, err := decodeEnvelope(msg, "file.uploaded", "file.updated", "file.deleted")
 	if err != nil || !ok {
@@ -151,11 +157,25 @@ func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
 		return &PermanentError{Reason: envelope.Type + " event carries no file id"}
 	}
 
+	// The SAME mapping the index arm uses, and that is the whole point. DocID is
+	// "<type>_<uuid>": indexing a document as document_<id> while deleting it as
+	// file_<id> would leave a trashed document fully searchable.
+	typ := FileObjectType(event.FileType)
+
 	if envelope.Type == "file.deleted" || event.IsDeleted {
-		if err := idx.service.DeleteAwait(ctx, TypeFile, event.ID); err != nil {
-			return fmt.Errorf("unindex file %s: %w", event.ID, err)
+		if err := idx.service.DeleteAwait(ctx, typ, event.ID); err != nil {
+			return fmt.Errorf("unindex %s %s: %w", typ, event.ID, err)
 		}
-		idx.logger.Debug("unindexed file", "id", event.ID)
+		// Transitional: sweep the file_<uuid> twin an earlier release wrote for
+		// this object, before the event carried a type. Two awaited deletes on a
+		// trash is cheap, and leaving the twin behind means the document stays
+		// searchable forever. Removable one release after a full reindex.
+		if typ != TypeFile {
+			if err := idx.service.DeleteAwait(ctx, TypeFile, event.ID); err != nil {
+				return fmt.Errorf("unindex the untyped twin of %s %s: %w", typ, event.ID, err)
+			}
+		}
+		idx.logger.Debug("unindexed file", "id", event.ID, "type", typ)
 		return nil
 	}
 
@@ -180,6 +200,7 @@ func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
 	}
 
 	doc := FileDoc{
+		Type:        typ,
 		ID:          event.ID,
 		WorkspaceID: workspaceID,
 		ChannelID:   event.ChannelID,
@@ -191,9 +212,17 @@ func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
 	}.Doc()
 
 	if err := idx.service.IndexAwait(ctx, doc); err != nil {
-		return fmt.Errorf("index file %s: %w", event.ID, err)
+		return fmt.Errorf("index %s %s: %w", typ, event.ID, err)
 	}
-	idx.logger.Debug("indexed file", "id", event.ID)
+	// The other half of the transitional sweep: an object that used to be
+	// indexed as file_<uuid> is now written under its own type, and the old id
+	// would otherwise survive as a second, stale hit for the same object.
+	if typ != TypeFile {
+		if err := idx.service.DeleteAwait(ctx, TypeFile, event.ID); err != nil {
+			return fmt.Errorf("remove the untyped twin of %s %s: %w", typ, event.ID, err)
+		}
+	}
+	idx.logger.Debug("indexed file", "id", event.ID, "type", typ)
 	return nil
 }
 

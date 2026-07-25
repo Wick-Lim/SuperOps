@@ -33,19 +33,19 @@ func (h *harness) indexDriveFile(t *testing.T, workspaceID, fileID string) {
 	defer cancel()
 
 	var (
-		name, userID string
-		folderID     *string
-		createdAt    time.Time
+		name, userID, fileType string
+		folderID               *string
+		createdAt              time.Time
 	)
 	if err := h.app.DB.QueryRow(ctx,
-		`SELECT name, user_id::text, folder_id::text, created_at FROM files WHERE id = $1`,
-		fileID).Scan(&name, &userID, &folderID, &createdAt); err != nil {
+		`SELECT name, user_id::text, folder_id::text, file_type, created_at FROM files WHERE id = $1`,
+		fileID).Scan(&name, &userID, &folderID, &fileType, &createdAt); err != nil {
 		t.Fatalf("read file fixture: %v", err)
 	}
 
 	indexer := search.NewIndexer(h.search, h.app.Authz, slog.Default())
 	event := map[string]any{
-		"id": fileID, "user_id": userID, "name": name,
+		"id": fileID, "user_id": userID, "name": name, "file_type": fileType,
 		"created_at": createdAt.UTC().Format(time.RFC3339Nano),
 	}
 	if folderID != nil {
@@ -64,8 +64,44 @@ func (h *harness) indexDriveFile(t *testing.T, workspaceID, fileID string) {
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer ccancel()
+		_ = h.search.DeleteAwait(cctx, search.FileObjectType(fileType), fileID)
 		_ = h.search.DeleteAwait(cctx, search.TypeFile, fileID)
 	})
+}
+
+// unindexDriveFile runs the worker's indexer over a file.deleted event, built
+// from the SAME row the index arm read. That is the point: the two arms must
+// derive the same document id from the same file, and the only way to prove it
+// is to let both of them do their own deriving.
+func (h *harness) unindexDriveFile(t *testing.T, workspaceID, fileID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var name, userID, fileType string
+	var createdAt time.Time
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT name, user_id::text, file_type, created_at FROM files WHERE id = $1`,
+		fileID).Scan(&name, &userID, &fileType, &createdAt); err != nil {
+		t.Fatalf("read file fixture: %v", err)
+	}
+	data, err := json.Marshal(map[string]any{
+		"type": "file.deleted",
+		"data": map[string]any{
+			"id": fileID, "user_id": userID, "name": name, "file_type": fileType,
+			"created_at": createdAt.UTC().Format(time.RFC3339Nano), "is_deleted": true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexer := search.NewIndexer(h.search, h.app.Authz, slog.Default())
+	if err := indexer.HandleFile(ctx, &nats.Msg{
+		Subject: "superops." + workspaceID + ".file.deleted",
+		Data:    data,
+	}); err != nil {
+		t.Fatalf("unindex drive file: %v", err)
+	}
 }
 
 // multipart posts a file part plus optional form fields, and returns the status
@@ -496,4 +532,67 @@ func TestReindexCarriesTheSameAccessKeysAsTheLiveIndexer(t *testing.T) {
 		t.Error("a file in the shared Drive carries no workspace key; the fixture is not " +
 			"exercising the case the bug was in")
 	}
+}
+
+// TRASHING A DOCUMENT MUST REMOVE IT FROM THE INDEX.
+//
+// search.DocID is "<type>_<uuid>". The indexer used to hardcode TypeFile in
+// both arms, which agreed and was wrong only in the facet. The moment the index
+// arm learned to write document_<uuid>, a delete arm still saying file_<uuid>
+// would delete a document that does not exist and leave the real one fully
+// searchable — the body of a trashed document, readable by everyone who could
+// find it, forever. That is a leak, not a stale result.
+//
+// So this drives BOTH real arms over the same file and asserts the second
+// undoes the first. It is deliberately not a unit test asserting two strings
+// are equal: the failure mode is one arm being changed without the other, and
+// only running both catches it.
+func TestTrashingADocumentRemovesItFromTheIndex(t *testing.T) {
+	h := getHarness(t)
+	h.requireSearch(t)
+
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	root := h.driveRoot(t, admin, ws)
+
+	name := fmt.Sprintf("meeting-notes-%d", time.Now().UnixNano())
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/drive/files", admin,
+		map[string]string{"name": name, "file_type": "document", "folder_id": root.ID})
+	var doc driveDescriptor
+	decodeInto(t, resp.Data, &doc)
+	if doc.FileType != "document" {
+		t.Fatalf("file_type = %q, want document", doc.FileType)
+	}
+
+	h.indexDriveFile(t, ws, doc.ID)
+
+	hits := h.searchHits(t, admin, ws, name)
+	if !contains(hits, doc.ID) {
+		t.Fatal("a created document is not in the index after the indexer ran")
+	}
+
+	// It is indexed AS A DOCUMENT, not as a file. If this fails the facet is
+	// wrong and the delete arm below would pass vacuously by deleting the id
+	// that is actually there.
+	if !contains(h.searchHitsOfType(t, admin, ws, name, "document"), doc.ID) {
+		t.Fatal("the document is in the index but not under ?type=document; " +
+			"the index arm did not apply FileObjectType")
+	}
+
+	h.unindexDriveFile(t, ws, doc.ID)
+
+	if contains(h.searchHits(t, admin, ws, name), doc.ID) {
+		t.Fatal("the document is still searchable after file.deleted; the delete arm " +
+			"computed a different document id than the index arm")
+	}
+}
+
+func contains(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }

@@ -134,19 +134,22 @@ func TestScanRows(t *testing.T) {
 			// can see the file.
 			name: "drive file carries its materialized keys verbatim",
 			typ:  search.TypeFile,
-			// id, workspace_id, user_id, name, channel_id, folder_id, acl, created_at
-			row: fakeRow{objID, wsID, userID, "budget.xlsx", "", folderID,
+			// id, workspace_id, user_id, name, channel_id, folder_id, file_type,
+			// acl, created_at. The type is "spreadsheet" and the document must
+			// come back as one: a rebuild that wrote it as a file would leave
+			// ?type=spreadsheet empty for the whole corpus.
+			row: fakeRow{objID, wsID, userID, "budget.xlsx", "", folderID, "spreadsheet",
 				[]string{"w-" + wsID, "f-" + folderID, "u-" + otherID}, createdAt},
 			wantACL: []string{"w-" + wsID, "f-" + folderID, "u-" + otherID},
 			want: search.Doc{
-				Type: search.TypeFile, ID: objID, WorkspaceID: wsID, FolderID: folderID,
+				Type: search.TypeSpreadsheet, ID: objID, WorkspaceID: wsID, FolderID: folderID,
 				UserID: userID, Title: "budget.xlsx", CreatedAt: createdAt.Unix(),
 			},
 		},
 		{
 			name: "attached file is keyed on the channel of its message",
 			typ:  search.TypeFile,
-			row: fakeRow{objID, wsID, userID, "plan.pdf", chID, "",
+			row: fakeRow{objID, wsID, userID, "plan.pdf", chID, "", "file",
 				[]string{"c-" + chID}, createdAt},
 			wantACL: []string{"c-" + chID},
 			want: search.Doc{
@@ -160,7 +163,7 @@ func TestScanRows(t *testing.T) {
 			// stays, for exactly this case.
 			name:    "unattached file with no materialized keys falls back to its uploader",
 			typ:     search.TypeFile,
-			row:     fakeRow{objID, wsID, userID, "draft.pdf", "", "", []string(nil), createdAt},
+			row:     fakeRow{objID, wsID, userID, "draft.pdf", "", "", "file", []string(nil), createdAt},
 			wantACL: []string{"u-" + userID},
 			want: search.Doc{
 				Type: search.TypeFile, ID: objID, WorkspaceID: wsID,

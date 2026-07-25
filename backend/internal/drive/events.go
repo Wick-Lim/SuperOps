@@ -64,6 +64,7 @@ type fileEvent struct {
 	ID        string `json:"id"`
 	ChannelID string `json:"channel_id,omitempty"`
 	FolderID  string `json:"folder_id,omitempty"`
+	FileType  string `json:"file_type"`
 	UserID    string `json:"user_id"`
 	Name      string `json:"name"`
 	CreatedAt string `json:"created_at"`
@@ -82,7 +83,11 @@ func (p *Publisher) PublishFile(ctx context.Context, action string, f *File) {
 	}
 
 	payload := fileEvent{
-		ID:        f.ID,
+		ID: f.ID,
+		// One payload serves uploaded/updated/deleted, so setting this here
+		// covers all three at once — which is exactly what the delete arm needs
+		// in order to compute the same document id the index arm did.
+		FileType:  f.FileType,
 		UserID:    f.CreatedBy,
 		Name:      f.Name,
 		CreatedAt: f.CreatedAt.UTC().Format(time.RFC3339Nano),

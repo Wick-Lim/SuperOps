@@ -233,6 +233,7 @@ const fileSQL = `
 	SELECT f.id, f.workspace_id, f.user_id, f.name,
 	       COALESCE(m.channel_id::text, ''),
 	       COALESCE(f.folder_id::text, ''),
+	       f.file_type,
 	       COALESCE(ARRAY(SELECT k.key FROM acl_key k
 	                       WHERE k.object_type = 'file' AND k.object_id = f.id), '{}'),
 	       f.created_at
@@ -268,10 +269,16 @@ func sources() []source {
 					doc       search.FileDoc
 					createdAt time.Time
 				)
+				var fileType string
 				if err := row.Scan(&doc.ID, &doc.WorkspaceID, &doc.UserID, &doc.Name,
-					&doc.ChannelID, &doc.FolderID, &doc.ACL, &createdAt); err != nil {
+					&doc.ChannelID, &doc.FolderID, &fileType, &doc.ACL, &createdAt); err != nil {
 					return search.Doc{}, cursor{}, fmt.Errorf("scan file: %w", err)
 				}
+				// The same mapper the live indexer uses. Without it a rebuild
+				// writes every document back under file_<uuid> — the twin the
+				// indexer's transitional sweep exists to remove — and ?type=document
+				// returns nothing the day after a recovery.
+				doc.Type = search.FileObjectType(fileType)
 				doc.CreatedAt = createdAt.Unix()
 				return doc.Doc(), cursor{at: createdAt, id: doc.ID}, nil
 			},
