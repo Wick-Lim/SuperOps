@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
-import { View, Text, TextInput, Pressable, SafeAreaView, Alert } from 'react-native'
+import { View, Text, TextInput, Pressable, Alert } from 'react-native'
+import { AuthLayout } from '../components/AuthLayout'
 import type { NativeStackScreenProps } from '@react-navigation/native-stack'
 import type { RootStackParamList } from '../navigation/AppNavigator'
 import { authApi } from '../api/auth'
@@ -80,8 +81,7 @@ export default function InviteScreen({ navigation, route }: Props) {
   } as const
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: '#020617' }}>
-      <View style={{ flex: 1, justifyContent: 'center', paddingHorizontal: 32 }}>
+    <AuthLayout>
         <View style={{ alignItems: 'center', marginBottom: 32 }}>
           <Text accessibilityRole="header" style={{ color: '#fff', fontSize: 24, fontWeight: 'bold' }}>
             Join SuperOps
@@ -187,7 +187,6 @@ export default function InviteScreen({ navigation, route }: Props) {
             Already have an account? <Text style={{ color: '#818cf8' }}>Sign in</Text>
           </Text>
         </Pressable>
-      </View>
-    </SafeAreaView>
+    </AuthLayout>
   )
 }

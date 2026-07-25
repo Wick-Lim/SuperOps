@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
-import { View, Text, TextInput, Pressable, SafeAreaView, Alert } from 'react-native'
+import { View, Text, TextInput, Pressable, Alert } from 'react-native'
+import { AuthLayout } from '../components/AuthLayout'
 import type { NativeStackScreenProps } from '@react-navigation/native-stack'
 import type { RootStackParamList } from '../navigation/AppNavigator'
 import { authApi } from '../api/auth'
@@ -49,8 +50,7 @@ export default function LoginScreen({ navigation }: Props) {
   }
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: '#020617' }}>
-      <View style={{ flex: 1, justifyContent: 'center', paddingHorizontal: 32 }}>
+    <AuthLayout>
         <View style={{ alignItems: 'center', marginBottom: 40 }}>
           <View style={{ width: 48, height: 48, backgroundColor: '#4f46e5', borderRadius: 12, alignItems: 'center', justifyContent: 'center', marginBottom: 16 }}>
             <Text style={{ color: '#fff', fontSize: 20, fontWeight: 'bold' }}>S</Text>
@@ -106,7 +106,6 @@ export default function LoginScreen({ navigation }: Props) {
             Have an invite? <Text style={{ color: '#818cf8' }}>Join workspace</Text>
           </Text>
         </Pressable>
-      </View>
-    </SafeAreaView>
+    </AuthLayout>
   )
 }

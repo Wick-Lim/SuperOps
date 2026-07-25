@@ -43,7 +43,7 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -99,7 +99,7 @@ services:
       # answers 503 once a job loop stops ticking. Nothing depends on the
       # worker's health condition, so this reports rather than gates — but
       # `docker compose ps` now distinguishes "running" from "still working".
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:${WORKER_HEALTH_PORT:-8081}/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:${WORKER_HEALTH_PORT:-8081}/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -196,7 +196,7 @@ services:
       # Monitoring endpoint — unauthenticated, never expose it publicly.
       - "127.0.0.1:8222:8222"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8222/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -223,7 +223,7 @@ services:
       # `mc ready local` is what MinIO documents for current images; curl is the
       # fallback for older ones. The backend waits on this, so it must not
       # depend on a tool that may be absent.
-      test: ["CMD-SHELL", "mc ready local || curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      test: ["CMD-SHELL", "mc ready local || curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -246,7 +246,7 @@ services:
     ports:
       - "127.0.0.1:7700:7700"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:7700/health || wget -q --spider http://localhost:7700/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7700/health || wget -q --spider http://127.0.0.1:7700/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5

@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { View, Text, Pressable, SafeAreaView, Alert, ScrollView } from 'react-native'
+import { AUTH_MAX_WIDTH } from '../components/AuthLayout'
 import type { NativeStackScreenProps } from '@react-navigation/native-stack'
 import type { RootStackParamList } from '../navigation/AppNavigator'
 import { workspaceApi } from '../api/workspaces'
@@ -163,7 +164,17 @@ export default function OnboardingScreen({ navigation }: Props) {
       </View>
 
       <ScrollView
-        contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', paddingHorizontal: 32, paddingBottom: 40 }}
+        contentContainerStyle={{
+          flexGrow: 1,
+          justifyContent: 'center',
+          paddingHorizontal: 32,
+          paddingBottom: 40,
+          // Same cap as AuthLayout. This screen keeps its own header, so it
+          // constrains the scroll content rather than using that component.
+          width: '100%',
+          maxWidth: AUTH_MAX_WIDTH + 64, // + the horizontal padding
+          alignSelf: 'center',
+        }}
         keyboardShouldPersistTaps="handled"
       >
         <View
