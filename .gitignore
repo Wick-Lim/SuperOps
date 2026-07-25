@@ -46,3 +46,8 @@ docker-compose.override.yml
 
 # OS
 Thumbs.db
+
+# Helm subchart archives fetched by `helm dependency build`. Chart.lock IS
+# committed (it pins the exact resolved versions); the .tgz payloads are
+# rebuildable from it and would be ~256K of vendored binaries in git.
+deploy/k8s/helm/*/charts/

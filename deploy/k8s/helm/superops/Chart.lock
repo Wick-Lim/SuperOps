@@ -1,0 +1,15 @@
+dependencies:
+- name: postgresql
+  repository: oci://registry-1.docker.io/bitnamicharts
+  version: 16.0.6
+- name: redis
+  repository: oci://registry-1.docker.io/bitnamicharts
+  version: 20.0.5
+- name: nats
+  repository: https://nats-io.github.io/k8s/helm/charts/
+  version: 1.2.11
+- name: minio
+  repository: oci://registry-1.docker.io/bitnamicharts
+  version: 14.0.0
+digest: sha256:7563995e48006059edb64a2797a50cbb8e0d0aff9a469758ffd4c738782a64b8
+generated: "2026-07-25T14:53:59.150956+09:00"
