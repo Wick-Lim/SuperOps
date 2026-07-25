@@ -11,13 +11,24 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
+// SubscriptionRevoker is the subset of *ws.Hub this package needs. Kept as an
+// interface for the same reason internal/channel does: no dependency on the
+// WebSocket implementation, and handlers stay unit-testable without a hub.
+//
+// Revocation is best effort — the membership rows are already deleted by the
+// time it is called, so a hub that cannot be reached must not fail the request.
+type SubscriptionRevoker interface {
+	RevokeChannelSubscription(userID, channelID string)
+}
+
 type Handler struct {
 	repo *Repository
 	az   *authz.Checker
+	hub  SubscriptionRevoker
 }
 
-func NewHandler(repo *Repository, az *authz.Checker) *Handler {
-	return &Handler{repo: repo, az: az}
+func NewHandler(repo *Repository, az *authz.Checker, hub SubscriptionRevoker) *Handler {
+	return &Handler{repo: repo, az: az, hub: hub}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -273,7 +284,8 @@ func (h *Handler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.repo.RemoveMember(r.Context(), wsID, targetUID); err != nil {
+	removedFrom, err := h.repo.RemoveMember(r.Context(), wsID, targetUID)
+	if err != nil {
 		if errors.Is(err, ErrMemberNotFound) {
 			httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "member not found")
 			return
@@ -282,7 +294,20 @@ func (h *Handler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httputil.JSON(w, http.StatusOK, map[string]string{"message": "member removed"})
+	// Hub subscriptions live in memory and survive the DELETE, so without this
+	// the evicted user keeps receiving message.new for every channel they were
+	// in until they happen to disconnect.
+	if h.hub != nil {
+		for _, channelID := range removedFrom {
+			h.hub.RevokeChannelSubscription(targetUID, channelID)
+		}
+	}
+
+	httputil.JSON(w, http.StatusOK, map[string]any{
+		"message":             "member removed",
+		"channels_removed":    len(removedFrom),
+		"removed_channel_ids": removedFrom,
+	})
 }
 
 // TransferOwnership is the only way the 'owner' role moves. Making it an

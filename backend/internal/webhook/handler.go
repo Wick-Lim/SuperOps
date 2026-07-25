@@ -44,7 +44,13 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("POST /api/v1/webhooks", authMw(http.HandlerFunc(h.Create)))
 	mux.Handle("GET /api/v1/webhooks", authMw(http.HandlerFunc(h.List)))
 	mux.Handle("PATCH /api/v1/webhooks/{webhook_id}", authMw(http.HandlerFunc(h.Update)))
-	mux.Handle("POST /api/v1/webhooks/{webhook_id}/rotate", authMw(http.HandlerFunc(h.Rotate)))
+	// Rotation is PUT-on-the-token, not POST-.../rotate, because
+	// `POST /api/v1/webhooks/{webhook_id}/rotate` is ambiguous against the
+	// legacy delivery route below: "/api/v1/webhooks/incoming/rotate" matches
+	// both and neither pattern is more specific, which makes ServeMux panic at
+	// registration. Differing methods cannot conflict, and replacing the token
+	// resource is a fair reading of PUT anyway.
+	mux.Handle("PUT /api/v1/webhooks/{webhook_id}/token", authMw(http.HandlerFunc(h.Rotate)))
 	mux.Handle("DELETE /api/v1/webhooks/{webhook_id}", authMw(http.HandlerFunc(h.Delete)))
 
 	// Preferred delivery endpoint: the credential travels in the Authorization

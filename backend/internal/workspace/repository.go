@@ -241,19 +241,61 @@ func (r *Repository) TransferOwnership(ctx context.Context, workspaceID, fromUse
 	})
 }
 
-func (r *Repository) RemoveMember(ctx context.Context, workspaceID, userID string) error {
-	tag, err := r.pool.Exec(ctx,
-		`DELETE FROM workspace_members
-		  WHERE workspace_id = $1 AND user_id = $2 AND role <> 'owner'`,
-		workspaceID, userID,
-	)
+// RemoveMember evicts a user from a workspace and from every channel in it,
+// returning the channels they were removed from.
+//
+// Dropping only the workspace_members row is not enough: channel routes
+// authorize on channel_members, so a user removed from the workspace would keep
+// full read/write access to every channel they had already joined, and their
+// live WebSocket subscriptions would keep delivering. The two deletes must also
+// be one transaction — a partial removal is exactly that same hole.
+//
+// The returned channel ids let the caller revoke the corresponding hub
+// subscriptions, which are held in memory and are not affected by the delete.
+func (r *Repository) RemoveMember(ctx context.Context, workspaceID, userID string) ([]string, error) {
+	var channelIDs []string
+
+	err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM workspace_members
+			  WHERE workspace_id = $1 AND user_id = $2 AND role <> 'owner'`,
+			workspaceID, userID,
+		)
+		if err != nil {
+			return fmt.Errorf("remove workspace member: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrMemberNotFound
+		}
+
+		rows, err := tx.Query(ctx,
+			`DELETE FROM channel_members cm
+			  USING channels ch
+			  WHERE cm.channel_id = ch.id
+			    AND ch.workspace_id = $1
+			    AND cm.user_id = $2
+			  RETURNING cm.channel_id`,
+			workspaceID, userID,
+		)
+		if err != nil {
+			return fmt.Errorf("remove channel memberships: %w", err)
+		}
+		defer rows.Close()
+
+		channelIDs = []string{}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return fmt.Errorf("scan removed channel: %w", err)
+			}
+			channelIDs = append(channelIDs, id)
+		}
+		return rows.Err()
+	})
 	if err != nil {
-		return fmt.Errorf("remove member: %w", err)
+		return nil, err
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrMemberNotFound
-	}
-	return nil
+	return channelIDs, nil
 }
 
 func (r *Repository) scanWorkspace(row pgx.Row) (*Workspace, error) {

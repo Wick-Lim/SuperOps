@@ -166,8 +166,11 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// Handlers
 	authHandler := auth.NewHandler(authService)
 	userHandler := user.NewHandler(userRepo)
-	workspaceHandler := workspace.NewHandler(workspaceRepo, az)
-	channelHandler := channel.NewHandler(channelRepo, az)
+	workspaceHandler := workspace.NewHandler(workspaceRepo, az, hub)
+	// The hub is what makes channel lifecycle events reach connected clients and
+	// what revokes a subscription the roster no longer authorizes; natsClient
+	// carries channel.member_added to the worker's channel-invite notifier.
+	channelHandler := channel.NewHandler(channelRepo, az, hub, natsClient, logger)
 	messageHandler := message.NewHandler(messageRepo, az, natsClient, logger)
 	wsHandler := ws.NewWSHandler(
 		hub,
