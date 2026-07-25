@@ -353,6 +353,19 @@ func (h *Hub) PublishPresenceChanged(userID, status string, workspaceIDs []strin
 	}
 }
 
+// PublishHuddle fans a huddle event out to a channel across every replica.
+//
+// A thin wrapper over publishDomain rather than a new mechanism: the frame is
+// channel-targeted like a message, so it rides the same subject and the same
+// dispatch arm. The one thing it adds is the resource name, so an operator
+// watching NATS can tell call traffic from chat traffic.
+func (h *Hub) PublishHuddle(workspaceID, channelID, eventType string, data any) {
+	if workspaceID == "" || channelID == "" {
+		return
+	}
+	h.publishDomain(workspaceID, "huddle", eventType, eventType, data)
+}
+
 // publishDomain emits an event on the domain plane
 // ("superops.{workspace_id}.{resource}.{action}"). Every replica's relay — this
 // one included, because the NATS connection is not opened with NoEcho — then

@@ -46,7 +46,12 @@ func (h *Hub) dispatchEvent(msgType string, data json.RawMessage) {
 	switch msgType {
 	case TypeMessageNew, TypeMessageUpdated, TypeMessageDeleted,
 		TypeReactionAdded, TypeReactionRemoved,
-		TypeChannelUpdated, TypeMemberJoined, TypeMemberLeft:
+		TypeChannelUpdated, TypeMemberJoined, TypeMemberLeft,
+		// dispatchEvent is a CLOSED switch: an event type absent from it is
+		// silently dropped. The huddle frames are channel-targeted, so they
+		// belong in this arm and nowhere else — "no new fan-out code" would
+		// have meant no fan-out at all.
+		TypeHuddleStarted, TypeHuddleEnded, TypeHuddleRoster:
 		var target struct {
 			ChannelID string `json:"channel_id"`
 		}

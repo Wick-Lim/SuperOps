@@ -96,6 +96,15 @@ const (
 	TypeUnreadUpdate    = "unread.update"
 	TypeError           = "error"
 
+	// Huddles. Delivered to a channel's SUBSCRIBERS, which is the point:
+	// subscribing requires read on the channel, so a stranger never learns a
+	// call exists. Somebody who can read a public channel but has not
+	// subscribed learns about it from GET /channels/{id}/huddle instead — the
+	// pull path, which authorizes per request.
+	TypeHuddleStarted = "huddle.started"
+	TypeHuddleEnded   = "huddle.ended"
+	TypeHuddleRoster  = "huddle.roster"
+
 	TypeCollabJoined = "collab.joined"
 	TypeCollabLeft   = "collab.left"
 	// TypeCollabCompact asks one client in the room to produce a snapshot of

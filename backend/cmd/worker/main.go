@@ -48,11 +48,13 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive"
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive/registry"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
+	"github.com/Wick-Lim/SuperOps/backend/internal/huddle"
 	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/push"
+	"github.com/Wick-Lim/SuperOps/backend/internal/rtc"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/internal/thumb"
@@ -64,16 +66,17 @@ import (
 
 // Job names, also used as the keys in the /health payload.
 const (
-	jobSessionCleanup = "session_cleanup"
-	jobScheduledSend  = "scheduled_messages"
-	jobRetention      = "retention"
-	jobObjectGC       = "object_gc"
-	jobACLDrift       = "acl_drift"
-	jobInboxDigest    = "inbox_digest"
-	jobInboxReconcile = "inbox_reconcile"
-	jobAuditPartition = "audit_partitions"
-	jobAuditVerify    = "audit_verify"
-	jobDriveTrash     = "drive_trash_purge"
+	jobSessionCleanup  = "session_cleanup"
+	jobScheduledSend   = "scheduled_messages"
+	jobRetention       = "retention"
+	jobObjectGC        = "object_gc"
+	jobACLDrift        = "acl_drift"
+	jobInboxDigest     = "inbox_digest"
+	jobInboxReconcile  = "inbox_reconcile"
+	jobAuditPartition  = "audit_partitions"
+	jobAuditVerify     = "audit_verify"
+	jobDriveTrash      = "drive_trash_purge"
+	jobHuddleReconcile = "huddle_reconcile"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -102,6 +105,15 @@ const (
 	// often would scan the same empty index over and over.
 	driveTrashInterval   = time.Hour
 	driveTrashStartDelay = 7 * time.Minute
+	// Huddles, every 30 seconds. Short because the cost of being wrong is a
+	// channel whose Huddle button does nothing — the partial unique index makes
+	// a stale live row block every new call on that scope — and because asking
+	// the media server about a handful of live rooms is cheap. The grace period
+	// keeps it from ending a call that was created a second ago and whose first
+	// participant has not connected yet.
+	huddleReconcileInterval   = 30 * time.Second
+	huddleReconcileStartDelay = 45 * time.Second
+	huddleReconcileGrace      = 60 * time.Second
 )
 
 // Advisory-lock keys. Distinct 64-bit constants; any other application taking
@@ -119,6 +131,11 @@ const (
 	lockAuditPartition int64 = 0x50_0007
 	lockAuditVerify    int64 = 0x50_0008
 	lockDriveTrash     int64 = 0x50_0009
+	// Huddles. The reconciler is the only thing that ends a call whose
+	// room the media server has forgotten — a webhook that never arrived
+	// leaves a huddle live forever, and the partial unique index then blocks
+	// every future call on that channel.
+	lockHuddleReconcile int64 = 0x50_000A
 )
 
 // aclDriftSamples bounds how many concrete disagreements one drift report
@@ -436,6 +453,33 @@ func run() int {
 		start(jobObjectGC, objectGCStartDelay, objectGCInterval, func(c context.Context) error {
 			return runObjectGC(c, pool, fileRepo, store, l)
 		})
+	}
+
+	// The huddle reconciler. It exists because at-least-once webhook delivery
+	// prevents duplicates and not LOSSES: a room_finished that never arrived
+	// leaves a huddle live forever, and the partial unique index then refuses
+	// every new call on that channel. Nothing else would ever notice.
+	if cfg.RTC.IsEnabled() {
+		media := &rtc.LiveKit{
+			Host:      cfg.RTC.Host,
+			APIKey:    cfg.RTC.APIKey,
+			APISecret: cfg.RTC.APISecret,
+			HTTP:      rtc.NewHTTP(cfg.RTC.HTTPTimeout),
+		}
+		huddleRepo := huddle.NewRepository(pool)
+		start(jobHuddleReconcile, huddleReconcileStartDelay, huddleReconcileInterval,
+			func(c context.Context) error {
+				ran, err := withSingletonLock(c, pool, lockHuddleReconcile, func(c context.Context) error {
+					return reconcileHuddles(c, huddleRepo, media, l)
+				})
+				if err != nil {
+					return err
+				}
+				if !ran {
+					l.Debug("huddle reconcile skipped: another replica holds the lock")
+				}
+				return nil
+			})
 	}
 
 	// --- health endpoint -----------------------------------------------------
@@ -1642,4 +1686,68 @@ func startHealthServer(l *slog.Logger, health *healthState) *http.Server {
 	}()
 	l.Info("worker health endpoint listening", "addr", srv.Addr, "path", "/health")
 	return srv
+}
+
+// reconcileHuddles makes the database agree with the media server.
+//
+// The media server is authoritative for presence, so a disagreement is resolved
+// in its favour: a room it has forgotten ends the huddle, and a roster it
+// reports replaces ours. That is what repairs the state after a lost webhook —
+// which at-least-once delivery does not prevent, because it only guarantees a
+// message is delivered AT LEAST once if it is delivered at all.
+func reconcileHuddles(ctx context.Context, repo *huddle.Repository, media rtc.Provider, l *slog.Logger) error {
+	live, err := repo.StaleLive(ctx, huddleReconcileGrace, 200)
+	if err != nil {
+		return fmt.Errorf("list live huddles: %w", err)
+	}
+	var ended, repaired int
+	for _, h := range live {
+		room, err := media.Room(ctx, h.RoomName)
+		switch {
+		case errors.Is(err, rtc.ErrRoomNotFound):
+			// The room is gone and we were never told. End it, or the channel
+			// can never start another call.
+			if _, err := repo.End(ctx, h.ID, "reconciled"); err != nil {
+				l.Error("end a forgotten huddle", "huddle_id", h.ID, "error", err)
+				continue
+			}
+			ended++
+			continue
+		case err != nil:
+			// A media server that is down must NOT end everybody call. Log and
+			// leave the row alone; the next pass will find it.
+			l.Warn("could not read a room from the media server",
+				"huddle_id", h.ID, "room", h.RoomName, "error", err)
+			continue
+		}
+
+		if len(room.Participants) == 0 {
+			if _, err := repo.End(ctx, h.ID, "empty"); err != nil {
+				l.Error("end an empty huddle", "huddle_id", h.ID, "error", err)
+				continue
+			}
+			ended++
+			continue
+		}
+
+		participants := make([]huddle.Participant, 0, len(room.Participants))
+		for _, p := range room.Participants {
+			participants = append(participants, huddle.Participant{
+				HuddleID:        h.ID,
+				ParticipantSID:  p.SID,
+				UserID:          p.Identity,
+				JoinedAt:        p.JoinedAt,
+				IsScreenSharing: p.ScreenSharing,
+			})
+		}
+		if err := repo.ReconcileParticipants(ctx, h.ID, participants); err != nil {
+			l.Error("reconcile a huddle roster", "huddle_id", h.ID, "error", err)
+			continue
+		}
+		repaired++
+	}
+	if ended > 0 || repaired > 0 {
+		l.Info("huddles reconciled", "ended", ended, "rosters_repaired", repaired, "checked", len(live))
+	}
+	return nil
 }

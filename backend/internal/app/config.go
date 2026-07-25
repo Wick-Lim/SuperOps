@@ -28,6 +28,7 @@ type Config struct {
 	Push         PushConfig
 	Mail         MailConfig
 	SSO          SSOConfig
+	RTC          RTCConfig
 	Inbox        InboxConfig
 	Audit        AuditConfig
 	MetricsToken string // METRICS_TOKEN — if set, GET /metrics requires this bearer token
@@ -375,6 +376,36 @@ type MeiliConfig struct {
 // disable search did the opposite of what it looked like.
 func (c MeiliConfig) IsEnabled() bool { return c.Enabled && c.Host != "" }
 
+// RTCConfig is the real-time media capability (ROADMAP §3c).
+//
+// DISABLED BY DEFAULT, and that is the important part. Audio and screen sharing
+// need an SFU, which is a second server somebody has to run; a self-hosted
+// product that assumed one would ship a button that fails. With no host
+// configured the routes are not registered at all.
+//
+// TURN is configured SEPARATELY from the SFU because they are separate
+// deployment decisions: an SFU on a public address needs no relays, and a
+// deployment behind a corporate firewall needs relays even with a healthy SFU.
+type RTCConfig struct {
+	Host          string        // RTC_HOST — the SFU's URL; empty disables huddles
+	APIKey        string        // RTC_API_KEY
+	APISecret     string        // RTC_API_SECRET
+	WebhookSecret string        // RTC_WEBHOOK_SECRET — empty leaves the webhook route unregistered
+	HTTPTimeout   time.Duration // RTC_HTTP_TIMEOUT (default 10s)
+
+	ICEURLs   []string      // RTC_ICE_URLS — comma-separated stun:/turn: URLs
+	ICESecret string        // RTC_ICE_SECRET — coturn's shared secret
+	ICETTL    time.Duration // RTC_ICE_TTL (default 12h)
+}
+
+// IsEnabled mirrors MinIOConfig.IsEnabled so no caller tests a raw field. All
+// three parts are required: a host without credentials cannot mint a token, and
+// a deployment in that state should behave as if it had no SFU rather than fail
+// at the first join.
+func (c RTCConfig) IsEnabled() bool {
+	return c.Host != "" && c.APIKey != "" && c.APISecret != ""
+}
+
 // SSOConfig configures OpenID Connect single sign-on.
 //
 // Per-workspace provider configuration lives in Postgres (one deployment serves
@@ -452,6 +483,16 @@ func LoadConfig() (*Config, error) {
 			Region:       e.str("STORAGE_REGION", ""),
 			PathStyle:    e.optBool("STORAGE_PATH_STYLE"),
 			CreateBucket: e.optBool("STORAGE_CREATE_BUCKET"),
+		},
+		RTC: RTCConfig{
+			Host:          e.str("RTC_HOST", ""),
+			APIKey:        e.str("RTC_API_KEY", ""),
+			APISecret:     e.str("RTC_API_SECRET", ""),
+			WebhookSecret: e.str("RTC_WEBHOOK_SECRET", ""),
+			HTTPTimeout:   e.duration("RTC_HTTP_TIMEOUT", 10*time.Second),
+			ICEURLs:       e.list("RTC_ICE_URLS", nil),
+			ICESecret:     e.str("RTC_ICE_SECRET", ""),
+			ICETTL:        e.duration("RTC_ICE_TTL", 12*time.Hour),
 		},
 		Meili: MeiliConfig{
 			Enabled:   e.bool("SEARCH_ENABLED", true),

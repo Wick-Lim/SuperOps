@@ -30,6 +30,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive/registry"
 	"github.com/Wick-Lim/SuperOps/backend/internal/emoji"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
+	"github.com/Wick-Lim/SuperOps/backend/internal/huddle"
 	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/issue"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
@@ -37,6 +38,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/presence"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ratelimit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/rbac"
+	"github.com/Wick-Lim/SuperOps/backend/internal/rtc"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/internal/sso"
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
@@ -340,6 +342,27 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 			return nil, fmt.Errorf("register drive kind %q: %w", kind.Type, err)
 		}
 	}
+	// Real-time media (ROADMAP §3c). Disabled unless a media server is
+	// configured, and disabled means the routes are never registered — the
+	// same shape storage and search already have.
+	var media rtc.Provider = rtc.Disabled{}
+	if cfg.RTC.IsEnabled() {
+		media = &rtc.LiveKit{
+			Host:      cfg.RTC.Host,
+			APIKey:    cfg.RTC.APIKey,
+			APISecret: cfg.RTC.APISecret,
+			HTTP:      rtc.NewHTTP(cfg.RTC.HTTPTimeout),
+		}
+		logger.Info("huddles enabled", "media_host", cfg.RTC.Host,
+			"turn_configured", len(cfg.RTC.ICEURLs) > 0)
+	}
+	var ice rtc.ICEProvider = rtc.Disabled{}
+	if len(cfg.RTC.ICEURLs) > 0 {
+		ice = rtc.StaticICE{URLs: cfg.RTC.ICEURLs, Secret: cfg.RTC.ICESecret, TTL: cfg.RTC.ICETTL}
+	}
+	huddleHandler := huddle.NewHandler(pool, az, media, ice, hub, auditService,
+		cfg.RTC.WebhookSecret, logger)
+
 	driveRepo := drive.NewRepository(pool, az, driveKinds)
 	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService,
 		drive.NewPublisher(natsClient, logger))
@@ -570,6 +593,11 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	channelHandler.RegisterRoutes(mux, authMw)
 	collabHandler.RegisterRoutes(mux, authMw)
 	driveHandler.RegisterRoutes(mux, authMw)
+	huddleHandler.RegisterRoutes(mux, authMw)
+	// The webhook is authenticated by signature rather than by session, and it
+	// is rate-limited by IP: a media server that started retrying in a loop
+	// must not be able to saturate the API.
+	huddleHandler.RegisterWebhookRoutes(mux, func(next http.Handler) http.Handler { return next })
 	commentHandler.RegisterRoutes(mux, authMw)
 	issueHandler.RegisterRoutes(mux, authMw)
 	// Resolving a share link is unauthenticated and its path CONTAINS the
