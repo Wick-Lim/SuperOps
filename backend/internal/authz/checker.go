@@ -1452,3 +1452,75 @@ func (c *Checker) KeysForObject(ctx context.Context, objectType, objectID string
 	}
 	return keys, rows.Err()
 }
+
+// MoveTx is Move inside the caller's transaction, WITHOUT the Revoker.
+//
+// It exists for one caller: restoring a trashed folder whose original parent is
+// gone, which relocates it to the Drive root in the same transaction that
+// un-trashes its subtree. Splitting that into two transactions would leave a
+// window where the subtree is live at a path whose parent does not exist.
+//
+// No live sessions are dropped, and that is correct HERE and only here: the
+// object was in the trash, so nobody holds an open connection to it. Any other
+// caller wants Move.
+func (c *Checker) MoveTx(ctx context.Context, tx pgx.Tx, obj, newParent ObjectRef) error {
+	ref, ok, err := obj.normalize()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("move: invalid object id")
+	}
+	if derivedTypes[ref.Type] {
+		return fmt.Errorf("move %s: %w", ref, ErrDerivedType)
+	}
+	parentRef, ok, err := newParent.normalize()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("move %s: invalid parent id", ref)
+	}
+	// Register performs exactly the reposition-and-rewrite this needs, and it
+	// refuses the same things Move does. Reusing it keeps one implementation of
+	// the path rewrite rather than a second that can drift.
+	return registerIn(ctx, tx, ref, parentRef)
+}
+
+// UnregisterTx removes an ACL-native object's rows, inside the caller's
+// transaction.
+//
+// It exists because acl_object.object_id is POLYMORPHIC — there is no foreign
+// key from drive_folders, and there cannot be one — so deleting a folder leaves
+// its acl_object row, its acl_key rows and any acl_grant on it behind forever.
+// Rebuild does not clean them either: it prunes DERIVED types only, by design,
+// because it must never delete a row it did not compute.
+//
+// The result is not merely untidy. A folder id is a uuid; reuse is not a
+// practical concern, but the grant rows are an authorization statement about
+// something that no longer exists, and GrantsFor — the "this person left, what
+// could they reach" audit — would keep answering with it.
+//
+// Derived types are refused: their rows come from the views, and the way to
+// remove one is to remove the row the view reads.
+func (c *Checker) UnregisterTx(ctx context.Context, tx pgx.Tx, obj ObjectRef) error {
+	ref, ok, err := obj.normalize()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("unregister %s: invalid object id", obj)
+	}
+	if derivedTypes[ref.Type] {
+		return fmt.Errorf("unregister %s: %w", ref, ErrDerivedType)
+	}
+	// acl_grant and acl_key both cascade from acl_object, so one DELETE is the
+	// whole removal — and it stays the whole removal if a fourth table is added
+	// with the same foreign key.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM acl_object WHERE object_type = $1 AND object_id = $2`,
+		ref.Type, ref.ID); err != nil {
+		return fmt.Errorf("unregister %s: %w", ref, err)
+	}
+	return nil
+}

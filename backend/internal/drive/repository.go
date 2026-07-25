@@ -28,10 +28,12 @@ type Repository struct {
 	pool  *pgxpool.Pool
 	authz *authz.Checker
 	kinds *registry.Registry
+	// retention is how long a trashed object is kept; see SetRetention.
+	retention time.Duration
 }
 
 func NewRepository(pool *pgxpool.Pool, az *authz.Checker, kinds *registry.Registry) *Repository {
-	return &Repository{pool: pool, authz: az, kinds: kinds}
+	return &Repository{pool: pool, authz: az, kinds: kinds, retention: DefaultRetention}
 }
 
 const folderColumns = `id::text, workspace_id::text, parent_id::text, name, is_root,

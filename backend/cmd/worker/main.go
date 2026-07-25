@@ -45,6 +45,8 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
+	"github.com/Wick-Lim/SuperOps/backend/internal/drive"
+	"github.com/Wick-Lim/SuperOps/backend/internal/drive/registry"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
@@ -71,6 +73,7 @@ const (
 	jobInboxReconcile = "inbox_reconcile"
 	jobAuditPartition = "audit_partitions"
 	jobAuditVerify    = "audit_verify"
+	jobDriveTrash     = "drive_trash_purge"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -94,6 +97,11 @@ const (
 	auditPartitionDelay    = 30 * time.Second
 	auditVerifyInterval    = 30 * time.Minute
 	auditVerifyStartDelay  = 6 * time.Minute
+	// Hourly. The retention window is measured in days, so the cadence only has
+	// to be short enough that "30 days" is not "30 days and a bit"; running more
+	// often would scan the same empty index over and over.
+	driveTrashInterval   = time.Hour
+	driveTrashStartDelay = 7 * time.Minute
 )
 
 // Advisory-lock keys. Distinct 64-bit constants; any other application taking
@@ -110,6 +118,7 @@ const (
 	lockInboxReconcile int64 = 0x50_0006
 	lockAuditPartition int64 = 0x50_0007
 	lockAuditVerify    int64 = 0x50_0008
+	lockDriveTrash     int64 = 0x50_0009
 )
 
 // aclDriftSamples bounds how many concrete disagreements one drift report
@@ -396,6 +405,24 @@ func run() int {
 			durable: "thumbnailer",
 			filter:  "superops.*.thumbnail.requested",
 			handle:  thumbs.Handle,
+		})
+
+		// The trash purge. It is the ONLY thing that clears trashed_at, and
+		// internal/file's collector deliberately excludes trashed rows so the
+		// two cannot race for the same object.
+		driveRepo := drive.NewRepository(pool, az, registry.New())
+		start(jobDriveTrash, driveTrashStartDelay, driveTrashInterval, func(c context.Context) error {
+			ran, err := withSingletonLock(c, pool, lockDriveTrash, func(c context.Context) error {
+				_, err := drive.Purge(c, driveRepo, store, drive.PurgeOptions{Now: time.Now()}, l)
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			if !ran {
+				l.Debug("drive trash purge skipped: another replica holds the lock")
+			}
+			return nil
 		})
 
 		fileRepo := file.NewRepository(pool)

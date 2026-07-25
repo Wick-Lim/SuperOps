@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -348,6 +349,22 @@ func (r *Repository) MoveFile(ctx context.Context, id, newFolderID, actorID stri
 // It marks rather than deletes. Deletion goes through the purge job, which owns
 // the object cleanup and the audit entry — and until then trashed rows are
 // excluded from the object collector by name (internal/file's predicate).
+// Retention is how long this deployment keeps a trashed object. Zero disables
+// the automatic purge. Set once at construction so changing the setting cannot
+// retroactively shorten the promise already made about something trashed last
+// week — the deadline is stamped at trash time, not computed at purge time.
+func (r *Repository) SetRetention(d time.Duration) { r.retention = d }
+
+// purgeAfter is the absolute deadline stamped onto a row being trashed, or nil
+// when this deployment purges nothing automatically.
+func (r *Repository) purgeAfter() *time.Time {
+	if r.retention <= 0 {
+		return nil
+	}
+	t := time.Now().Add(r.retention)
+	return &t
+}
+
 func (r *Repository) TrashFolder(ctx context.Context, id, actorID string) error {
 	folder, err := r.Folder(ctx, id)
 	if err != nil {
@@ -374,20 +391,21 @@ func (r *Repository) TrashFolder(ctx context.Context, id, actorID string) error 
 			return fmt.Errorf("read folder path: %w", err)
 		}
 
+		due := r.purgeAfter()
 		if _, err := tx.Exec(ctx, `
-			UPDATE drive_folders SET trashed_at = NOW(), trashed_by = $2
+			UPDATE drive_folders SET trashed_at = NOW(), trashed_by = $2, purge_after = $3
 			 WHERE trashed_at IS NULL
 			   AND id IN (SELECT object_id FROM acl_object
 			               WHERE object_type = 'folder' AND path LIKE $1 || '%')`,
-			path, nullable(actorID)); err != nil {
+			path, nullable(actorID), due); err != nil {
 			return fmt.Errorf("trash folder subtree: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
-			UPDATE files SET trashed_at = NOW(), trashed_by = $2, updated_by = $2
+			UPDATE files SET trashed_at = NOW(), trashed_by = $2, updated_by = $2, purge_after = $3
 			 WHERE trashed_at IS NULL
 			   AND folder_id IN (SELECT object_id FROM acl_object
 			                      WHERE object_type = 'folder' AND path LIKE $1 || '%')`,
-			path, nullable(actorID)); err != nil {
+			path, nullable(actorID), due); err != nil {
 			return fmt.Errorf("trash folder contents: %w", err)
 		}
 		return nil
@@ -396,8 +414,8 @@ func (r *Repository) TrashFolder(ctx context.Context, id, actorID string) error 
 
 func (r *Repository) TrashFile(ctx context.Context, id, actorID string) error {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE files SET trashed_at = NOW(), trashed_by = $2, updated_by = $2
-		  WHERE id = $1 AND trashed_at IS NULL`, id, nullable(actorID))
+		`UPDATE files SET trashed_at = NOW(), trashed_by = $2, updated_by = $2, purge_after = $3
+		  WHERE id = $1 AND trashed_at IS NULL`, id, nullable(actorID), r.purgeAfter())
 	if err != nil {
 		return fmt.Errorf("trash file: %w", err)
 	}
