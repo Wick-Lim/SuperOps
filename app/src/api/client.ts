@@ -278,6 +278,36 @@ export function fileURL(fileId: string): string {
 }
 
 /** Appends `cursor`/`limit` to a path, encoding the opaque base64 cursor. */
+/**
+ * Follows a cursor to the end and returns everything.
+ *
+ * SEVERAL SCREENS READ ONE PAGE AND CALLED IT THE TOTAL. The server's default is
+ * 50; the shared inbox stopped at 50 conversations, a comment thread's header
+ * printed its page length as "N comments", and a workflow's run history simply
+ * ended. None read `meta`, and nothing said anything was missing.
+ *
+ * Bounded on purpose. A runaway cursor — a server that always answers
+ * `has_more` — is worse than a truncated list, so the walk stops and SAYS it
+ * stopped. A caller that ignores `truncated` is back where it started, which is
+ * why it is a field and not a console warning.
+ */
+export async function collectPages<T>(
+  fetchPage: (cursor?: string) => Promise<ApiResponse<T[]>>,
+  maxPages = 20,
+): Promise<{ items: T[]; truncated: boolean }> {
+  const items: T[] = []
+  let cursor: string | undefined
+  for (let page = 0; page < maxPages; page++) {
+    const res = await fetchPage(cursor)
+    items.push(...(res.data ?? []))
+    if (!res.meta?.has_more || !res.meta.cursor) {
+      return { items, truncated: false }
+    }
+    cursor = res.meta.cursor
+  }
+  return { items, truncated: true }
+}
+
 export function withPaging(path: string, cursor?: string, limit?: number): string {
   const parts: string[] = []
   if (cursor) parts.push(`cursor=${encodeURIComponent(cursor)}`)

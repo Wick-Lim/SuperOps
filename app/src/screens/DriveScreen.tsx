@@ -329,7 +329,12 @@ function Breadcrumb({
   return (
     <View style={styles.breadcrumb} accessibilityRole="header">
       {elided && (
-        <Pressable onPress={() => onNavigate(trail[0])} hitSlop={8}>
+        <Pressable
+          onPress={() => onNavigate(trail[0])}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel="Go to the Drive root"
+        >
           <Text style={styles.crumbMuted}>…/</Text>
         </Pressable>
       )}
@@ -337,7 +342,22 @@ function Breadcrumb({
         const last = i === shown.length - 1
         return (
           <View key={f.id} style={styles.crumbWrap}>
-            <Pressable onPress={() => !last && onNavigate(f)} disabled={last} hitSlop={8}>
+            {/* The crumbs are the only navigation out of a deep folder on a
+                phone, and they announced nothing at all: no role, no label, so
+                a screen reader read the folder name as static text with no
+                indication it could be activated. The current folder is
+                deliberately not a button — it is where you already are. */}
+            <Pressable
+              onPress={() => !last && onNavigate(f)}
+              disabled={last}
+              hitSlop={8}
+              accessibilityRole={last ? 'text' : 'button'}
+              accessibilityLabel={
+                last
+                  ? `Current folder, ${f.is_root ? 'Drive' : f.name}`
+                  : `Go to ${f.is_root ? 'Drive' : f.name}`
+              }
+            >
               <Text style={last ? styles.crumbCurrent : styles.crumbMuted} numberOfLines={1}>
                 {f.is_root ? 'Drive' : f.name}
               </Text>

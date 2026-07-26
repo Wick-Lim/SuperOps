@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { View, Text, Pressable, TextInput, Alert, StyleSheet } from 'react-native'
 import { theme } from '../lib/theme'
-import { errorMessage } from '../api/client'
+import { collectPages, errorMessage } from '../api/client'
 import { MENTION_PATTERN, commentApi, renderMentions } from '../api/comments'
 import type { Comment } from '../api/comments'
 import { useUserStore } from '../stores/userStore'
@@ -38,11 +38,19 @@ export default function CommentThread({
   const [replyTo, setReplyTo] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /** The cursor walk hit its page cap, so the count below is a floor. */
+  const [truncated, setTruncated] = useState(false)
 
   const load = useCallback(async () => {
     try {
-      const res = await commentApi.list(objectType, objectId)
-      setComments(res.data)
+      // EVERY page. The header prints the list's length as the comment count,
+      // so one page of 50 turned a truncation into a wrong number rather than a
+      // missing "load more".
+      const { items, truncated } = await collectPages<Comment>((cursor) =>
+        commentApi.list(objectType, objectId, cursor),
+      )
+      setComments(items)
+      setTruncated(truncated)
       setError(null)
     } catch (e) {
       setError(errorMessage(e))
@@ -133,7 +141,9 @@ export default function CommentThread({
   return (
     <View>
       <Text style={styles.heading}>
-        {comments.length === 0 ? 'No comments' : `${comments.length} comment(s)`}
+        {comments.length === 0
+          ? 'No comments'
+          : `${comments.length}${truncated ? '+' : ''} comment(s)`}
       </Text>
       {error && <Text style={styles.error}>{error}</Text>}
 

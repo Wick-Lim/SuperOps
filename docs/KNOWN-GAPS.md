@@ -35,6 +35,51 @@ imports `mailboxApi`.
 | `search.TypeIssue` | Declared and accepted by `parseTypes`; no producer. `?type=issue` always returns nothing. Comments and mail are not indexed at all. |
 | `folder_id` in the search index | Filterable and documented as backing "search inside this folder"; no handler parameter exposes it and `hitAttributes` omits it. |
 
+### Touch targets below the codebase's own minimum
+
+`components/a11y.ts` exports `MIN_TOUCH = 44` and `touchSlop(size)` precisely so
+small controls reach it, and 24 call sites instead use a bare `hitSlop={8}`
+around an unpadded `<Text>` at fontSize 13–14 — roughly a 34px target.
+`HuddleBar` and `HuddleRoom.web` size their controls to `MIN_TOUCH - 12` (32px).
+
+Left rather than bulk-replaced because the fix cannot be verified without
+rendering, and a wrong one is worse than the problem: several of these sit
+adjacent in a row (Drive's breadcrumbs, the mail-setup actions), and two
+neighbours each growing 13px per side produces overlapping hit areas — a
+mis-tap, not a missed one. It needs a pass with a device or a screenshot test,
+not a scripted edit.
+
+The unambiguous half IS fixed: Drive's breadcrumbs carried no
+`accessibilityRole` and no `accessibilityLabel`, so a screen reader read the
+folder names as static text with no indication they could be activated — and on
+a phone they are the only way out of a deep folder.
+
+### Drive share links are minted, validated, and grant nothing
+
+The whole chain exists except its last link, so this looks finished from every
+angle except using it.
+
+`POST /drive/{type}/{id}/links` creates one and grants `LinkSubject(linkID)` on
+the object — a real ACL grant, so the *authorization* side is built.
+`POST /drive/links/{token}/resolve` verifies the token, checks the password,
+expiry, use count and revocation, and returns the object it points at plus
+`access_keys: ["l-<linkID>"]`.
+
+**Nothing consumes that key.** There is no middleware, header or session that
+turns a resolved token into a subject a request carries, so every subsequent
+call is made as whoever the caller already was — anonymous, therefore refused.
+Establish it by grepping: the key is produced at `drive/sharing.go` and read
+nowhere.
+
+Finishing it means minting a short-lived credential for an unauthenticated
+holder and teaching the auth middleware to accept it as `LinkSubject`. That is
+new work on the most security-sensitive path in the product, not a patch, so it
+is left rather than half-built.
+
+`DriveShareScreen` used to present the token under "Copy this link now — anyone
+holding it can open {name}", which was the product promising something it does
+not do. The copy now says what is true.
+
 ### Audit log trust boundary
 
 Two gaps, referenced from `internal/audit/service.go`.

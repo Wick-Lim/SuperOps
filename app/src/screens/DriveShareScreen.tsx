@@ -129,12 +129,16 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
 
           {freshToken && (
             <View style={styles.tokenBox}>
-              <Text style={styles.tokenTitle}>Copy this link now</Text>
+              <Text style={styles.tokenTitle}>Copy this token now</Text>
               <Text style={styles.tokenBody} selectable>
                 {freshToken}
               </Text>
               <Text style={styles.tokenNote}>
-                It is shown once and cannot be recovered. Anyone holding it can open {name}.
+                It is shown once and cannot be recovered.
+                {'\n\n'}
+                A holder cannot open {name} with it yet: the server validates the
+                token and describes what it points at, but nothing turns that
+                into access. Grant a person or a group instead.
               </Text>
               {/* No clipboard dependency: the text above is selectable on every
                   platform, and a "Copy" button that silently did nothing on one

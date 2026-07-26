@@ -4,7 +4,7 @@ import {
 } from 'react-native'
 import { theme } from '../lib/theme'
 import { space, MIN_TOUCH } from '../lib/responsive'
-import { errorMessage } from '../api/client'
+import { collectPages, errorMessage } from '../api/client'
 import { workflowApi } from '../api/workflows'
 import type {
   Catalogue, Workflow, WorkflowRejection, WorkflowRun, WorkflowStep, WorkflowStepRun,
@@ -150,7 +150,12 @@ function WorkflowRow({
 
   useEffect(() => {
     if (!open) return
-    void workflowApi.runs(workflow.id).then((r) => setRuns(r.data ?? [])).catch(() => undefined)
+    // EVERY page. A run history that silently ends at 50 is worse than a short
+    // one: the list is what an operator reads to decide whether automation is
+    // behaving, and a truncated tail looks like "it stopped firing".
+    void collectPages<WorkflowRun>((cursor) => workflowApi.runs(workflow.id, cursor))
+      .then((r) => setRuns(r.items))
+      .catch(() => undefined)
     void workflowApi
       .rejections(workflow.id)
       .then((r) => setRejections(r.data ?? []))

@@ -501,6 +501,53 @@ jobs:
       - name: Build frontend (web) image
         run: docker build -f deploy/docker/Dockerfile.frontend -t superops-frontend:ci .
 
+      # AN IMAGE THAT BUILDS AND CRASHES ON BOOT PASSED THIS JOB.
+      #
+      # Building proves the Dockerfile compiles, not that the binary inside it
+      # runs — a missing shared library, a bad ENTRYPOINT path or a config
+      # refusal all survive a green build. These start each image and require it
+      # to still be alive a few seconds later.
+      #
+      # The backend is booted with NO infrastructure on purpose: it must fail
+      # LOUDLY and quickly rather than hang, so this asserts the process exits
+      # with a diagnostic instead of sitting there. Whether it stays up with a
+      # database is the integration job's question, not this one.
+      - name: The images actually start
+        run: |
+          set -euo pipefail
+
+          # The frontend is a static server; it must stay up on its own.
+          docker run -d --name fe-ci superops-frontend:ci
+          sleep 5
+          if [ "$(docker inspect -f '{{.State.Running}}' fe-ci)" != "true" ]; then
+            echo "::error::the frontend image exited on boot"
+            docker logs fe-ci
+            exit 1
+          fi
+          docker exec fe-ci wget -qO- http://127.0.0.1/ >/dev/null \
+            || { echo "::error::the frontend image is running but serves nothing"; docker logs fe-ci; exit 1; }
+          docker rm -f fe-ci >/dev/null
+
+          # The backend with no database. It must refuse, not hang: a config or
+          # connection failure that produces no output and never exits is the
+          # shape that turns a bad deploy into a silent outage.
+          set +e
+          timeout 30 docker run --name be-ci superops-backend:ci > /tmp/be.log 2>&1
+          code=$?
+          set -e
+          docker rm -f be-ci >/dev/null 2>&1 || true
+          if [ "$code" -eq 124 ]; then
+            echo "::error::the backend image hung for 30s with no database instead of failing"
+            cat /tmp/be.log
+            exit 1
+          fi
+          if [ ! -s /tmp/be.log ]; then
+            echo "::error::the backend image exited with no diagnostic at all"
+            exit 1
+          fi
+          echo "both images start; the backend refuses a missing database with a diagnostic"
+          head -5 /tmp/be.log
+
   helm:
     runs-on: ubuntu-latest
     env:

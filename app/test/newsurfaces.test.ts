@@ -247,3 +247,53 @@ describe('the issue cursor', () => {
     expect(net.calls).toHaveLength(1)
   })
 })
+
+// ONE PAGE IS NOT THE LIST.
+//
+// The shared inbox stopped at 50 conversations, a comment thread printed its
+// page length as "N comments", and a workflow's run history simply ended. None
+// of them read `meta`. collectPages is the one walk they now share; a copy per
+// screen is how three of them drifted apart in the first place.
+describe('collectPages', () => {
+  it('follows the cursor to the end', async () => {
+    const { collectPages } = await import('../src/api/client')
+    const pages = [
+      { data: [1, 2], meta: { cursor: 'c1', has_more: true } },
+      { data: [3], meta: { has_more: false } },
+    ]
+    const seen: (string | undefined)[] = []
+    let n = 0
+    const out = await collectPages<number>(async (cursor) => {
+      seen.push(cursor)
+      return pages[n++] as never
+    })
+    expect(out.items).toEqual([1, 2, 3])
+    expect(out.truncated).toBe(false)
+    // The second call must carry the cursor, or it re-reads page one forever.
+    expect(seen).toEqual([undefined, 'c1'])
+  })
+
+  it('stops at the cap against a server that always claims more', async () => {
+    const { collectPages } = await import('../src/api/client')
+    const out = await collectPages<number>(
+      async () => ({ data: [1], meta: { cursor: 'c', has_more: true } }) as never,
+      3,
+    )
+    expect(out.items).toHaveLength(3)
+    expect(out.truncated).toBe(true)
+  })
+
+  // has_more with no cursor is a server that cannot actually continue. Treating
+  // it as "keep going" is the infinite loop the cap exists to bound; treating it
+  // as done is the honest reading.
+  it('stops when has_more carries no cursor', async () => {
+    const { collectPages } = await import('../src/api/client')
+    let calls = 0
+    const out = await collectPages<number>(async () => {
+      calls++
+      return { data: [1], meta: { has_more: true } } as never
+    })
+    expect(calls).toBe(1)
+    expect(out.truncated).toBe(false)
+  })
+})

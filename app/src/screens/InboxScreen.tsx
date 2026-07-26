@@ -4,7 +4,7 @@ import {
 } from 'react-native'
 import { theme } from '../lib/theme'
 import { space, MIN_TOUCH } from '../lib/responsive'
-import { errorMessage } from '../api/client'
+import { collectPages, errorMessage } from '../api/client'
 import { mailboxApi } from '../api/mailboxes'
 import { formatBytes } from '../api/drive'
 import type { Conversation, ConversationState, Mailbox, MailMessage } from '../api/mailboxes'
@@ -35,6 +35,10 @@ export default function InboxScreen({ navigation }: { navigation: any }) {
   const [state, setState] = useState<ConversationState | 'all'>('open')
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [loading, setLoading] = useState(true)
+  /** The CONVERSATION list, separately from the mailbox list. Without it,
+   * switching mailbox or filter left the previous mailbox's threads on screen
+   * as though they belonged to the newly selected one. */
+  const [loadingConversations, setLoadingConversations] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -58,11 +62,21 @@ export default function InboxScreen({ navigation }: { navigation: any }) {
   const load = useCallback(async () => {
     if (!selected) return
     setError(null)
+    // Said out loud. `loading` covered only the mailbox list, so switching
+    // mailbox or filter left the PREVIOUS mailbox's conversations on screen —
+    // reading as though they belonged to the one just selected.
+    setLoadingConversations(true)
     try {
-      const res = await mailboxApi.conversations(selected.id, state === 'all' ? undefined : state)
-      setConversations(res.data ?? [])
+      // EVERY page: a shared inbox that stops at 50 conversations with no
+      // "load more" simply loses the older half of the queue.
+      const { items } = await collectPages<Conversation>((cursor) =>
+        mailboxApi.conversations(selected.id, state === 'all' ? undefined : state, cursor),
+      )
+      setConversations(items)
     } catch (e) {
       setError(errorMessage(e))
+    } finally {
+      setLoadingConversations(false)
     }
   }, [selected, state])
 
@@ -141,6 +155,8 @@ export default function InboxScreen({ navigation }: { navigation: any }) {
 
       {error ? (
         <ErrorState message={error} onRetry={load} />
+      ) : loadingConversations ? (
+        <LoadingState label="Loading conversations" />
       ) : conversations.length === 0 ? (
         <ContentColumn>
           <Text style={styles.empty}>Nothing here.</Text>
