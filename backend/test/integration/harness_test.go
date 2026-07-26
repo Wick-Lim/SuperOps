@@ -274,7 +274,9 @@ type apiResp struct {
 	} `json:"error"`
 }
 
-// httpClient is what every request in this suite goes through.
+// httpClient is what every request in this suite goes through — including the
+// three bare http.Get calls that a first pass at this missed, one of which went
+// to the server under test and so could still have hung the package.
 //
 // It exists because http.DefaultClient has NO TIMEOUT, so any request the
 // server never answers hangs the suite until `go test -timeout` kills the whole
@@ -1002,8 +1004,48 @@ func TestTheHarnessInheritsProductionDatabaseGuards(t *testing.T) {
 	if cfg.DB.LockTimeout != prod.DB.LockTimeout ||
 		cfg.DB.StatementTimeout != prod.DB.StatementTimeout ||
 		cfg.DB.IdleInTransactionTimeout != prod.DB.IdleInTransactionTimeout {
-		t.Errorf("the harness and production disagree:\n harness: lock=%s stmt=%s idle=%s\n prod:    lock=%s stmt=%s idle=%s",
+		t.Errorf("the harness and production disagree on the DEFAULTS:\n harness: lock=%s stmt=%s idle=%s\n prod:    lock=%s stmt=%s idle=%s",
 			cfg.DB.LockTimeout, cfg.DB.StatementTimeout, cfg.DB.IdleInTransactionTimeout,
 			prod.DB.LockTimeout, prod.DB.StatementTimeout, prod.DB.IdleInTransactionTimeout)
+	}
+
+	// AND ON A VALUE THAT IS ACTUALLY SET, which the comparison above cannot
+	// see. Clearing the environment makes both sides fall back to their
+	// defaults, so the two PARSERS are never run — swapping envDuration for one
+	// that reads a bare integer of seconds left this test green while the
+	// harness and production disagreed about every value anyone sets.
+	//
+	// That is the scenario the comment at the top of this test names: shorten
+	// DB_LOCK_TIMEOUT to make a lock test fast, production resolves 2s, the
+	// harness silently falls back to 5s, and the suite runs with a guard 2.5x
+	// looser than the thing it is supposed to mirror.
+	t.Setenv("DB_LOCK_TIMEOUT", "1500ms")
+	t.Setenv("DB_STATEMENT_TIMEOUT", "7s")
+	t.Setenv("DB_IDLE_IN_TX_TIMEOUT", "2m")
+
+	set := buildConfig()
+	prodSet, err := app.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if set.DB.LockTimeout != prodSet.DB.LockTimeout ||
+		set.DB.StatementTimeout != prodSet.DB.StatementTimeout ||
+		set.DB.IdleInTransactionTimeout != prodSet.DB.IdleInTransactionTimeout {
+		t.Errorf("the harness and production PARSE a set value differently:\n harness: lock=%s stmt=%s idle=%s\n prod:    lock=%s stmt=%s idle=%s",
+			set.DB.LockTimeout, set.DB.StatementTimeout, set.DB.IdleInTransactionTimeout,
+			prodSet.DB.LockTimeout, prodSet.DB.StatementTimeout, prodSet.DB.IdleInTransactionTimeout)
+	}
+	if set.DB.LockTimeout != 1500*time.Millisecond {
+		t.Errorf("DB_LOCK_TIMEOUT=1500ms resolved to %s: the value was not read at all",
+			set.DB.LockTimeout)
+	}
+
+	// THE SUITE'S HTTP CLIENT NEEDS A DEADLINE for the same reason these three
+	// do — without one, a wedged connection pool killed the whole package on
+	// `go test -timeout` with no failing test named. Asserted here rather than
+	// behaviourally, which would need a deliberately hanging endpoint.
+	if httpClient.Timeout <= 0 {
+		t.Error("httpClient has no timeout: a request the server never answers " +
+			"hangs the package instead of failing as a named test")
 	}
 }

@@ -250,6 +250,123 @@ kept deliberately — widening the constraint would otherwise route a new type i
 hence a 404 nobody can explain. Noted because an unreachable branch that is not
 documented as such invites deletion.
 
+**`pathSegment` treats an invalid UTF-8 byte two different ways.** Its fast path
+returns the string unchanged when there is no control character; the scrubbing
+loop, reached when there is one, ranges over the string — so `\xff` survives the
+first and becomes U+FFFD in the second. The same byte therefore depends on
+whether an unrelated control character happens to be present. Unreachable: the
+function only ever sees map keys from `encoding/json`, which substitutes U+FFFD
+at decode time, and struct field names, which are ours. Documented in the
+function rather than fixed, because a fix would mean scanning every segment for
+validity on the hot path to correct a case that cannot occur.
+
+The same caveat applies to `boundPath`'s promise that the message "never carries
+a broken sequence" — true for valid UTF-8 input, which is all it can receive.
+
+**The NUL guard's error path was verified by sweep, not by proof.** 1,505 cases —
+five value shapes (map, slice, map-in-slice, named key, empty key) at every depth
+from 0 to 300, spanning each shape's short-circuit crossover — checking that the
+reported path is a suffix of the true one, is marked exactly when truncated, is
+valid UTF-8, and never doubles the marker. Zero violations. That is strong
+evidence rather than a guarantee: a shape outside those five could in principle
+behave differently.
+
+**Vectors the NUL guards do not cover.** `DecodeJSON` covers every JSON body and
+`RejectNULInURL` covers the query string and path, but neither reaches:
+multipart form fields (safe *incidentally* — `httputil.SanitizeFileName` strips
+every rune below 0x20, and a NUL in a multipart filename is refused by Go's own
+parser); the seven packages that `json.Unmarshal(msg.Data, …)` from NATS
+directly (`internal/notification`, `internal/search`, `internal/inbox`,
+`internal/mailbox/outbound.go`, `internal/channel/unread.go`, `internal/thumb`,
+`internal/mail/queue.go`), whose content mostly originates from guarded HTTP
+requests; and `internal/huddle/handler.go:373`, which reads and unmarshals the
+body itself for RTC webhook signature verification. Whether that last one writes
+caller strings to Postgres is UNVERIFIED — forging a valid signature was out of
+reach. Four routes were never given a verdict at all because the probe's request
+shapes were wrong: collab document title, webhook description, issue
+title/description, comment body. Assume they behave like the seven that were
+measured until checked.
+
+**A `json.RawMessage` in a request struct would be silently skipped.** Verified
+directly: `reflect.ValueOf(json.RawMessage{})` has `Kind() == Slice` with
+`Elem().Kind() == Uint8`, so the byte-slice fast path returns without walking.
+The nuance that makes it a real hazard rather than a theoretical one: a
+RawMessage stores the JSON text, so it holds the six-character ESCAPE, not the
+byte — `{"data":{"k":"a\u0000b"}}` decodes to `{"k":"a\u0000b"}` verbatim, which
+means nothing has gone wrong YET. It becomes a NUL, and a 500, at whatever later
+unmarshals it into a string. None exists in HTTP request position today — every
+occurrence is a NATS envelope or a response type.
+
+**The URL guard changes what some requests answer**, measured against controls one
+byte apart: unauthenticated + NUL gives 400 where the control gives 401; a
+nonexistent route gives 400 where the control gives 404; `/health?x=%00` gives
+400 where the control gives 200. There is no information oracle — the answer is
+identical with and without a token — but it is a client-visible contract change
+on paths nobody thinks about. Kept deliberately: a malformed URL is malformed
+regardless of what it would have routed to.
+
+**Two assertions depend on invariants they cannot enforce.**
+`TestANulRefusalStillCarriesACorrelationID` reads a process-global 4xx counter and
+depends on the integration package being sequential — `t.Parallel()` appears
+nowhere in it today, but adding it would let another test's 4xx satisfy the delta
+while the guard contributes nothing. `TestAWorkflowNameIsStoredTrimmed` seeds a
+padded name through `wfRepo.Save`, which works only while trimming lives in the
+handler; its `t.Fatalf` diagnoses that rather than blaming the fixture. The
+raw-SQL alternative was rejected because `062_workflow_owner.up.sql` adds
+`owner_id NOT NULL` with no default, so a hand-written INSERT would break on the
+next `ALTER TABLE`.
+
+**`httpClient`'s timeout is asserted, not exercised** — `if httpClient.Timeout <= 0`
+pins the value, nothing pins that it fires. That needs a deliberately hanging
+endpoint.
+
+**Measuring allocation: count is not size.** `testing.AllocsPerRun` counts
+allocations, and a size regression changes their size rather than their number —
+it cannot see one, which cost a round to learn. `runtime.MemStats.TotalAlloc` is
+the right counter because it is monotonic and GC-independent; `HeapAlloc` reports
+live heap and moves under the collector. Five runs is enough: the delta's spread
+over seven repetitions is 2,144 bytes at one run, 61 at five, 79 at twenty. And
+each of the two allocation tests measures ONE axis — the key-size test uses a
+single-level key and would not have caught the quadratic depth regression; the
+depth test uses one-character keys and would not catch a key-size one.
+
+**`pg_column_size` inside a CHECK is evaluated pre-TOAST.** The constraint sees
+61,952 bytes for `[{"kind":"post_message","config":{"k0":0,…,"k2999":2999}}]`
+while `SELECT pg_column_size(steps)` on the stored row reports 21,207. Anyone
+measuring headroom against the 64 KiB limit with that query reads about three
+times more than there is.
+
+**The share-screen tests cannot fail on behaviour.** All of them in
+`app/test/newsurfaces.test.ts` are `fs.readFile` plus a regex over the source
+text, because `app/vitest.config.ts` runs `environment: 'node'` with no
+testing-library and no react-test-renderer. A change that keeps the text and
+inverts the behaviour passes. Every runtime claim about DriveShareScreen in this
+repo is therefore read from the source rather than observed — including that a
+failed grants request renders nothing affirmative, and that the one-time link
+token survives an unrelated failure. Not fixable without adding a render harness,
+which is the actual gap.
+
+**The workflow package's NUL checks are unreachable over HTTP and must not be
+deleted as dead code.** `httputil.DecodeJSON` answers first, so removing both
+`hasNUL` loops from `saveTx` leaves every HTTP workflow test green. They are the
+only guard on the exported `Repository.Save`, which the funnel does not sit in
+front of — `TestTheRepositoryRefusesNULWithoutTheHTTPFunnel` is what fails.
+
+**The integration suite has grown into its own timeout, and it is sensitive to
+accumulated data.** A run on a database carrying a day of test rows (124 MB;
+30,111 audit_logs, 28,107 acl_key, 24,046 workflow_runs) took 2,076s and was
+killed by `-timeout 35m` with zero test failures — the package timeout, not a
+hanging test. The same suite on a fresh database took 1,661s. Nothing regressed:
+`TestIssueMoveReordersByNeighbours` alone is 283s clean and 375s dirty, 18% of
+the total either way, and every other test scaled by roughly the same 25%.
+
+Two consequences. A local run against a database that has not been recreated
+will drift toward the timeout and eventually be killed in a way that names no
+test — the same shape as the `http.DefaultClient` hang this branch fixed, from a
+different cause. And the suite is one slow test away from needing the timeout
+raised in CI too: `TestIssueMoveReordersByNeighbours` is worth looking at before
+anything else, since it is a fifth of the wall clock on its own.
+
 **`rbac.RequireWorkspaceRole` is still unwired**, and its own comment says so.
 Every workspace-scoped route continues to do its role check handler-locally. The
 correctness fix landed; the wiring did not.

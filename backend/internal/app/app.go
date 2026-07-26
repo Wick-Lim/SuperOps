@@ -731,6 +731,16 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// outermost (after CORS) so the correlation id exists for RecoveryMiddleware
 	// and LoggingMiddleware, and for logger.FromContext inside handlers.
 	handler := httputil.EnvelopeMuxErrors(mux)
+	// INNERMOST but for the mux: outside routing, so no handler ever reads a URL
+	// carrying a NUL, and INSIDE the whole observability stack.
+	//
+	// It was assigned last, which — since each line wraps the previous — put it
+	// outermost, ahead of RequestID, Logging, Metrics and the rate limiter. The
+	// comment claimed the opposite of what that achieved: every refusal came
+	// back with an empty X-Request-ID, wrote no access-log line, incremented no
+	// metric, and was not counted against any rate limit. Probing a deployment
+	// with %00 URLs left no trace at all.
+	handler = httputil.RejectNULInURL(handler)
 	if cfg.RateLimit.Enabled {
 		handler = ratelimit.APIMiddleware(redisClient, ratelimit.Config{
 			RequestsPerMinute: cfg.RateLimit.APIPerMinute,

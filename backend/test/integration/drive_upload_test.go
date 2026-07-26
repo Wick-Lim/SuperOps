@@ -192,7 +192,7 @@ func (h *harness) followRedirect(t *testing.T, token, path string) ([]byte, stri
 		t.Fatalf("GET %s = %d, want 302 (%s)", path, res.StatusCode, raw)
 	}
 
-	object, err := http.Get(res.Header.Get("Location")) //nolint:gosec // a URL the server just minted
+	object, err := httpClient.Get(res.Header.Get("Location")) //nolint:gosec // a URL the server just minted
 	if err != nil {
 		t.Fatalf("fetch presigned url: %v", err)
 	}

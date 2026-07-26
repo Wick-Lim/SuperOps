@@ -170,3 +170,44 @@ func redactPath(path string) string {
 	}
 	return path
 }
+
+// RejectNULInURL refuses a request whose URL carries U+0000.
+//
+// The body guard in DecodeJSON cannot see this: a query parameter never passes
+// through it, and `net/url` decodes `%00` into a real NUL byte that a handler
+// then hands to Postgres. Demonstrated on `GET /api/v1/users/search`, one byte
+// apart, any authenticated user, no body at all:
+//
+//	?q=a%00b -> 500 internal server error
+//	?q=ab    -> 200
+//
+// It is a MIDDLEWARE rather than a helper because twelve handlers read
+// r.URL.Query() directly instead of going through QueryParam, so a guard in the
+// accessor would cover neither them nor a route written next year.
+//
+// Matching on the encoded form is exact, not a heuristic: `%00` is the only
+// spelling of the NUL byte in a URL — its hex digits have no case variants, and
+// a caller who wants the three literal characters sends `%2500`. The raw-byte
+// check beside it covers a client that puts the byte in the request line
+// unencoded.
+func RejectNULInURL(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hasEncodedNULInURL(r.URL.RawQuery) || hasEncodedNULInURL(r.URL.EscapedPath()) {
+			// BAD_REQUEST, not INVALID_BODY: there is no body involved, and
+			// BAD_REQUEST is what 138 other refusals in this codebase use.
+			// Inventing a code for one middleware would give clients something
+			// new to handle for no gain.
+			HandleError(w, &AppError{
+				Status:  http.StatusBadRequest,
+				Code:    "BAD_REQUEST",
+				Message: "the URL contains a NUL character (U+0000), which cannot be stored",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func hasEncodedNULInURL(s string) bool {
+	return strings.Contains(s, "%00") || strings.ContainsRune(s, 0)
+}

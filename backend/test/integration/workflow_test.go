@@ -1536,9 +1536,11 @@ func TestAnOperationalFailureIsNotReportedAsInvalid(t *testing.T) {
 		t.Errorf("the 400 does not name the offending step: %s", raw)
 	}
 
-	// AN OPERATIONAL failure is a 500 with nothing internal on the wire. Held by
-	// taking the row lock from another session and letting the handler's
-	// lock_timeout expire.
+	// AN OPERATIONAL failure is not a 400, and carries nothing internal on the
+	// wire. This one is a lock timeout, which is transient and retryable, so it
+	// is a 409 — the assertion below is what says so; this sentence used to say
+	// 500 and contradicted it. Held by taking the row lock from another session
+	// and letting the handler's lock_timeout expire.
 	conn, err := h.app.DB.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1677,6 +1679,34 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 			want: "",
 		},
 		{
+			// THE SIX CHARACTERS, NOT THE CODE POINT — this must be ACCEPTED.
+			//
+			// A check that searched the marshalled bytes for the escape refused
+			// it: encoding/json escapes a backslash too, so a Windows path, a
+			// regex, or any JSON round-tripped as a string re-encodes to
+			// `"C:\\u0000-ok"` and matched. The caller was told their config
+			// contained a character that was not in it — and the identical
+			// string was accepted in `name`, which checks the value.
+			name: "a literal backslash-u-0000 in a step config",
+			body: map[string]any{
+				"name": fmt.Sprintf("literal-%d", time.Now().UnixNano()),
+				"steps": []any{map[string]any{"kind": "post_message",
+					"config": map[string]any{"body": `C:\u0000-not-a-nul`}}},
+				"triggers": []any{trigger},
+			},
+			want: "",
+		},
+		{
+			name: "a literal backslash-u-0000 in a trigger filter",
+			body: map[string]any{
+				"name":  fmt.Sprintf("literal-f-%d", time.Now().UnixNano()),
+				"steps": []any{step},
+				"triggers": []any{map[string]any{"event_type": "message.created",
+					"filter": map[string]any{"path": `C:\u0000-not-a-nul`}}},
+			},
+			want: "",
+		},
+		{
 			// U+0000 IS LEGAL JSON AND UNSTORABLE. Go's decoder turns the
 			// escape into a real NUL, which survives TrimSpace and a rune
 			// count, and then no Postgres text or jsonb column can hold it —
@@ -1709,8 +1739,8 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 		},
 		{
 			// MANY SMALL KEYS, not one long string. jsonb carries a 4-byte
-			// JEntry per key/value pair, so this is 62,822 bytes of JSON text
-			// and 103,956 of jsonb — the exact shape a Go byte guard waves
+			// JEntry per key/value pair, so this is 62,816 bytes of JSON text
+			// and 103,952 of jsonb — the exact shape a Go byte guard waves
 			// through and the constraint rejects. A single 70,000-byte string
 			// was the earlier payload here and is the one case where jsonb and
 			// text agree, so it could not have caught this.
@@ -1744,6 +1774,13 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 			if strings.Contains(string(raw), "SQLSTATE") ||
 				strings.Contains(string(raw), "violates check constraint") {
 				t.Errorf("a Postgres constraint error reached the client: %s", raw)
+			}
+			// AND NOT THE PACKAGE'S OWN SENTINEL. invalidf wrapped with
+			// `%w: %s`, so ErrInvalid's text was prepended to every validation
+			// message and saveFailed forwarded it: a user read
+			// "workflow: invalid: workflow: step 0 has unknown kind".
+			if strings.Contains(string(raw), "workflow: invalid") {
+				t.Errorf("the internal sentinel is on the wire: %s", raw)
 			}
 		})
 	}
@@ -1799,8 +1836,18 @@ func TestAWorkflowNameIsStoredTrimmed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if seeded.Name != padded {
-		t.Fatalf("the repository trimmed on the way in (%q); this case can no longer "+
-			"reproduce what a pre-existing row looks like", seeded.Name)
+		// THIS IS THE REGRESSION, not a broken fixture.
+		//
+		// The seed goes through the repository on purpose: if the repository
+		// normalises on the way in, then Patch also normalises the name it
+		// MERGES for a caller who sent none, which silently renames a workflow
+		// on a PATCH of `enabled` — the exact behaviour the rest of this test
+		// checks. Diagnose it as that rather than as a seeding problem.
+		t.Fatalf("the repository trimmed %q to %q on the way in.\n"+
+			"Normalising there also rewrites the name Patch merges for a caller "+
+			"who sent none, so a PATCH of `enabled` renames the workflow. Move "+
+			"the trim back to the handler, or seed this row with raw SQL.",
+			padded, seeded.Name)
 	}
 	code, body := h.do(t, http.MethodPatch, "/api/v1/workflows/"+seeded.ID, admin,
 		map[string]any{"enabled": false})
@@ -1838,4 +1885,92 @@ func manyKeys(n int) map[string]any {
 		m[fmt.Sprintf("k%d", i)] = i
 	}
 	return m
+}
+
+// THE REPOSITORY'S OWN NUL CHECKS, DRIVEN WHERE THE FUNNEL IS NOT.
+//
+// httputil.DecodeJSON now refuses a NUL before any handler runs, which makes the
+// checks in saveTx unreachable over HTTP — and the subtests named for them pass
+// with those checks deleted, because both layers' messages contain "NUL" and the
+// assertion cannot tell which answered.
+//
+// They still have a job: Repository.Save is EXPORTED and the funnel does not sit
+// in front of it. Anything constructing a workflow in Go — a template gallery, a
+// duplicate-a-workflow path, a migration — reaches saveTx directly, and a NUL
+// there is a 500 at the INSERT. So this drives the checks from that side, where
+// they are the only thing standing between a caller and the database.
+func TestTheRepositoryRefusesNULWithoutTheHTTPFunnel(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := wfRepo(t)
+	ctx := context.Background()
+
+	nul := string(rune(0))
+	step := workflow.Step{Kind: workflow.StepPostMessage, Config: map[string]any{}}
+	trig := workflow.Trigger{EventType: "message.created"}
+
+	for _, c := range []struct {
+		name     string
+		steps    []workflow.Step
+		triggers []workflow.Trigger
+		wfName   string
+		desc     string
+		want     string
+	}{
+		{
+			name:   "in the name",
+			wfName: "bad" + nul + "name",
+			steps:  []workflow.Step{step}, triggers: []workflow.Trigger{trig},
+			want: "NUL",
+		},
+		{
+			// The description shares the name's check and had no case of its
+			// own, so half of that condition was unguarded.
+			name:   "in the description",
+			wfName: fmt.Sprintf("repo-nul-desc-%d", time.Now().UnixNano()),
+			desc:   "bad" + nul + "description",
+			steps:  []workflow.Step{step}, triggers: []workflow.Trigger{trig},
+			want: "NUL",
+		},
+		{
+			name:   "in a step config",
+			wfName: fmt.Sprintf("repo-nul-step-%d", time.Now().UnixNano()),
+			steps: []workflow.Step{{Kind: workflow.StepPostMessage,
+				Config: map[string]any{"body": "a" + nul + "b"}}},
+			triggers: []workflow.Trigger{trig},
+			want:     "config of step 0",
+		},
+		{
+			name:   "nested inside a step config",
+			wfName: fmt.Sprintf("repo-nul-deep-%d", time.Now().UnixNano()),
+			steps: []workflow.Step{{Kind: workflow.StepPostMessage,
+				Config: map[string]any{"a": []any{map[string]any{"b": "x" + nul}}}}},
+			triggers: []workflow.Trigger{trig},
+			want:     "config of step 0",
+		},
+		{
+			name:   "in a trigger filter",
+			wfName: fmt.Sprintf("repo-nul-filter-%d", time.Now().UnixNano()),
+			steps:  []workflow.Step{step},
+			triggers: []workflow.Trigger{{EventType: "message.created",
+				Filter: map[string]any{"k": "a" + nul + "b"}}},
+			want: "filter of trigger 0",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := repo.Save(ctx, ws, "", c.wfName, c.desc, c.steps, c.triggers, true, me)
+			if err == nil {
+				t.Fatal("the repository stored a NUL; the INSERT would answer 500")
+			}
+			if !errors.Is(err, workflow.ErrInvalid) {
+				t.Errorf("the refusal is not a caller error, so the route would "+
+					"report it as 500: %v", err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("the refusal does not say where: %v", err)
+			}
+		})
+	}
 }

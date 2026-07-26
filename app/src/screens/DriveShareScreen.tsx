@@ -62,6 +62,10 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
 
   const load = useCallback(async () => {
     setError(null)
+    // Cleared with `error`, not only on the paths that set it. The shares
+    // failure returns early without touching it, so a links failure followed by
+    // a shares failure left the older banner on screen underneath the new one.
+    setLinksError(null)
     try {
       // TWO INDEPENDENT REQUESTS, NOT ONE Promise.all.
       //
@@ -179,8 +183,14 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
       <ScreenHeader title="Share" subtitle={name} onBack={() => navigation.goBack()} />
       <ScrollView>
         <ContentColumn>
-          {error && <ErrorState message={error} onRetry={load} />}
+          {/* OUTSIDE the error branch, deliberately.
 
+              The token is minted once and the server keeps only its hash, so
+              this box is the single place it ever exists. Putting it inside
+              the branch below meant an unrelated failure destroyed it: create
+              a link, the follow-up grants request 500s, and the secret is
+              replaced by an error banner. A shares failure says nothing about
+              whether the link was minted — it was, and it cannot be reissued. */}
           {freshToken && (
             <View style={styles.tokenBox}>
               <Text style={styles.tokenTitle}>Copy this token now</Text>
@@ -207,63 +217,78 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
             </View>
           )}
 
-          <Section title="People with access">
-            {shares.length === 0 ? (
-              <Text style={styles.empty}>
-                Everyone in the workspace can already open this. Share to give someone more than
-                that.
-              </Text>
-            ) : (
-              shares.map((s) => (
-                <View key={`${s.subject_type}:${s.subject_id}`} style={styles.row}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.rowTitle}>{nameFor(users, s)}</Text>
-                    <Text style={styles.rowMeta}>{s.capability}</Text>
-                  </View>
-                  {s.subject_type === 'user' && (
-                    <Pressable onPress={() => unshare(s)} hitSlop={8} accessibilityRole="button">
-                      <Text style={styles.danger}>Remove</Text>
-                    </Pressable>
-                  )}
-                </View>
-              ))
-            )}
-          </Section>
+          {/* A FAILED GRANTS REQUEST STOPS HERE.
 
-          <Section title="Links">
-            {!linkable ? (
-              <Text style={styles.empty}>
-                Links are for a folder or a file. Grant a person or a group above instead.
-              </Text>
-            ) : linksError ? (
-              <ErrorState message={linksError} onRetry={load} />
-            ) : links.length === 0 ? (
-              <Text style={styles.empty}>No links yet.</Text>
-            ) : (
-              links.map((l) => (
-                <View key={l.id} style={styles.row}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.rowTitle}>
-                      {l.capability} link{l.has_password ? ' · password' : ''}
-                    </Text>
-                    <Text style={styles.rowMeta}>
-                      {l.use_count} use(s)
-                      {l.max_uses ? ` of ${l.max_uses}` : ''}
-                      {l.expires_at ? ` · expires ${new Date(l.expires_at).toLocaleDateString()}` : ''}
-                    </Text>
-                  </View>
-                  <Pressable onPress={() => revokeLink(l)} hitSlop={8} accessibilityRole="button">
-                    <Text style={styles.danger}>Revoke</Text>
+              The banner rendered INLINE, so the sections below still drew:
+              "Everyone in the workspace can already open this." and "No links
+              yet." — two affirmative claims about who can reach the object,
+              from a request that failed. The second sentence is the exact bug
+              this screen fixed for the LINKS request and left open for the
+              shares one, where it is worse: the first line tells an auditor the
+              whole workspace already has access. */}
+          {error ? (
+            <ErrorState message={error} onRetry={load} />
+          ) : (
+            <>
+              <Section title="People with access">
+                {shares.length === 0 ? (
+                  <Text style={styles.empty}>
+                    Everyone in the workspace can already open this. Share to give someone more than
+                    that.
+                  </Text>
+                ) : (
+                  shares.map((s) => (
+                    <View key={`${s.subject_type}:${s.subject_id}`} style={styles.row}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.rowTitle}>{nameFor(users, s)}</Text>
+                        <Text style={styles.rowMeta}>{s.capability}</Text>
+                      </View>
+                      {s.subject_type === 'user' && (
+                        <Pressable onPress={() => unshare(s)} hitSlop={8} accessibilityRole="button">
+                          <Text style={styles.danger}>Remove</Text>
+                        </Pressable>
+                      )}
+                    </View>
+                  ))
+                )}
+              </Section>
+
+              <Section title="Links">
+                {!linkable ? (
+                  <Text style={styles.empty}>
+                    Links are for a folder or a file. Grant a person or a group above instead.
+                  </Text>
+                ) : linksError ? (
+                  <ErrorState message={linksError} onRetry={load} />
+                ) : links.length === 0 ? (
+                  <Text style={styles.empty}>No links yet.</Text>
+                ) : (
+                  links.map((l) => (
+                    <View key={l.id} style={styles.row}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.rowTitle}>
+                          {l.capability} link{l.has_password ? ' · password' : ''}
+                        </Text>
+                        <Text style={styles.rowMeta}>
+                          {l.use_count} use(s)
+                          {l.max_uses ? ` of ${l.max_uses}` : ''}
+                          {l.expires_at ? ` · expires ${new Date(l.expires_at).toLocaleDateString()}` : ''}
+                        </Text>
+                      </View>
+                      <Pressable onPress={() => revokeLink(l)} hitSlop={8} accessibilityRole="button">
+                        <Text style={styles.danger}>Revoke</Text>
+                      </Pressable>
+                    </View>
+                  ))
+                )}
+                {linkable && (
+                  <Pressable style={styles.button} onPress={createLink} accessibilityRole="button">
+                    <Text style={styles.buttonText}>Create a read-only link</Text>
                   </Pressable>
-                </View>
-              ))
-            )}
-            {linkable && (
-              <Pressable style={styles.button} onPress={createLink} accessibilityRole="button">
-                <Text style={styles.buttonText}>Create a read-only link</Text>
-              </Pressable>
-            )}
-          </Section>
+                )}
+              </Section>
+            </>
+          )}
         </ContentColumn>
       </ScrollView>
     </SafeAreaView>

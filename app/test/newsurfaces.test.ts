@@ -384,6 +384,66 @@ describe('the share screen', () => {
     ).toBe(true)
   })
 
+  // A FAILED GRANTS REQUEST MUST NOT LEAVE AFFIRMATIVE CLAIMS ON SCREEN.
+  //
+  // The error banner rendered inline, so both sections still drew underneath it:
+  // "Everyone in the workspace can already open this." and "No links yet." —
+  // statements about who can reach the object, produced by a request that
+  // failed. The links half of this was fixed first and the shares half left
+  // open, where it is worse, because that first line tells someone auditing
+  // access that the whole workspace already has it.
+  it('renders nothing affirmative when the grants request fails', async () => {
+    const fs = await import('node:fs/promises')
+    const src = await fs.readFile('src/screens/DriveShareScreen.tsx', 'utf8')
+
+    // The error must be a BRANCH, not an inline banner: everything else is in
+    // the alternative.
+    expect(
+      src,
+      'the error banner renders inline again, so the sections below still draw',
+    ).toMatch(/\{error \? \(\s*<ErrorState/)
+
+    const branch = src.indexOf('{error ? (')
+    const sections = src.indexOf('<Section title="People with access">')
+    expect(sections, 'the grants section is gone').toBeGreaterThan(-1)
+    expect(
+      branch < sections,
+      'the People/Links sections are not inside the non-error branch',
+    ).toBe(true)
+
+    // And a links failure must not survive into the next load.
+    const loadStart = src.indexOf('const load = useCallback')
+    const firstAwait = src.indexOf('await driveApi.shares', loadStart)
+    expect(
+      src.slice(loadStart, firstAwait),
+      'linksError is not reset at the top of load, so a stale links banner can ' +
+        'render under a newer shares error',
+    ).toContain('setLinksError(null)')
+  })
+
+  // AN UNRELATED FAILURE MUST NOT DESTROY THE ONE-TIME TOKEN.
+  //
+  // The server stores only the token's hash, so the box that shows it after
+  // createLink is the single place it ever exists. Wrapping the page in
+  // `{error ? <ErrorState/> : <>…</>}` put that box inside the non-error branch
+  // — so creating a link, then having the follow-up grants request fail,
+  // replaced the secret with an error banner. The grants request says nothing
+  // about whether the link was minted; it was, and it cannot be reissued.
+  it('keeps the one-time token outside the error branch', async () => {
+    const fs = await import('node:fs/promises')
+    const src = await fs.readFile('src/screens/DriveShareScreen.tsx', 'utf8')
+
+    const token = src.indexOf('{freshToken && (')
+    const errorBranch = src.indexOf('{error ? (')
+    expect(token, 'the token box is gone').toBeGreaterThan(-1)
+    expect(errorBranch, 'the error branch is gone').toBeGreaterThan(-1)
+    expect(
+      token < errorBranch,
+      'the one-time token renders inside the error branch, so a failed grants ' +
+        'request destroys a secret the server cannot reissue',
+    ).toBe(true)
+  })
+
   it('offers links only where the server has them', async () => {
     const fs = await import('node:fs/promises')
     const src = await fs.readFile('src/screens/DriveShareScreen.tsx', 'utf8')

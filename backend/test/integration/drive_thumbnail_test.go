@@ -98,7 +98,7 @@ func TestDriveThumbnailIsGeneratedAndServedInline(t *testing.T) {
 	// THE ONE OBJECT DRIVE SERVES INLINE from a presigned URL, where no CSP
 	// header can travel. Fetch it from the bucket and check what the BUCKET
 	// says it is — the server's intent is not the thing that reaches a browser.
-	object, err := http.Get(*withThumb.ThumbnailURL) //nolint:gosec // a URL the server just minted
+	object, err := httpClient.Get(*withThumb.ThumbnailURL) //nolint:gosec // a URL the server just minted
 	if err != nil {
 		t.Fatalf("fetch thumbnail: %v", err)
 	}

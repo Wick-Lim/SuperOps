@@ -18,7 +18,7 @@ func TestHealthAndMetrics(t *testing.T) {
 		t.Errorf("/health = %d, want 200", code)
 	}
 	// /metrics is plain text, not the JSON envelope.
-	res, err := http.Get(h.base + "/metrics")
+	res, err := httpClient.Get(h.base + "/metrics")
 	if err != nil {
 		t.Fatalf("/metrics: %v", err)
 	}

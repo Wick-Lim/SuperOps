@@ -641,15 +641,24 @@ func (h *Handler) saveFailed(w http.ResponseWriter, err error) {
 		// database's CHECK constraints.
 		httputil.JSONError(w, http.StatusBadRequest, "INVALID_WORKFLOW", err.Error())
 	case database.IsCallerData(err):
-		// A CONSTRAINT GO CANNOT PREDICT, and every value on this path comes
-		// from the request body, so the caller is who sent it.
+		// A CONSTRAINT GO CANNOT PREDICT.
 		//
 		// The one that matters is `workflow_versions_steps_size CHECK
-		// (pg_column_size(steps) <= 65536)`, which measures the stored JSONB. A
-		// byte count of the JSON text cannot stand in for it: 5000 one-character
-		// keys are 62,822 bytes of text and 103,956 of jsonb. A Go guard was
-		// tried and passed exactly the payloads the constraint rejects, so the
-		// database keeps the limit and this translates the refusal.
+		// (pg_column_size(steps) <= 65536)`. A byte count of the JSON TEXT
+		// cannot stand in for it — jsonb carries a 4-byte JEntry per key/value
+		// pair, so `[{"kind":"post_message","config":{"k0":0,…,"k4999":4999}}]`
+		// is 62,816 bytes of text and 103,952 of jsonb — and a Go guard written
+		// for it passed exactly the payloads the constraint rejects. The database keeps the limit; this translates
+		// the refusal.
+		//
+		// NOT every value on this path is the caller's: owner_id, created_by,
+		// workspace_id and the version number are ours. What makes 400 correct
+		// is narrower — the only two constraints OUR values can violate,
+		// `workflow_versions_steps_array` and `workflow_triggers_filter_object`,
+		// are unreachable by construction, because json.Marshal of a []Step is
+		// always an array and nonNilMap is always an object. If either becomes
+		// reachable this branch would report our bug as the caller's, so they
+		// are named here rather than left to be rediscovered.
 		//
 		// The error text is NOT forwarded — it carries the constraint name, the
 		// column list and the failing row.

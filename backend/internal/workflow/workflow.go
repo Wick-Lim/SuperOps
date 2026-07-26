@@ -16,7 +16,6 @@
 package workflow
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -278,12 +277,12 @@ func (r *Repository) saveTx(ctx context.Context, tx pgx.Tx, workspaceID, id, nam
 		return nil, invalidf("a workflow name or description cannot contain a NUL character")
 	}
 	for i, st := range steps {
-		if hasEncodedNUL(st.Config) {
+		if hasNUL(st.Config) {
 			return nil, invalidf("the config of step %d cannot contain a NUL character", i)
 		}
 	}
 	for i, t := range triggers {
-		if hasEncodedNUL(t.Filter) {
+		if hasNUL(t.Filter) {
 			return nil, invalidf("the filter of trigger %d cannot contain a NUL character", i)
 		}
 	}
@@ -293,12 +292,12 @@ func (r *Repository) saveTx(ctx context.Context, tx pgx.Tx, workspaceID, id, nam
 	}
 	for i, st := range steps {
 		if !validStepKind(st.Kind) {
-			return nil, invalidf("workflow: step %d has unknown kind %q", i, st.Kind)
+			return nil, invalidf("step %d has an unknown kind %q", i, st.Kind)
 		}
 	}
 	for i, t := range triggers {
 		if !eventShape.MatchString(t.EventType) {
-			return nil, invalidf("workflow: trigger %d has invalid event type %q", i, t.EventType)
+			return nil, invalidf("trigger %d has an invalid event type %q", i, t.EventType)
 		}
 	}
 	stepsJSON, err := json.Marshal(nonNilSteps(steps))
@@ -306,13 +305,22 @@ func (r *Repository) saveTx(ctx context.Context, tx pgx.Tx, workspaceID, id, nam
 		return nil, fmt.Errorf("encode steps: %w", err)
 	}
 	// NO GO-SIDE SIZE CHECK. `workflow_versions_steps_size CHECK
-	// (pg_column_size(steps) <= 65536)` measures the stored JSONB, and a byte
-	// count of the JSON TEXT cannot predict it: jsonb carries a 4-byte JEntry
-	// per array element and per object key/value pair, so a config of many small
-	// keys inflates. Measured on this database — 5000 one-character keys are
-	// 62,822 bytes of text and 103,956 bytes of jsonb. A guard written here
-	// passed exactly the payloads the constraint rejects, which is worse than no
-	// guard: it reads as protection.
+	// (pg_column_size(steps) <= 65536)` is measured on the JSONB datum, and a
+	// byte count of the JSON TEXT cannot predict it: jsonb carries a 4-byte
+	// JEntry per array element and per object key/value pair, so a config of
+	// many small keys inflates. For
+	// `[{"kind":"post_message","config":{"k0":0,…,"k4999":4999}}]`, which is what
+	// the test sends: 62,816 bytes of JSON text, 103,952 of jsonb. A guard
+	// written here passed exactly the payloads the constraint rejects, which is
+	// worse than no guard: it reads as protection.
+	//
+	// It is NOT the size of the stored column. A CHECK runs before the row is
+	// toasted, so the constraint sees the uncompressed datum while
+	// `SELECT pg_column_size(steps)` afterwards reports the compressed one. For
+	// `[{"kind":"post_message","config":{"k0":0,…,"k2999":2999}}]` on this
+	// database: 61,952 to the CHECK, 21,207 once stored. Anyone measuring
+	// headroom with that query reads about three times more than there is —
+	// which is the wrong direction to be wrong in.
 	//
 	// The constraint is the authority on its own limit, so its violation is
 	// translated at the boundary instead — see saveFailed.
@@ -732,22 +740,60 @@ func nonNilAny(v any) any {
 
 // eventShape mirrors the column's CHECK. Refusing here rather than at the
 // database means the caller is told which trigger is wrong.
-// hasEncodedNUL reports whether an arbitrary decoded JSON value contains U+0000
-// anywhere inside it.
+// hasNUL reports whether a decoded JSON value contains U+0000 anywhere inside
+// it — in a string, in a map key, or nested through arrays and objects.
 //
-// It searches the ENCODED form for the escape rather than the decoded form for
-// the byte, because encoding/json writes U+0000 as `\u0000` — a first attempt
-// looked for a raw NUL in the marshalled bytes, found none, and let every one of
-// these through to the database. The strings the map holds are ordinary Go
-// strings that really do contain the byte; it is only the JSON rendering that
-// escapes it.
-func hasEncodedNUL(v any) bool {
-	b, err := json.Marshal(v)
-	if err != nil {
-		// Unencodable is a different failure, reported by the real Marshal.
-		return false
+// TWO EARLIER VERSIONS OF THIS WERE WRONG IN OPPOSITE DIRECTIONS, both because
+// they inspected the ENCODED form instead of the value:
+//
+//   - searching the marshalled bytes for a raw NUL matched nothing, because
+//     encoding/json writes U+0000 as the escape. Every one of these reached the
+//     database and became a 500.
+//   - searching them for the escape matched too much, because json ALSO escapes
+//     a backslash: a caller sending the six ordinary characters `\u0000` — a
+//     Windows path, a regex, any JSON round-tripped as a string — produced
+//     `"\\u0000"`, which contains the escape at offset 1. It was refused, told
+//     it contained a character that was not there, and the same six characters
+//     were accepted in the `name` field of the same request, which checks the
+//     value instead.
+//
+// So this walks the value. `Step.Config` and `Trigger.Filter` are
+// map[string]any decoded by encoding/json, so the only shapes here are string,
+// float64, bool, nil, map[string]any and []any. Of those, float64, bool and nil
+// cannot hold one; map and slice can, which is why the switch recurses into
+// them.
+//
+// THE INPUT MUST BE encoding/json OUTPUT, and the signature says so: hasNUL
+// takes map[string]any, which is what both call sites already hold, so handing
+// it a struct or a map[string]string is a compile error rather than a silent
+// false. That matters because Save is exported — a typed config for a new step
+// kind, or a duplicate-a-workflow path, is the kind of caller that arrives
+// without anyone rereading this, and a false here is a NUL reaching the
+// database as a 500.
+//
+// What the type cannot prevent is a wrong-shaped value INSIDE the map. The
+// recursion returns false for those, deliberately: a default of true would
+// reject every number and boolean, i.e. every real config.
+func hasNUL(m map[string]any) bool { return hasNULValue(m) }
+
+func hasNULValue(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.ContainsRune(t, 0)
+	case map[string]any:
+		for k, val := range t {
+			if strings.ContainsRune(k, 0) || hasNULValue(val) {
+				return true
+			}
+		}
+	case []any:
+		for _, val := range t {
+			if hasNULValue(val) {
+				return true
+			}
+		}
 	}
-	return bytes.Contains(b, []byte(`\u0000`))
+	return false
 }
 
 var eventShape = regexp.MustCompile(`^[a-z][a-z0-9_.]{0,63}$`)
@@ -765,6 +811,19 @@ var eventShape = regexp.MustCompile(`^[a-z][a-z0-9_.]{0,63}$`)
 // and a Postgres error string is on the wire.
 var ErrInvalid = errors.New("workflow: invalid")
 
+// invalidError carries the caller-facing sentence and NOTHING ELSE.
+//
+// invalidf used to be `fmt.Errorf("%w: %s", ErrInvalid, …)`, and saveFailed
+// forwards the message verbatim — so the sentinel's own text landed on the wire
+// and every validation message got worse, in the change whose point was to keep
+// internals off it: `workflow: step 0 has unknown kind "x"` became
+// `workflow: invalid: workflow: step 0 has unknown kind "x"`. Wrapping through
+// a type keeps errors.Is working without the prefix.
+type invalidError struct{ msg string }
+
+func (e invalidError) Error() string { return e.msg }
+func (e invalidError) Unwrap() error { return ErrInvalid }
+
 func invalidf(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, args...))
+	return invalidError{msg: fmt.Sprintf(format, args...)}
 }
