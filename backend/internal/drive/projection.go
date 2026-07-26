@@ -382,7 +382,15 @@ func (h *Handler) PutProjection(w http.ResponseWriter, r *http.Request) {
 	// changed nothing, and re-publishing on every idle debounce is the storm
 	// this avoids.
 	if applied {
-		if file, err := h.repo.File(r.Context(), fileID); err == nil {
+		file, err := h.repo.File(r.Context(), fileID)
+		if err != nil {
+			// Logged rather than swallowed: the projection is committed, and a
+			// re-index that silently did not happen leaves the document stale
+			// in search with no trace of why.
+			h.logger().Error("projected file could not be re-indexed",
+				"file_id", fileID, "error", err)
+		}
+		if err == nil {
 			// Keyed on the projection seq, NOT on files.updated_at — this write
 			// does not touch the files row, so every projection inside the
 			// stream's two-minute duplicate window used to collapse onto the

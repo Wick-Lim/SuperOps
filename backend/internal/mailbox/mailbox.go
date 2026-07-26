@@ -173,18 +173,38 @@ func (r *Repository) CreateMailbox(ctx context.Context, workspaceID, address, di
 		// needs.
 		var domainID *string
 		if at := strings.LastIndex(address, "@"); at >= 0 {
+			// THE DOMAIN AND EVERY DOMAIN BELOW IT.
+			//
+			// An exact-string comparison read `mail.victim.test` as unclaimed
+			// while `victim.test` was registered to somebody else — and an
+			// audit created a mailbox there. A subdomain is not a different
+			// domain for this purpose: whoever owns victim.test owns the name
+			// space under it, and letting a stranger take
+			// `billing@mail.victim.test` is the same attack with one label
+			// added. The trailing dot is the same trick spelled differently.
+			//
+			// Longest match wins, so a tenant that has registered BOTH
+			// victim.test and mail.victim.test still owns its own subdomain
+			// rather than being refused by its own parent.
+			host := strings.TrimSuffix(address[at+1:], ".")
 			var owner, id string
-			err := tx.QueryRow(ctx,
-				`SELECT id::text, workspace_id::text FROM mail_domains WHERE domain = $1`,
-				address[at+1:]).Scan(&id, &owner)
+			err := tx.QueryRow(ctx, `
+				SELECT id::text, workspace_id::text
+				  FROM mail_domains
+				 WHERE domain = $1 OR $1 LIKE '%.' || domain
+				 ORDER BY length(domain) DESC
+				 LIMIT 1`, host).Scan(&id, &owner)
 			switch {
 			case errors.Is(err, pgx.ErrNoRows):
-				// Unclaimed. Nothing to enforce.
+				// Unclaimed, and no ancestor claims it either.
 			case err != nil:
 				return fmt.Errorf("resolve mail domain: %w", err)
 			case owner != workspaceID:
 				return ErrDomainNotYours
 			default:
+				// Bound to the row that actually matched — which for a
+				// subdomain of a registered domain is the parent. Sending still
+				// waits on that row's verified_at.
 				domainID = &id
 			}
 		}

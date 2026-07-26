@@ -297,3 +297,26 @@ describe('collectPages', () => {
     expect(out.truncated).toBe(false)
   })
 })
+
+// A NULL PAGE IS NOT A CRASH.
+//
+// collectPages guarded `res.data ?? []` and allIssues, written in the same
+// change, did not — so a null page threw a TypeError out of allIssues and out
+// of BoardScreen's Promise.all, killing the whole board render. The server does
+// not send one; the asymmetry between two functions written together was the
+// bug.
+describe('a null page', () => {
+  it('is survived by allIssues', async () => {
+    const { issueApi } = await import('../src/api/issues')
+    net = mockFetch(() => ok(null))
+    const res = await issueApi.allIssues('p-1')
+    expect(res.issues).toEqual([])
+    expect(res.truncated).toBe(false)
+  })
+
+  it('is survived by collectPages', async () => {
+    const { collectPages } = await import('../src/api/client')
+    const out = await collectPages<number>(async () => ({ data: null }) as never)
+    expect(out.items).toEqual([])
+  })
+})

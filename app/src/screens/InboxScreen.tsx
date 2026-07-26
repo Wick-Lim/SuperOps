@@ -39,6 +39,9 @@ export default function InboxScreen({ navigation }: { navigation: any }) {
    * switching mailbox or filter left the previous mailbox's threads on screen
    * as though they belonged to the newly selected one. */
   const [loadingConversations, setLoadingConversations] = useState(false)
+  /** The cursor walk hit its page cap, so the list below is not the whole
+   * queue. Said out loud rather than silently short. */
+  const [truncated, setTruncated] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -59,30 +62,41 @@ export default function InboxScreen({ navigation }: { navigation: any }) {
     }
   }, [workspace])
 
-  const load = useCallback(async () => {
-    if (!selected) return
-    setError(null)
-    // Said out loud. `loading` covered only the mailbox list, so switching
-    // mailbox or filter left the PREVIOUS mailbox's conversations on screen —
-    // reading as though they belonged to the one just selected.
-    setLoadingConversations(true)
-    try {
-      // EVERY page: a shared inbox that stops at 50 conversations with no
-      // "load more" simply loses the older half of the queue.
-      const { items } = await collectPages<Conversation>((cursor) =>
-        mailboxApi.conversations(selected.id, state === 'all' ? undefined : state, cursor),
-      )
-      setConversations(items)
-    } catch (e) {
-      setError(errorMessage(e))
-    } finally {
-      setLoadingConversations(false)
-    }
-  }, [selected, state])
-
+  // THE EFFECT OWNS CANCELLATION, which is why this is not a useCallback the
+  // effect merely calls.
+  //
+  // The walk is up to twenty sequential requests, so switching mailbox or
+  // filter mid-flight left the previous mailbox's conversations to land on top
+  // of the new one's — reading as though they belonged to the mailbox now
+  // selected, with `loadingConversations` already false so no spinner
+  // contradicted them. The pagination made the window twenty round trips wide;
+  // the race was there at one.
+  const [reload, setReload] = useState(0)
   useEffect(() => {
-    void load()
-  }, [load])
+    if (!selected) return
+    let cancelled = false
+    setError(null)
+    setLoadingConversations(true)
+    void (async () => {
+      try {
+        // EVERY page: a shared inbox that stops at 50 conversations with no
+        // "load more" simply loses the older half of the queue.
+        const { items, truncated } = await collectPages<Conversation>((cursor) =>
+          mailboxApi.conversations(selected.id, state === 'all' ? undefined : state, cursor),
+        )
+        if (cancelled) return
+        setConversations(items)
+        setTruncated(truncated)
+      } catch (e) {
+        if (!cancelled) setError(errorMessage(e))
+      } finally {
+        if (!cancelled) setLoadingConversations(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [selected, state, reload])
 
   if (loading) {
     return (
@@ -154,7 +168,7 @@ export default function InboxScreen({ navigation }: { navigation: any }) {
       </ScrollView>
 
       {error ? (
-        <ErrorState message={error} onRetry={load} />
+        <ErrorState message={error} onRetry={() => setReload((n) => n + 1)} />
       ) : loadingConversations ? (
         <LoadingState label="Loading conversations" />
       ) : conversations.length === 0 ? (
@@ -163,6 +177,11 @@ export default function InboxScreen({ navigation }: { navigation: any }) {
         </ContentColumn>
       ) : (
         <ScrollView>
+          {truncated ? (
+            <Text style={styles.truncated}>
+              This mailbox has more conversations than the list loads.
+            </Text>
+          ) : null}
           {conversations.map((c) => (
             <Pressable
               key={c.id}
@@ -352,6 +371,7 @@ export function ConversationScreen({ navigation, route }: { navigation: any; rou
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: theme.bg },
+  truncated: { color: theme.textMuted, fontSize: 12, padding: 10 },
   empty: { color: theme.textFaint, fontSize: 14, paddingVertical: space.md, lineHeight: 20 },
   setup: {
     minHeight: MIN_TOUCH,

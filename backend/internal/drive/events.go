@@ -122,13 +122,22 @@ func (p *Publisher) PublishFileDeletions(ctx context.Context, files []FileRef) {
 		if f.ID == "" || f.WorkspaceID == "" {
 			continue
 		}
-		rev := f.Revision
-		if rev == "" {
-			rev = "deleted"
+		if f.Revision == "" {
+			// LOUD, not defaulted. A constant revision is the collapse this
+			// field exists to prevent — trash and purge shared one once and the
+			// destroyed document was never unindexed. Substituting "deleted"
+			// here would reinstate exactly that, silently, for whichever caller
+			// forgot. Refusing to publish is worse for one event and better for
+			// the next person: cmd/reindex converges a missing unindex, and
+			// nothing converges a collapsed one.
+			p.logger.Error("refusing to publish a deletion with no revision; "+
+				"the caller must supply one that distinguishes this removal",
+				"file_id", f.ID)
+			continue
 		}
 		p.publishFile(ctx, ActionDeleted, &File{
 			ID: f.ID, WorkspaceID: f.WorkspaceID, FileType: f.FileType,
-		}, rev)
+		}, f.Revision)
 	}
 }
 

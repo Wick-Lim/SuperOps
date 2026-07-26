@@ -35,6 +35,42 @@ imports `mailboxApi`.
 | `search.TypeIssue` | Declared and accepted by `parseTypes`; no producer. `?type=issue` always returns nothing. Comments and mail are not indexed at all. |
 | `folder_id` in the search index | Filterable and documented as backing "search inside this folder"; no handler parameter exposes it and `hitAttributes` omits it. |
 
+### Bulk unindexing blocks the request that caused it
+
+Trashing a folder, restoring one and emptying the trash each publish ONE
+synchronous JetStream event per file, inside the HTTP handler, with no cap.
+`JetStream.Publish` waits for the storage ack (3 s timeout each), and restore
+additionally runs one row read per file.
+
+Measured against localhost NATS: trashing 1 file is 6.5 ms, 150 files is 55.7 ms
+— about 330 µs per extra file. Linear and unbounded. With NATS a network hop
+away, a large folder is seconds of blocked request, and there is no resumption:
+the events not yet published are simply lost when the client gives up on an
+operation that has already committed. `internal/drive/events.go` calls this
+"bounded by the folder's contents", which is not a bound.
+
+Left because the fix is a queue, not a patch — the events belong on a durable
+outbox the worker drains, which is a new mechanism with its own ordering and
+retry semantics. Today's failure mode is a slow request and a stale index that
+`make reindex` converges; the queue would be a better answer to a problem
+nobody has hit yet.
+
+### A read-only viewer absorbs every repair request
+
+`SendToRoomLeader` picks the room member with the lowest connection id, with no
+capability filter. But `PutProjection` requires `CapWrite` and the client only
+answers when it is editable — so a document sitting open in one read-only
+viewer's tab absorbs every `collab.project` request and answers none of them.
+
+Migration 064's cursor means the sweep now moves past it rather than freezing,
+so this is "wasted request, document still stale" rather than "queue jammed".
+It is new load on an old function: `collab.compact` tolerated a silent leader
+because compaction is an optimisation, and repair is not.
+
+The fix is a capability-aware leader election, which means the hub knowing each
+member's capability on the document — it currently knows only that they were
+allowed to join. Left as a design change rather than guessed at.
+
 ### Touch targets below the codebase's own minimum
 
 `components/a11y.ts` exports `MIN_TOUCH = 44` and `touchSlop(size)` precisely so

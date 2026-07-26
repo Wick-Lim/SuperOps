@@ -125,8 +125,11 @@ export const issueApi = {
         afterRank: after?.after_rank,
         afterId: after?.after_id,
       })
-      issues.push(...res.data.issues)
-      if (!res.data.has_more || !res.data.next?.after_id) {
+      // `?? []` for the same reason collectPages guards its own: two functions
+      // written together should not disagree about whether a null page is a
+      // crash. The server does not send one; the asymmetry was the bug.
+      issues.push(...(res.data?.issues ?? []))
+      if (!res.data?.has_more || !res.data.next?.after_id) {
         return { issues, truncated: false }
       }
       after = res.data.next

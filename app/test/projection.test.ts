@@ -303,3 +303,62 @@ describe('the catch-up chain reaches the editor', () => {
     ).toBe(true)
   })
 })
+
+// THE NONCE IS CLAIMED WHEN THE WORK IS DONE, NOT WHEN IT IS SCHEDULED.
+//
+// Both catch-up effects arm a timer and claim the request. Claiming BEFORE the
+// timer loses it: the effect's cleanup clears the timer, so any dependency
+// change inside the window — a reconnect flips `status` to 'connecting' and
+// back — re-runs the effect, finds the nonce claimed, and returns. Request
+// answered, nothing published.
+//
+// Asserted on the source because there is no React renderer in this project,
+// and the ordering IS the invariant: the claim must appear after the guard
+// inside the callback, not above it.
+describe('the catch-up claim', () => {
+  it('happens inside the timer, in both surfaces', async () => {
+    const fs = await import('node:fs/promises')
+    for (const [file, marker] of [
+      ['src/screens/CollabDocumentScreen.tsx', 'caughtUp.current = projectNonce'],
+      ['src/editor/Editor.web.tsx', 'caughtUp.current = catchUp'],
+    ] as const) {
+      const whole = await fs.readFile(file, 'utf8')
+      // Scope to the catch-up effect. Searching the whole file backwards from
+      // the claim finds the DEBOUNCE timer instead, which is a different
+      // setTimeout and made the first version of this test pass against the
+      // very ordering it exists to pin.
+      const start = whole.indexOf('const caughtUp = useRef(0)')
+      expect(start, `${file} no longer has the catch-up ref`).toBeGreaterThan(-1)
+      const src = whole.slice(start)
+
+      const claim = src.indexOf(marker)
+      expect(claim, `${file} no longer claims the nonce`).toBeGreaterThan(-1)
+      const timer = src.indexOf('setTimeout(')
+      expect(
+        timer > -1 && timer < claim,
+        `${file} claims the catch-up request before arming its timer, so a ` +
+          `dependency change inside the window swallows the request`,
+      ).toBe(true)
+    }
+  })
+
+  // And it happens after the emptiness check, so an empty result leaves the
+  // request live for the server's next re-ask rather than burning it.
+  it('happens after worthPublishing, in both surfaces', async () => {
+    const fs = await import('node:fs/promises')
+    for (const [file, marker] of [
+      ['src/screens/CollabDocumentScreen.tsx', 'caughtUp.current = projectNonce'],
+      ['src/editor/Editor.web.tsx', 'caughtUp.current = catchUp'],
+    ] as const) {
+      const whole = await fs.readFile(file, 'utf8')
+      const src = whole.slice(whole.indexOf('const caughtUp = useRef(0)'))
+      const claim = src.indexOf(marker)
+      const check = src.indexOf('worthPublishing(projection)')
+      expect(
+        check > -1 && check < claim,
+        `${file} claims the request before checking the projection is worth ` +
+          `publishing, so an empty one burns the request`,
+      ).toBe(true)
+    }
+  })
+})

@@ -1189,6 +1189,35 @@ func TestAMailboxCannotClaimAnotherTenantsDomain(t *testing.T) {
 		t.Fatalf("mailbox domain belongs to %v, want %s", boundTo, victim.workspaceID)
 	}
 
+	// SUBDOMAINS AND THE TRAILING DOT. An exact-string comparison read
+	// mail.victim.test as unclaimed while victim.test was registered to somebody
+	// else, and an audit created a mailbox there. A subdomain is not a different
+	// domain for this purpose — whoever owns the name owns the space under it —
+	// and "victim.test." is the same attack spelled differently.
+	for _, host := range []string{"mail." + domain, "a.b." + domain, domain + "."} {
+		_, err := repo.CreateMailbox(ctx, attacker.workspaceID,
+			fmt.Sprintf("billing-%d@%s", time.Now().UnixNano(), host),
+			"Billing", "BIL", attacker.id)
+		if !errors.Is(err, mailbox.ErrDomainNotYours) {
+			t.Errorf("the attacker created a mailbox at @%s: err = %v", host, err)
+		}
+	}
+
+	// The owner still may, on its own subdomain.
+	if _, err := repo.CreateMailbox(ctx, victim.workspaceID,
+		fmt.Sprintf("sub-%d@mail.%s", time.Now().UnixNano(), domain),
+		"Sub", "SUB", victim.id); err != nil {
+		t.Fatalf("the domain's own tenant was refused on its subdomain: %v", err)
+	}
+
+	// A DIFFERENT domain that merely ENDS with the same letters is not a
+	// subdomain. "notvictim.test" must not match "victim.test".
+	if _, err := repo.CreateMailbox(ctx, attacker.workspaceID,
+		fmt.Sprintf("ok-%d@not%s", time.Now().UnixNano(), domain),
+		"Ok", "OK1", attacker.id); err != nil {
+		t.Fatalf("a domain that merely shares a suffix was refused: %v", err)
+	}
+
 	// An unclaimed domain stays open — a shared demo deployment depends on it.
 	if _, err := repo.CreateMailbox(ctx, attacker.workspaceID,
 		fmt.Sprintf("support-%d@unclaimed.test", time.Now().UnixNano()),

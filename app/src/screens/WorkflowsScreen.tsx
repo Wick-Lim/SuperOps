@@ -4,7 +4,7 @@ import {
 } from 'react-native'
 import { theme } from '../lib/theme'
 import { space, MIN_TOUCH } from '../lib/responsive'
-import { collectPages, errorMessage } from '../api/client'
+import { errorMessage } from '../api/client'
 import { workflowApi } from '../api/workflows'
 import type {
   Catalogue, Workflow, WorkflowRejection, WorkflowRun, WorkflowStep, WorkflowStepRun,
@@ -150,19 +150,38 @@ function WorkflowRow({
 
   useEffect(() => {
     if (!open) return
-    // EVERY page. A run history that silently ends at 50 is worse than a short
-    // one: the list is what an operator reads to decide whether automation is
-    // behaving, and a truncated tail looks like "it stopped firing".
-    void collectPages<WorkflowRun>((cursor) => workflowApi.runs(workflow.id, cursor))
-      .then((r) => setRuns(r.items))
+    // ONE PAGE, deliberately.
+    //
+    // I paginated this and the reasoning was wrong: the list renders
+    // `runs.slice(0, 10)`, so walking twenty pages fetched a thousand runs to
+    // show ten. Worse, `lastFailure` scans whatever was fetched — so a workflow
+    // whose last thousand runs are green except one from months ago grew a
+    // permanent red error banner about a failure nobody can act on.
+    //
+    // The most recent page IS the question this panel answers: is it running,
+    // and did anything just break.
+    let cancelled = false
+    void workflowApi
+      .runs(workflow.id)
+      .then((r) => {
+        if (!cancelled) setRuns(r.data ?? [])
+      })
       .catch(() => undefined)
     void workflowApi
       .rejections(workflow.id)
-      .then((r) => setRejections(r.data ?? []))
+      .then((r) => {
+        if (!cancelled) setRejections(r.data ?? [])
+      })
       .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
   }, [open, workflow.id])
 
-  const lastFailure = runs.find((r) => r.status === 'failed')
+  // Among the runs SHOWN. Scoping it to the rendered slice is what keeps the
+  // banner about something the reader can see for themselves.
+  const shown = runs.slice(0, 10)
+  const lastFailure = shown.find((r) => r.status === 'failed')
 
   return (
     <View style={styles.card}>
@@ -205,7 +224,7 @@ function WorkflowRow({
                 It has not run yet. Nothing it watches for has happened since it was enabled.
               </Text>
             ) : (
-              runs.slice(0, 10).map((r) => <RunRow key={r.id} run={r} />)
+              shown.map((r) => <RunRow key={r.id} run={r} />)
             )}
             {/* The error verbatim: this is the only place anybody finds out
                 why their automation is not working. */}

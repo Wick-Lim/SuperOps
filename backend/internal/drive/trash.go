@@ -105,7 +105,17 @@ func (h *Handler) Restore(w http.ResponseWriter, r *http.Request) {
 	// Re-index what came back. The trash unindexed these; nothing else would
 	// ever put them back, so a restored document was permanently unsearchable.
 	for _, fid := range result.Restored {
-		if file, err := h.repo.File(ctx, fid); err == nil && file != nil {
+		file, err := h.repo.File(ctx, fid)
+		switch {
+		case err != nil:
+			// SAID OUT LOUD. This used to be `if err == nil`, so a transient
+			// database failure left a restored document permanently absent from
+			// search with nothing recorded anywhere. The restore itself has
+			// committed and must not be undone for it; a log line is what makes
+			// `make reindex` a decision somebody can take.
+			h.logger().Error("restored file could not be re-indexed",
+				"file_id", fid, "error", err)
+		case file != nil:
 			h.events.PublishFile(ctx, ActionUpdated, file)
 		}
 	}

@@ -198,12 +198,22 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
     if (fileType !== 'spreadsheet' && fileType !== 'design') return
     if (projectNonce === 0 || caughtUp.current === projectNonce) return
     if (status !== 'synced' || !fileId) return
-    caughtUp.current = projectNonce
     const timer = setTimeout(() => {
+      // CLAIMED HERE, not above. The assignment used to sit before the timer,
+      // and the effect's cleanup clears that timer — so any dependency change
+      // inside the 1500 ms window (a reconnect flips `status` to 'connecting'
+      // and back) re-ran the effect, found the nonce already claimed, and
+      // returned. Request answered, nothing published: the exact swallow the
+      // counter exists to prevent, which I had fixed for `document` and left
+      // here. Editor.web.tsx claims inside its timer for the same reason.
+      if (caughtUp.current === projectNonce) return
       const projection =
         fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq)
-      // EMPTY IS NOT A REPAIR — see worthPublishing.
+      // EMPTY IS NOT A REPAIR — see worthPublishing. Claiming after this check
+      // also means an empty result leaves the request live for the server's
+      // next re-ask rather than burning it.
       if (!worthPublishing(projection)) return
+      caughtUp.current = projectNonce
       publish(projection)
     }, 1500)
     return () => clearTimeout(timer)
