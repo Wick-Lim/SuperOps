@@ -83,9 +83,18 @@ export default function InboxScreen({ navigation }: { navigation: any }) {
         <ScreenHeader title="Inbox" onBack={() => navigation.goBack()} />
         <ContentColumn>
           <Text style={styles.empty}>
-            No mailbox yet. A workspace admin can add one in Settings, then verify its sending
-            domain — until the domain is verified, replies are written but not delivered.
+            No mailbox yet. Setting one up takes three steps: verify a sending domain, add an
+            address, and connect your mail provider.
           </Text>
+          {/* The empty state POINTS AT THE FIX. It used to say "an admin can add
+              one in Settings" about a screen that did not exist. */}
+          <Pressable
+            onPress={() => navigation.navigate('MailSetup')}
+            style={({ pressed }) => [styles.setup, pressed && styles.pressed]}
+            accessibilityRole="button"
+          >
+            <Text style={styles.setupText}>Set up email</Text>
+          </Pressable>
         </ContentColumn>
       </SafeAreaView>
     )
@@ -310,6 +319,14 @@ export function ConversationScreen({ navigation, route }: { navigation: any; rou
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: theme.bg },
   empty: { color: theme.textFaint, fontSize: 14, paddingVertical: space.md, lineHeight: 20 },
+  setup: {
+    minHeight: MIN_TOUCH,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 8,
+    backgroundColor: theme.primary,
+  },
+  setupText: { color: theme.primaryText, fontWeight: '600', fontSize: 15 },
   pressed: { opacity: 0.7 },
 
   chips: { gap: 6, paddingHorizontal: space.md, paddingVertical: space.sm },

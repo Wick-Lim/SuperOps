@@ -43,6 +43,26 @@ func (netResolver) LookupTXT(ctx context.Context, name string) ([]string, error)
 	return net.DefaultResolver.LookupTXT(ctx, name)
 }
 
+// matchesToken reports whether the zone carries our verification value.
+//
+// Extracted so it can be tested: it is the entire ownership check, and a
+// matcher that accepted a prefix — or that treated a failed lookup as a match —
+// would let anybody claim any domain. The zone almost always has other TXT
+// records, so ours only has to be present among them.
+func matchesToken(records []string, token string) bool {
+	if token == "" {
+		return false
+	}
+	for _, rec := range records {
+		// Trimmed, because some registrars store the value with surrounding
+		// quotes and some resolvers hand them back that way.
+		if strings.Trim(strings.TrimSpace(rec), `"`) == token {
+			return true
+		}
+	}
+	return false
+}
+
 // verifyHost is where the operator publishes the token. A dedicated subdomain
 // rather than the apex, so verification does not collide with SPF, DMARC or
 // anything else already living in the zone's TXT records.
@@ -208,16 +228,7 @@ func (h *Handler) VerifyDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	found := false
-	for _, rec := range records {
-		// Trimmed, because some registrars store the value with surrounding
-		// quotes and some resolvers hand them back.
-		if strings.Trim(strings.TrimSpace(rec), `"`) == token {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !matchesToken(records, token) {
 		httputil.JSON(w, http.StatusOK, map[string]any{
 			"verified": false,
 			"reason":   "the TXT record does not match the expected value",

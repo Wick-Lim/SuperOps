@@ -333,6 +333,15 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
           <NavRow label="Work" onPress={() => navigation.navigate('Board')} />
           <NavRow label="Drive" onPress={() => navigation.navigate('Drive')} />
           <NavRow label="Bookmarks" onPress={() => navigation.navigate('Bookmarks')} />
+          {/* The shared inbox and automation. Both were registered, routed and
+              reachable ONLY by typing a URL — which on native, where the prefix
+              is superops://, means not reachable at all. A screen with no way
+              in is a feature that does not exist. */}
+          <NavRow label="Inbox" onPress={() => navigation.navigate('Inbox')} />
+          <NavRow label="Automation" onPress={() => navigation.navigate('Workflows')} />
+          {isWorkspaceAdmin ? (
+            <NavRow label="Email setup" onPress={() => navigation.navigate('MailSetup')} />
+          ) : null}
           {isWorkspaceAdmin ? (
             <NavRow
               label="Admin panel"

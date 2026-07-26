@@ -724,3 +724,178 @@ func TestMailAdministrationIsReachable(t *testing.T) {
 		t.Fatalf("a non-admin minting an ingest token = %d, want 403", code)
 	}
 }
+
+// stubResolver is what SetResolver exists for. Verification's SUCCESS path had
+// never run: every test could only reach the failure branch, because the real
+// resolver was hardcoded and no zone under test publishes our token.
+type stubResolver struct{ records map[string][]string }
+
+func (s stubResolver) LookupTXT(_ context.Context, name string) ([]string, error) {
+	recs, ok := s.records[name]
+	if !ok {
+		return nil, fmt.Errorf("NXDOMAIN")
+	}
+	return recs, nil
+}
+
+// VERIFYING A DOMAIN ADOPTS THE MAILBOXES ALREADY ON IT.
+//
+// Without that an operator verifies the domain, watches mail still not go out,
+// and has nothing to look at: the mailbox keeps a NULL domain_id and the
+// outbound consumer keeps refusing. It is the difference between a working
+// setup flow and one that appears to work.
+func TestVerifyingADomainAdoptsItsMailboxesAndUnblocksSending(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+	n := time.Now().UnixNano()
+	domain := fmt.Sprintf("adopt-%d.test", n)
+
+	// The mailbox exists FIRST — the order an operator actually works in, and
+	// the order that leaves domain_id NULL.
+	mb, err := mailRepo(t).CreateMailbox(ctx, ws, fmt.Sprintf("help@%s", domain), "Help", "ADO", me)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/mail/domains", admin, map[string]string{"domain": domain})
+	var dom struct {
+		ID          string `json:"id"`
+		VerifyHost  string `json:"verify_host"`
+		VerifyValue string `json:"verify_value"`
+	}
+	decodeInto(t, resp.Data, &dom)
+
+	// Publish the record, in the resolver the handler will consult.
+	h.app.MailboxHandler.SetResolver(stubResolver{
+		records: map[string][]string{dom.VerifyHost: {"v=spf1 -all", dom.VerifyValue}},
+	})
+	t.Cleanup(func() { h.app.MailboxHandler.SetResolver(stubResolver{}) })
+
+	var verdict struct {
+		Verified bool   `json:"verified"`
+		Reason   string `json:"reason"`
+	}
+	decodeInto(t, h.req(t, http.StatusOK, http.MethodPost,
+		"/api/v1/mail/domains/"+dom.ID+"/verify", admin, nil).Data, &verdict)
+	if !verdict.Verified {
+		t.Fatalf("a published TXT record did not verify: %s", verdict.Reason)
+	}
+
+	// THE ADOPTION. The mailbox created before verification now points at the
+	// verified domain.
+	var adopted *string
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT domain_id::text FROM mailboxes WHERE id = $1`, mb.ID).Scan(&adopted); err != nil {
+		t.Fatal(err)
+	}
+	if adopted == nil || *adopted != dom.ID {
+		t.Fatal("verifying the domain did not adopt the mailbox already on it; sending stays " +
+			"blocked with nothing to look at")
+	}
+
+	// And sending now works, which is the property the whole step exists for.
+	conv, _, err := mailRepo(t).Ingest(ctx, inbound(mb, fmt.Sprintf("adopt-%d", n)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rresp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/conversations/"+conv.ID+"/reply", admin, map[string]string{"body_text": "now it goes"})
+	var reply struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, rresp.Data, &reply)
+
+	sender := &recordingSender{}
+	if err := mailbox.NewConsumer(h.app.DB, sender, nil).Deliver(ctx, reply.ID); err != nil {
+		t.Fatal(err)
+	}
+	if sender.count() != 1 {
+		t.Fatal("the reply still did not go out after the domain was verified")
+	}
+}
+
+// THE SWEEP MUST NOT HEAD-OF-LINE BLOCK on messages it will always refuse.
+//
+// A reply from an unverified domain keeps its NULL sent_at forever. Selecting
+// those oldest-first meant a few hundred of them starved every newer reply —
+// including ones from a mailbox whose domain IS verified, which the sweeper
+// would then never reach.
+func TestTheSweepSkipsPermanentlyUnsendableMessages(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+	n := time.Now().UnixNano()
+
+	// An OLD reply that can never be sent: no verified domain.
+	stuck := newMailbox(t, ws, me)
+	stuckConv, _, err := mailRepo(t).Ingest(ctx, inbound(stuck, fmt.Sprintf("stuck-%d", n)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sresp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/conversations/"+stuckConv.ID+"/reply", admin, map[string]string{"body_text": "stuck"})
+	var stuckReply struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, sresp.Data, &stuckReply)
+	if _, err := h.app.DB.Exec(ctx,
+		`UPDATE mail_messages SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1`,
+		stuckReply.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A NEWER reply that CAN be sent.
+	domain := fmt.Sprintf("sendable-%d.test", n)
+	var domainID string
+	if err := h.app.DB.QueryRow(ctx, `
+		INSERT INTO mail_domains (workspace_id, domain, verify_token, verified_at)
+		VALUES ($1, $2, 'tok', NOW()) RETURNING id::text`, ws, domain).Scan(&domainID); err != nil {
+		t.Fatal(err)
+	}
+	good, err := mailRepo(t).CreateMailbox(ctx, ws, fmt.Sprintf("ok@%s", domain), "OK", "OKM", me)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.app.DB.Exec(ctx, `UPDATE mailboxes SET domain_id = $2 WHERE id = $1`, good.ID, domainID); err != nil {
+		t.Fatal(err)
+	}
+	goodConv, _, err := mailRepo(t).Ingest(ctx, inbound(good, fmt.Sprintf("good-%d", n)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gresp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/conversations/"+goodConv.ID+"/reply", admin, map[string]string{"body_text": "deliverable"})
+	var goodReply struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, gresp.Data, &goodReply)
+	if _, err := h.app.DB.Exec(ctx,
+		`UPDATE mail_messages SET created_at = NOW() - INTERVAL '10 minutes' WHERE id = $1`,
+		goodReply.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A batch of ONE. If the unsendable message were selected it would consume
+	// the whole batch and the deliverable one would never be reached.
+	sender := &recordingSender{}
+	sent, err := mailbox.NewConsumer(h.app.DB, sender, nil).SweepUnsent(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sender.count() != 1 {
+		t.Fatalf("the sweep sent %d messages with a batch of 1; the unsendable message is "+
+			"starving the deliverable one", sender.count())
+	}
+	// AND THE COUNT IS HONEST. Counting a refusal as a delivery made the worker
+	// log "delivered replies the queue had lost" on every pass of a deployment
+	// whose domain is simply not verified.
+	if sent != 1 {
+		t.Fatalf("SweepUnsent reported %d delivered, want 1", sent)
+	}
+}

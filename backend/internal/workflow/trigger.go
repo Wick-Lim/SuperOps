@@ -117,6 +117,15 @@ func (c *TriggerConsumer) Handle(ctx context.Context, msg *nats.Msg) error {
 		return nil
 	}
 
+	// PROVENANCE, read out of the event. A message posted BY a workflow carries
+	// how deep in a chain it is; a human's message carries nothing and is
+	// therefore depth 0.
+	var provenance struct {
+		Depth int    `json:"workflow_depth"`
+		Root  string `json:"workflow_root_run_id"`
+	}
+	_ = json.Unmarshal(env.Data, &provenance)
+
 	payload := map[string]any{}
 	if len(env.Data) > 0 {
 		// A payload that is not an object is not a filter target and not a
@@ -144,8 +153,17 @@ func (c *TriggerConsumer) Handle(ctx context.Context, msg *nats.Msg) error {
 			continue
 		}
 
-		_, err := c.repo.EnqueueRun(ctx, m, eventType, triggerKey+":"+m.WorkflowID, encoded)
+		_, err := c.repo.EnqueueRunAt(ctx, m, eventType, triggerKey+":"+m.WorkflowID, encoded,
+			provenance.Depth, provenance.Root)
 		switch {
+		case errors.Is(err, ErrLoopGuard):
+			// A runaway. Recorded so the author sees WHY it stopped rather than
+			// discovering that automation silently gave up — and acked, because
+			// redelivering produces the same refusal.
+			c.repo.RecordRejection(ctx, m.WorkflowID, m.WorkspaceID, eventType,
+				"loop guard: this workflow is triggering itself, or is running far too often")
+			c.logger.Warn("workflow loop guard tripped",
+				"workflow_id", m.WorkflowID, "event", eventType, "depth", provenance.Depth)
 		case errors.Is(err, ErrDuplicate):
 			// Redelivery. The run exists; nothing to do.
 		case err != nil:

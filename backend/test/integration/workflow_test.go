@@ -46,7 +46,7 @@ func (p *countingPoster) count() int {
 
 type failingPoster struct{ calls int }
 
-func (p *failingPoster) PostAs(context.Context, string, string, string) (string, error) {
+func (p *failingPoster) CreateFor(context.Context, string, string, string, string, int, string) (string, error) {
 	p.calls++
 	return "", errors.New("the chat surface is down")
 }
@@ -104,7 +104,7 @@ func TestARetriedRunDoesNotPerformItsEffectTwice(t *testing.T) {
 	}
 
 	poster := &countingPoster{}
-	exec := workflow.NewExecutor(repo, nil, workflow.NewPostMessageAction(poster))
+	exec := workflow.NewExecutor(repo, nil, workflow.NewMessageAction(h.app.Authz, &recordingCreator{poster: poster}))
 
 	// The run is constructed directly rather than claimed from the queue.
 	//
@@ -332,7 +332,7 @@ func TestAFailingStepStopsTheRun(t *testing.T) {
 	}
 
 	poster := &failingPoster{}
-	exec := workflow.NewExecutor(repo, nil, workflow.NewPostMessageAction(poster))
+	exec := workflow.NewExecutor(repo, nil, workflow.NewMessageAction(h.app.Authz, poster))
 	// OwnerID is set: an ownerless run now fails before reaching any step, so
 	// without it this would assert the wrong refusal.
 	run := &workflow.Run{ID: runID, WorkspaceID: ws, OwnerID: me, Payload: []byte(`{}`)}
@@ -753,7 +753,8 @@ func TestTheWorkflowAPIIsReachableAndAdminGated(t *testing.T) {
 // authorization tests do not depend on the chat schema.
 type recordingCreator struct{ poster *countingPoster }
 
-func (c *recordingCreator) CreateAs(ctx context.Context, workspaceID, channelID, userID, body string) (string, error) {
+func (c *recordingCreator) CreateFor(ctx context.Context, workspaceID, channelID, userID, body string,
+	_ int, _ string) (string, error) {
 	return c.poster.PostAs(ctx, workspaceID, channelID, body)
 }
 
@@ -944,4 +945,164 @@ func TestClaimRunTakesAPendingRunWithItsSteps(t *testing.T) {
 		t.Fatalf("claimed run status = %q, want running — two workers would take it", status)
 	}
 	_ = repo.FinishRun(ctx, run.ID, "cancelled", "claimed by a test")
+}
+
+// THE RUNAWAY, reproduced.
+//
+// "When a message is posted, post a message" is a workflow anybody would write
+// by accident, and it loops forever: the poster publishes message.created, the
+// consumer is bound to it, and the idempotency key cannot help because every
+// iteration is a genuinely new message with a genuinely fresh stream sequence.
+// Every one is a real event, correctly deduplicated, and there are infinitely
+// many of them.
+//
+// This drives the actual cascade — poster to consumer to poster — and asserts
+// it STOPS.
+func TestAWorkflowThatTriggersItselfIsStopped(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	channel := h.createChannel(t, admin, ws, uniqueSlug("wf-loop"))
+	repo := wfRepo(t)
+	ctx := context.Background()
+
+	wf := saveWorkflow(t, ws, me,
+		[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{
+			"channel_id": channel, "body": "and again",
+		}}},
+		[]workflow.Trigger{{EventType: "message.created"}})
+
+	consumer := workflow.NewTriggerConsumer(repo, nil)
+	poster := &countingPoster{}
+	exec := workflow.NewExecutor(repo, nil,
+		workflow.NewMessageAction(h.app.Authz, &recordingCreator{poster: poster}))
+
+	// One human message starts it. Then run the cascade by hand: each round
+	// executes the queued runs and feeds their output back as the next event,
+	// exactly as the poster and the consumer do in production.
+	depth := 0
+	root := ""
+	seq := time.Now().UnixNano()
+	rounds := 0
+
+	for round := 0; round < 25; round++ {
+		payload, _ := json.Marshal(map[string]any{
+			"type": "message.new",
+			"data": map[string]any{
+				"id": fmt.Sprintf("m%d", round), "channel_id": channel, "user_id": me,
+				// Provenance, as the workflow poster stamps it.
+				"workflow_depth": depth, "workflow_root_run_id": root,
+			},
+		})
+		seq++
+		if err := consumer.Handle(ctx, &nats.Msg{
+			Subject: "superops." + ws + ".message.created",
+			Data:    payload,
+			Header:  nats.Header{natspkg.HeaderStreamSequence: []string{fmt.Sprint(seq)}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Execute whatever it queued for THIS workflow.
+		var runID string
+		var runDepth int
+		var runRoot *string
+		err := h.app.DB.QueryRow(ctx, `
+			SELECT id::text, depth, root_run_id::text FROM workflow_runs
+			 WHERE workflow_id = $1 AND status = 'pending'
+			 ORDER BY created_at LIMIT 1`, wf.ID).Scan(&runID, &runDepth, &runRoot)
+		if err != nil {
+			// Nothing queued — the guard refused. That is the pass condition.
+			break
+		}
+		rounds++
+		run := &workflow.Run{
+			ID: runID, WorkflowID: wf.ID, WorkspaceID: ws, OwnerID: me,
+			Depth: runDepth, Payload: []byte(`{}`),
+		}
+		if runRoot != nil {
+			run.RootRunID = *runRoot
+		} else {
+			run.RootRunID = runID
+		}
+		if err := exec.Run(ctx, run, wf.Steps); err != nil {
+			t.Fatal(err)
+		}
+		// The next event carries the run's provenance, one generation deeper.
+		depth = runDepth + 1
+		root = run.RootRunID
+	}
+
+	if rounds > workflow.MaxDepth+1 {
+		t.Fatalf("the cascade ran %d generations; the depth guard (max %d) did not stop it",
+			rounds, workflow.MaxDepth)
+	}
+	if poster.count() > workflow.MaxDepth+1 {
+		t.Fatalf("the workflow posted %d messages from one human message", poster.count())
+	}
+
+	// And the author is TOLD why it stopped, rather than discovering that
+	// automation silently gave up.
+	var reason string
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT reason FROM workflow_trigger_rejections
+		  WHERE workflow_id = $1 ORDER BY created_at DESC LIMIT 1`, wf.ID).Scan(&reason); err != nil {
+		t.Fatalf("no rejection was recorded, so nobody can tell why it stopped: %v", err)
+	}
+	if !strings.Contains(reason, "loop") {
+		t.Errorf("rejection reason = %q, want it to name the loop guard", reason)
+	}
+}
+
+// The RATE CAP is the guard that does not need provenance, and it is the one
+// that survives a producer somebody adds next year without reading the loop
+// comment.
+func TestTheRateCapStopsALoopWithNoProvenance(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := wfRepo(t)
+	ctx := context.Background()
+
+	wf := saveWorkflow(t, ws, me,
+		[]workflow.Step{{Kind: workflow.StepNotify, Config: map[string]any{"user_id": me, "title": "x"}}},
+		[]workflow.Trigger{{EventType: "wf.test.rate"}})
+	matches, _ := repo.MatchingWorkflows(ctx, ws, "wf.test.rate")
+	var match workflow.Matching
+	for _, m := range matches {
+		if m.WorkflowID == wf.ID {
+			match = m
+		}
+	}
+
+	// Every event has depth 0 — a producer that propagates nothing — so only
+	// the rate cap can stop this.
+	n := time.Now().UnixNano()
+	refused := false
+	for i := 0; i < workflow.MaxRunsPerMinute+5; i++ {
+		_, err := repo.EnqueueRunAt(ctx, match, "wf.test.rate",
+			fmt.Sprintf("evt-rate-%d-%d", n, i), nil, 0, "")
+		if errors.Is(err, workflow.ErrLoopGuard) {
+			refused = true
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !refused {
+		t.Fatalf("queued more than %d runs in a minute without the rate cap tripping",
+			workflow.MaxRunsPerMinute)
+	}
+
+	var queued int
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT count(*) FROM workflow_runs WHERE workflow_id = $1`, wf.ID).Scan(&queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued > workflow.MaxRunsPerMinute {
+		t.Fatalf("%d runs queued, cap is %d", queued, workflow.MaxRunsPerMinute)
+	}
 }

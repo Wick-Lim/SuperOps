@@ -6,7 +6,9 @@ import { theme } from '../lib/theme'
 import { space, MIN_TOUCH } from '../lib/responsive'
 import { errorMessage } from '../api/client'
 import { workflowApi } from '../api/workflows'
-import type { Catalogue, Workflow, WorkflowRejection, WorkflowRun, WorkflowStep } from '../api/workflows'
+import type {
+  Catalogue, Workflow, WorkflowRejection, WorkflowRun, WorkflowStep, WorkflowStepRun,
+} from '../api/workflows'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { ContentColumn, ErrorState, LoadingState, ScreenHeader, Section } from './internal/ui'
 
@@ -198,14 +200,7 @@ function WorkflowRow({
                 It has not run yet. Nothing it watches for has happened since it was enabled.
               </Text>
             ) : (
-              runs.slice(0, 10).map((r) => (
-                <View key={r.id} style={styles.runRow}>
-                  <Text style={[styles.runStatus, statusStyle(r.status)]}>{r.status}</Text>
-                  <Text style={styles.runMeta} numberOfLines={1}>
-                    {r.event_type} · {new Date(r.created_at).toLocaleString()}
-                  </Text>
-                </View>
-              ))
+              runs.slice(0, 10).map((r) => <RunRow key={r.id} run={r} />)
             )}
             {/* The error verbatim: this is the only place anybody finds out
                 why their automation is not working. */}
@@ -215,6 +210,49 @@ function WorkflowRow({
           </Section>
         </View>
       )}
+    </View>
+  )
+}
+
+/** One run, expandable to its steps.
+ *
+ * The run list says a run FAILED. Only the step detail says which step and
+ * why — and "step 2 (post_message): the workflow owner may not write channel X"
+ * is the difference between fixing it and guessing. */
+function RunRow({ run }: { run: WorkflowRun }) {
+  const [steps, setSteps] = useState<WorkflowStepRun[] | null>(null)
+  const [open, setOpen] = useState(false)
+
+  useEffect(() => {
+    if (!open || steps) return
+    void workflowApi
+      .run(run.id)
+      .then((r) => setSteps(r.data?.steps ?? []))
+      .catch(() => setSteps([]))
+  }, [open, steps, run.id])
+
+  return (
+    <View>
+      <Pressable
+        onPress={() => setOpen((v) => !v)}
+        style={styles.runRow}
+        accessibilityRole="button"
+        accessibilityLabel={`Run ${run.status}, ${run.event_type}`}
+      >
+        <Text style={[styles.runStatus, statusStyle(run.status)]}>{run.status}</Text>
+        <Text style={styles.runMeta} numberOfLines={1}>
+          {run.event_type} · {new Date(run.created_at).toLocaleString()}
+        </Text>
+      </Pressable>
+      {open &&
+        (steps ?? []).map((s) => (
+          <View key={s.step_index} style={styles.stepRow}>
+            <Text style={[styles.stepStatus, statusStyle(s.status as WorkflowRun['status'])]}>
+              {s.step_index + 1}. {s.kind} — {s.status}
+            </Text>
+            {s.error ? <Text style={styles.failure}>{s.error}</Text> : null}
+          </View>
+        ))}
     </View>
   )
 }
@@ -358,6 +396,35 @@ function WorkflowEditor({
           >
             <Text style={styles.primaryText}>{saving ? 'Saving' : 'Save workflow'}</Text>
           </Pressable>
+
+          {/* Deleting the workflow, not a step. The editor's other "Remove"
+              controls remove a step, which is a different and much smaller
+              thing — so this one says what it deletes and confirms. */}
+          {workflow && (
+            <Pressable
+              onPress={() =>
+                Alert.alert('Delete this workflow?', 'It stops running immediately.', [
+                  { text: 'Cancel', style: 'cancel' },
+                  {
+                    text: 'Delete',
+                    style: 'destructive',
+                    onPress: async () => {
+                      try {
+                        await workflowApi.archive(workflow.id)
+                        onSaved()
+                      } catch (e) {
+                        Alert.alert('Could not delete that workflow', errorMessage(e))
+                      }
+                    },
+                  },
+                ])
+              }
+              style={({ pressed }) => [styles.destructive, pressed && styles.pressed]}
+              accessibilityRole="button"
+            >
+              <Text style={styles.destructiveText}>Delete workflow</Text>
+            </Pressable>
+          )}
         </ContentColumn>
       </ScrollView>
     </SafeAreaView>
@@ -437,4 +504,15 @@ const styles = StyleSheet.create({
   stepHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   stepTitle: { color: theme.text, fontSize: 14, fontWeight: '600' },
   remove: { color: theme.danger, fontSize: 13 },
+  destructive: {
+    minHeight: MIN_TOUCH,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 8,
+    backgroundColor: theme.surfaceAlt,
+    marginBottom: space.lg,
+  },
+  destructiveText: { color: theme.danger, fontWeight: '600', fontSize: 15 },
+  stepRow: { paddingLeft: space.md, paddingVertical: 2 },
+  stepStatus: { fontSize: 12 },
 })

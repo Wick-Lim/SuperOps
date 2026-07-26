@@ -135,6 +135,20 @@ func (c *Consumer) Handle(ctx context.Context, msg *nats.Msg) error {
 // Deliver sends one stored outbound message by id. Shared by the consumer and
 // by the sweeper, so both take exactly the same path.
 func (c *Consumer) Deliver(ctx context.Context, messageID string) error {
+	_, err := c.deliver(ctx, messageID)
+	return err
+}
+
+// deliver reports whether it ACTUALLY SENT, which the sweeper needs and the
+// consumer does not.
+//
+// The distinction is not bookkeeping: Deliver returns nil for a message it
+// REFUSED — an unverified sending domain, no recipient — because redelivering
+// it produces the same refusal. A sweeper that counted those as delivered would
+// log "delivered replies the queue had lost" on every pass of a deployment
+// whose domain is simply not verified, telling an operator that customer
+// replies went out when nothing did.
+func (c *Consumer) deliver(ctx context.Context, messageID string) (bool, error) {
 	var (
 		fromAddr, fromName      string
 		toAddr                  string
@@ -164,17 +178,17 @@ func (c *Consumer) Deliver(ctx context.Context, messageID string) error {
 		&rfcMessageID, &inReplyTo, &references, &verified, &alreadySent)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Not ours, or deleted. Acked: redelivering will not make it exist.
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("load outbound message %s: %w", messageID, err)
+		return false, fmt.Errorf("load outbound message %s: %w", messageID, err)
 	}
 	if alreadySent {
-		return nil
+		return false, nil
 	}
 	if toAddr == "" {
 		c.logger.Warn("outbound mail has no recipient", "mail_message_id", messageID)
-		return nil
+		return false, nil
 	}
 	if !verified {
 		// REFUSED, not retried. Sending as a domain the deployment does not
@@ -184,7 +198,7 @@ func (c *Consumer) Deliver(ctx context.Context, messageID string) error {
 		// the moment the domain is verified.
 		c.logger.Warn("refusing to send from an unverified domain",
 			"mail_message_id", messageID, "from", fromAddr)
-		return nil
+		return false, nil
 	}
 
 	out := &mail.Message{
@@ -205,7 +219,7 @@ func (c *Consumer) Deliver(ctx context.Context, messageID string) error {
 	if err := c.sender.Send(ctx, out); err != nil {
 		// Returned, so the consumer naks and JetStream redelivers. sent_at is
 		// still NULL, so the retry is a fresh attempt rather than a duplicate.
-		return fmt.Errorf("send outbound message %s: %w", messageID, err)
+		return false, fmt.Errorf("send outbound message %s: %w", messageID, err)
 	}
 
 	if _, err := c.pool.Exec(ctx,
@@ -218,7 +232,7 @@ func (c *Consumer) Deliver(ctx context.Context, messageID string) error {
 		c.logger.Error("outbound mail was SENT but could not be stamped; it may be re-sent "+
 			"by the sweeper", "mail_message_id", messageID, "error", err)
 	}
-	return nil
+	return true, nil
 }
 
 // SweepUnsent delivers outbound messages that were never queued or whose
@@ -229,11 +243,22 @@ func (c *Consumer) Deliver(ctx context.Context, messageID string) error {
 // notice what the queue lost. It is also what drains everything written before
 // the delivery path existed at all.
 func (c *Consumer) SweepUnsent(ctx context.Context, limit int) (int, error) {
+	// ONLY MESSAGES THAT CAN ACTUALLY BE SENT.
+	//
+	// A reply from an unverified domain is refused every time and keeps its
+	// NULL sent_at forever. Selecting those oldest-first meant a few hundred of
+	// them starved every newer reply — including replies from a mailbox whose
+	// domain IS verified, which the sweeper would then never reach. The join
+	// filters them at the source rather than discovering the refusal per row.
 	rows, err := c.pool.Query(ctx, `
 		SELECT m.id::text
 		  FROM mail_messages m
+		  JOIN mail_conversations conv ON conv.id = m.conversation_id
+		  JOIN mailboxes mb ON mb.id = conv.mailbox_id
+		  JOIN mail_domains d ON d.id = mb.domain_id AND d.verified_at IS NOT NULL
 		 WHERE m.direction = 'outbound'
 		   AND m.sent_at IS NULL
+		   AND conv.customer_email <> ''
 		   -- A grace period, so this never races the consumer for a message
 		   -- queued a moment ago.
 		   AND m.created_at < NOW() - INTERVAL '2 minutes'
@@ -258,14 +283,19 @@ func (c *Consumer) SweepUnsent(ctx context.Context, limit int) (int, error) {
 
 	sent := 0
 	for _, id := range ids {
-		if err := c.Deliver(ctx, id); err != nil {
+		delivered, err := c.deliver(ctx, id)
+		if err != nil {
 			// One bad message must not stop the sweep. It stays unsent and the
 			// next pass tries again.
 			c.logger.Warn("sweep could not deliver an outbound message",
 				"mail_message_id", id, "error", err)
 			continue
 		}
-		sent++
+		// Counted only when something actually went out. A refusal returns nil
+		// and must not be reported as a delivery.
+		if delivered {
+			sent++
+		}
 	}
 	return sent, nil
 }

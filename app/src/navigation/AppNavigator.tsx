@@ -32,6 +32,7 @@ import DriveShareScreen from '../screens/DriveShareScreen'
 import CollabDocumentScreen from '../screens/CollabDocumentScreen'
 import WorkflowsScreen from '../screens/WorkflowsScreen'
 import InboxScreen, { ConversationScreen } from '../screens/InboxScreen'
+import MailSetupScreen from '../screens/MailSetupScreen'
 import SettingsScreen from '../screens/SettingsScreen'
 import AdminScreen from '../screens/AdminScreen'
 import ChannelDetailScreen from '../screens/ChannelDetailScreen'
@@ -77,6 +78,7 @@ export type RootStackParamList = {
   Workflows: undefined
   Inbox: undefined
   Conversation: { conversationId: string }
+  MailSetup: undefined
   /** Internal: shown while the post-login workspace lookup is in flight. */
   Bootstrap: undefined
 }
@@ -156,6 +158,7 @@ const linking: LinkingOptions<RootStackParamList> = {
       Workflows: 'automation',
       Inbox: 'inbox',
       Conversation: 'conversations/:conversationId',
+      MailSetup: 'inbox/setup',
       Settings: 'settings',
       Admin: 'admin',
     },
@@ -354,6 +357,7 @@ export default function AppNavigator() {
       <Stack.Screen name="Workflows" component={WorkflowsScreen} />
       <Stack.Screen name="Inbox" component={InboxScreen} />
       <Stack.Screen name="Conversation" component={ConversationScreen} />
+      <Stack.Screen name="MailSetup" component={MailSetupScreen} />
       <Stack.Screen name="Settings" component={SettingsScreen} />
       <Stack.Screen name="Admin" component={AdminScreen} />
     </>

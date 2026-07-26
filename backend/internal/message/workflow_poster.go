@@ -52,6 +52,18 @@ type posted struct {
 	ContentType string    `json:"content_type"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+
+	// PROVENANCE. This message was posted BY a workflow, and these two fields
+	// are how the trigger consumer knows not to let it start an infinite
+	// cascade: a workflow whose trigger is `message.created` and whose step is
+	// `post_message` would otherwise run forever, and the idempotency key
+	// cannot stop it — every iteration is a genuinely new message with a
+	// genuinely fresh stream sequence.
+	//
+	// Named with a prefix so no other consumer mistakes them for message
+	// fields, and omitted entirely on a human post.
+	WorkflowDepth int    `json:"workflow_depth,omitempty"`
+	WorkflowRoot  string `json:"workflow_root_run_id,omitempty"`
 }
 
 // CreateAs writes the message and announces it.
@@ -64,6 +76,12 @@ type posted struct {
 // tenant must not post there, and that is a tenancy fact rather than a
 // capability one.
 func (p *WorkflowPoster) CreateAs(ctx context.Context, workspaceID, channelID, userID, body string) (string, error) {
+	return p.CreateFor(ctx, workspaceID, channelID, userID, body, 0, "")
+}
+
+// CreateFor posts and stamps the provenance of the run that produced it.
+func (p *WorkflowPoster) CreateFor(ctx context.Context, workspaceID, channelID, userID, body string,
+	depth int, rootRunID string) (string, error) {
 	if p == nil || p.pool == nil {
 		return "", fmt.Errorf("message: no database, so nothing can be posted")
 	}
@@ -77,6 +95,10 @@ func (p *WorkflowPoster) CreateAs(ctx context.Context, workspaceID, channelID, u
 		// and a client that renders it as one would be lying about who is in
 		// the conversation.
 		ContentType: "system",
+		// depth+1: this message is one generation further from whatever
+		// started the chain.
+		WorkflowDepth: depth + 1,
+		WorkflowRoot:  rootRunID,
 	}
 
 	err := database.WithTx(ctx, p.pool, func(tx pgx.Tx) error {

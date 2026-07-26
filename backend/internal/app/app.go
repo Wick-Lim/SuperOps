@@ -74,6 +74,12 @@ type App struct {
 	// to be able to look at the bucket, and handlers are given it directly.
 	Storage storage.Backend
 
+	// MailboxHandler is exported so a test can substitute the DNS resolver.
+	// Domain verification's SUCCESS path is otherwise untestable — the real
+	// resolver is hardcoded and no zone under test publishes our token — which
+	// means an ownership check nobody had ever seen pass.
+	MailboxHandler *mailbox.Handler
+
 	// Drive is exported so a test can drive the same search.BodySource the
 	// worker uses. Without it a test would have to restate what the worker
 	// reads, which is how an indexer and its test agree with each other and
@@ -362,6 +368,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	if len(cfg.RTC.ICEURLs) > 0 {
 		ice = rtc.StaticICE{URLs: cfg.RTC.ICEURLs, Secret: cfg.RTC.ICESecret, TTL: cfg.RTC.ICETTL}
 	}
+	mailboxHandler := mailbox.NewHandler(pool, az, mailbox.NewPublisher(natsClient, logger), logger)
 	huddleHandler := huddle.NewHandler(pool, az, media, ice, hub, auditService,
 		cfg.RTC.WebhookSecret, logger)
 	// Automation. The API is the authoring surface; cmd/worker owns the trigger
@@ -505,16 +512,17 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	}
 
 	appInstance := &App{
-		Config:  cfg,
-		Logger:  logger,
-		Storage: fileStorage,
-		Drive:   driveRepo,
-		DB:      pool,
-		Redis:   redisClient,
-		NATS:    natsClient,
-		Hub:     hub,
-		Authz:   az,
-		audit:   auditService,
+		Config:         cfg,
+		Logger:         logger,
+		Storage:        fileStorage,
+		Drive:          driveRepo,
+		MailboxHandler: mailboxHandler,
+		DB:             pool,
+		Redis:          redisClient,
+		NATS:           natsClient,
+		Hub:            hub,
+		Authz:          az,
+		audit:          auditService,
 	}
 
 	// Router
@@ -600,7 +608,6 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	channelHandler.RegisterRoutes(mux, authMw)
 	collabHandler.RegisterRoutes(mux, authMw)
 	driveHandler.RegisterRoutes(mux, authMw)
-	mailboxHandler := mailbox.NewHandler(pool, az, mailbox.NewPublisher(natsClient, logger), logger)
 	mailboxHandler.RegisterRoutes(mux, authMw)
 	// Ingest is authenticated by a deployment-owned bearer token, not by a user
 	// session, and rate-limited by IP so a provider stuck in a retry loop

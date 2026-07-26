@@ -152,79 +152,17 @@ func mergeConfig(config map[string]any, payload map[string]any) map[string]any {
 	return out
 }
 
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
-
-// MessagePoster is the chat surface's half of post_message.
-type MessagePoster interface {
-	PostAs(ctx context.Context, workspaceID, channelID, body string) (string, error)
-}
-
-type postMessageAction struct{ poster MessagePoster }
-
-func NewPostMessageAction(p MessagePoster) Action { return postMessageAction{poster: p} }
-
-func (postMessageAction) Kind() string { return StepPostMessage }
-
-func (a postMessageAction) Perform(ctx context.Context, run *Run, config map[string]any) (any, error) {
-	channelID, _ := config["channel_id"].(string)
-	body, _ := config["body"].(string)
-	if channelID == "" || strings.TrimSpace(body) == "" {
-		return nil, fmt.Errorf("post_message needs a channel_id and a body")
-	}
-	id, err := a.poster.PostAs(ctx, run.WorkspaceID, channelID, body)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"message_id": id}, nil
-}
-
-// Notifier is the inbox's half of notify.
-type Notifier interface {
-	NotifyUser(ctx context.Context, workspaceID, userID, title, body string) error
-}
-
-type notifyAction struct{ notifier Notifier }
-
-func NewNotifyAction(n Notifier) Action { return notifyAction{notifier: n} }
-
-func (notifyAction) Kind() string { return StepNotify }
-
-func (a notifyAction) Perform(ctx context.Context, run *Run, config map[string]any) (any, error) {
-	userID, _ := config["user_id"].(string)
-	title, _ := config["title"].(string)
-	body, _ := config["body"].(string)
-	if userID == "" || strings.TrimSpace(title) == "" {
-		return nil, fmt.Errorf("notify needs a user_id and a title")
-	}
-	if err := a.notifier.NotifyUser(ctx, run.WorkspaceID, userID, title, body); err != nil {
-		return nil, err
-	}
-	return map[string]any{"notified": userID}, nil
-}
-
-// Commenter is the comment surface's half of add_comment.
-type Commenter interface {
-	CommentAs(ctx context.Context, workspaceID, objectType, objectID, body string) (string, error)
-}
-
-type addCommentAction struct{ commenter Commenter }
-
-func NewAddCommentAction(c Commenter) Action { return addCommentAction{commenter: c} }
-
-func (addCommentAction) Kind() string { return StepAddComment }
-
-func (a addCommentAction) Perform(ctx context.Context, run *Run, config map[string]any) (any, error) {
-	objectType, _ := config["object_type"].(string)
-	objectID, _ := config["object_id"].(string)
-	body, _ := config["body"].(string)
-	if objectType == "" || objectID == "" || strings.TrimSpace(body) == "" {
-		return nil, fmt.Errorf("add_comment needs an object_type, an object_id and a body")
-	}
-	id, err := a.commenter.CommentAs(ctx, run.WorkspaceID, objectType, objectID, body)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"comment_id": id}, nil
-}
+// The action implementations live in adapters.go, and there is deliberately no
+// second set here.
+//
+// There WAS one: three constructors that called their port directly with no
+// capability check, written before workflows had an owner to check against.
+// They survived the migration that added one, and every happy-path integration
+// test used them — so the tests exercised an unauthorized variant that
+// production never wires, while the shipped adapters were covered only by the
+// one test that tried to escalate. Two implementations of an interface whose
+// doc comment says "MUST authorize" is a comment that is false half the time.
+//
+// Deleted rather than fixed: adapters.go already had the correct versions, and
+// keeping a second set would have re-created exactly the drift that let the
+// tests point at the wrong one.

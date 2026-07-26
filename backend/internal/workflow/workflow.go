@@ -97,16 +97,22 @@ type Run struct {
 	// OwnerID is WHO THE RUN ACTS AS, and every action authorizes against it.
 	// A run with no owner must not execute: an action with only a workspace id
 	// has no authority to check, so it would reach every object in the tenant.
-	OwnerID     string     `json:"owner_id"`
-	WorkspaceID string     `json:"workspace_id"`
-	EventType   string     `json:"event_type"`
-	TriggerKey  string     `json:"trigger_key"`
-	Status      string     `json:"status"`
-	Error       string     `json:"error"`
-	Payload     []byte     `json:"payload"`
-	StartedAt   *time.Time `json:"started_at"`
-	FinishedAt  *time.Time `json:"finished_at"`
-	CreatedAt   time.Time  `json:"created_at"`
+	OwnerID     string `json:"owner_id"`
+	WorkspaceID string `json:"workspace_id"`
+	// Depth is how many workflow generations produced this run. 0 is a human
+	// action; anything above MaxDepth is refused before it is queued.
+	Depth int `json:"depth"`
+	// RootRunID is the run at the top of the chain, so an operator sees the
+	// whole cascade rather than one link of it.
+	RootRunID  string     `json:"root_run_id"`
+	EventType  string     `json:"event_type"`
+	TriggerKey string     `json:"trigger_key"`
+	Status     string     `json:"status"`
+	Error      string     `json:"error"`
+	Payload    []byte     `json:"payload"`
+	StartedAt  *time.Time `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 type Repository struct {
@@ -267,6 +273,27 @@ func (r *Repository) MatchingWorkflows(ctx context.Context, workspaceID, eventTy
 	return out, rows.Err()
 }
 
+// Loop guards.
+//
+// MaxDepth bounds a chain whose provenance we can follow. Three is enough for
+// every legitimate cascade anybody has described — "a message files an issue,
+// the issue notifies a channel" is two — and small enough that a runaway is
+// stopped before it is expensive.
+const MaxDepth = 3
+
+// MaxRunsPerMinute is the blunt backstop, and it is the one that matters.
+//
+// Depth only works through producers that propagate the marker. Two workflows
+// triggering each other through a pillar that propagates nothing, or a
+// publisher added next year by somebody who never read this file, defeat it
+// entirely. A cap on how fast ONE workflow may start runs needs no cooperation
+// from anything in the middle.
+//
+// Set well above any plausible burst: a busy channel is a few messages a
+// second, and a workflow that legitimately wants more than this is a workflow
+// that should be batching.
+const MaxRunsPerMinute = 120
+
 // EnqueueRun creates a run for one workflow and one event.
 //
 // THE TRIGGER KEY IS THE IDEMPOTENCY KEY, and it comes from the event's own id
@@ -275,6 +302,20 @@ func (r *Repository) MatchingWorkflows(ctx context.Context, workspaceID, eventTy
 // consumer treats as success, because the work is already queued.
 func (r *Repository) EnqueueRun(ctx context.Context, m Matching, eventType, triggerKey string,
 	payload []byte) (string, error) {
+	return r.EnqueueRunAt(ctx, m, eventType, triggerKey, payload, 0, "")
+}
+
+// ErrLoopGuard is a run refused because it would continue a runaway chain.
+// Recorded as a rejection, not returned to the message bus: redelivering it
+// produces the same refusal.
+var ErrLoopGuard = errors.New("workflow: refused to continue a runaway chain")
+
+// EnqueueRunAt is EnqueueRun with provenance.
+//
+// depth and rootRunID come from the event that caused it: a workflow's own
+// output carries where it came from, so a descendant knows how deep it is.
+func (r *Repository) EnqueueRunAt(ctx context.Context, m Matching, eventType, triggerKey string,
+	payload []byte, depth int, rootRunID string) (string, error) {
 
 	if triggerKey == "" {
 		return "", errors.New("workflow: an event with no id cannot start a run safely")
@@ -282,15 +323,40 @@ func (r *Repository) EnqueueRun(ctx context.Context, m Matching, eventType, trig
 	if len(payload) == 0 {
 		payload = []byte("{}")
 	}
+	if depth > MaxDepth {
+		return "", ErrLoopGuard
+	}
+
+	// THE RATE CAP, checked before the insert. A workflow that has started more
+	// than MaxRunsPerMinute runs in the last minute is looping — no legitimate
+	// trigger produces that — and the cheapest correct response is to stop
+	// queueing rather than to queue and fail.
+	var recent int
+	if err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM workflow_runs
+		  WHERE workflow_id = $1 AND created_at > NOW() - INTERVAL '1 minute'`,
+		m.WorkflowID).Scan(&recent); err != nil {
+		return "", fmt.Errorf("check workflow rate: %w", err)
+	}
+	if recent >= MaxRunsPerMinute {
+		return "", ErrLoopGuard
+	}
+
+	var root any
+	if rootRunID != "" {
+		root = rootRunID
+	}
 
 	var runID string
 	err := r.pool.QueryRow(ctx, `
 		INSERT INTO workflow_runs
-		       (workflow_id, version_id, workspace_id, trigger_key, event_type, payload)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		       (workflow_id, version_id, workspace_id, trigger_key, event_type, payload,
+		        depth, root_run_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (workflow_id, trigger_key) DO NOTHING
 		RETURNING id::text`,
-		m.WorkflowID, m.VersionID, m.WorkspaceID, triggerKey, eventType, payload).Scan(&runID)
+		m.WorkflowID, m.VersionID, m.WorkspaceID, triggerKey, eventType, payload,
+		depth, root).Scan(&runID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrDuplicate
 	}
@@ -338,10 +404,11 @@ func (r *Repository) ClaimRun(ctx context.Context) (*Run, []Step, error) {
 			RETURNING r.id::text, r.workflow_id::text, r.workspace_id::text, r.event_type,
 			          r.trigger_key, r.status, r.error, r.payload, r.started_at, r.finished_at,
 			          r.created_at, v.steps,
-			          (SELECT w.owner_id::text FROM workflows w WHERE w.id = r.workflow_id)`,
+			          (SELECT w.owner_id::text FROM workflows w WHERE w.id = r.workflow_id),
+			          r.depth, COALESCE(r.root_run_id::text, r.id::text)`,
 		).Scan(&run.ID, &run.WorkflowID, &run.WorkspaceID, &run.EventType, &run.TriggerKey,
 			&run.Status, &run.Error, &run.Payload, &run.StartedAt, &run.FinishedAt,
-			&run.CreatedAt, &stepsJSON, &run.OwnerID)
+			&run.CreatedAt, &stepsJSON, &run.OwnerID, &run.Depth, &run.RootRunID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}

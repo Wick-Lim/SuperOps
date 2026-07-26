@@ -63,8 +63,11 @@ func authorize(ctx context.Context, az *authz.Checker, owner string, obj authz.O
 // workflow does not import the message package's whole surface, and so the
 // dependency runs workflow -> interface <- app.
 type MessageCreator interface {
-	// CreateAs posts a message attributed to userID and returns its id.
-	CreateAs(ctx context.Context, workspaceID, channelID, userID, body string) (string, error)
+	// CreateFor posts a message attributed to userID and stamps the provenance
+	// of the run that produced it, so the trigger consumer can refuse to let it
+	// start an infinite cascade.
+	CreateFor(ctx context.Context, workspaceID, channelID, userID, body string,
+		depth int, rootRunID string) (string, error)
 }
 
 type messageAction struct {
@@ -89,7 +92,8 @@ func (a *messageAction) Perform(ctx context.Context, run *Run, config map[string
 	if err := authorize(ctx, a.az, run.OwnerID, authz.ChannelObject(channelID), authz.CapWrite); err != nil {
 		return nil, err
 	}
-	id, err := a.creator.CreateAs(ctx, run.WorkspaceID, channelID, run.OwnerID, body)
+	id, err := a.creator.CreateFor(ctx, run.WorkspaceID, channelID, run.OwnerID, body,
+		run.Depth, run.RootRunID)
 	if err != nil {
 		return nil, fmt.Errorf("post message: %w", err)
 	}
