@@ -1400,6 +1400,22 @@ func TestAMailboxCanBeSharedWithAnAgent(t *testing.T) {
 
 	// A conversation is shareable too: one thread without the whole inbox.
 	h.req(t, http.StatusOK, http.MethodGet, "/api/v1/drive/mailbox/"+mb.ID+"/shares", admin, nil)
+
+	// BUT NOT BY LINK. Widening shareTarget for per-user grants widened all five
+	// sharing routes, and a link is ANONYMOUS access — one over a mailbox is an
+	// unauthenticated read of an entire customer inbox. It used to 500 on the
+	// table's CHECK constraint, which is a refusal by accident rather than by
+	// decision, and RevokeLink could not have revoked it anyway.
+	code, _ := h.do(t, http.MethodPost, "/api/v1/drive/mailbox/"+mb.ID+"/links", admin,
+		map[string]any{"capability": "read"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("POST a link on a mailbox = %d, want 400", code)
+	}
+	code, _ = h.do(t, http.MethodPost, "/api/v1/drive/conversation/"+mb.ID+"/links", admin,
+		map[string]any{"capability": "read"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("POST a link on a conversation = %d, want 400", code)
+	}
 }
 
 // ATTACHING IS IDEMPOTENT AND TENANT-SCOPED.

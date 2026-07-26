@@ -1308,3 +1308,76 @@ func TestStorageQuotaDriftIsCorrected(t *testing.T) {
 		t.Fatalf("workspace_storage holds %d, recompute reported %d", stored, after)
 	}
 }
+
+// A RENAME MUST NOT DELETE THE AUTOMATION.
+//
+// PATCH decoded into the same struct POST does, so an omitted `steps` meant an
+// empty slice — and Save writes a new version from whatever it is given and
+// replaces the triggers wholesale. A body as small as {"name": "renamed"}
+// therefore wrote an EMPTY version and dropped every trigger: the workflow
+// still existed, still said enabled, and did nothing. An audit did exactly
+// that and watched one step and one trigger become zero and zero.
+func TestPatchingAWorkflowPreservesWhatItOmits(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+
+	channel := h.createTypedChannel(t, admin, ws, uniqueSlug("wf-patch"), "public")
+	body := map[string]any{
+		"name":    fmt.Sprintf("patchme-%d", time.Now().UnixNano()),
+		"enabled": true,
+		"steps": []map[string]any{{
+			"kind":   "post_message",
+			"config": map[string]any{"channel_id": channel, "body": "hello"},
+		}},
+		"triggers": []map[string]any{{"event_type": "message.created"}},
+	}
+	var created struct {
+		ID       string `json:"id"`
+		Steps    []any  `json:"steps"`
+		Triggers []any  `json:"triggers"`
+	}
+	decodeInto(t, h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/workflows", admin, body).Data, &created)
+	if len(created.Steps) != 1 || len(created.Triggers) != 1 {
+		t.Fatalf("the fixture did not take: %d steps, %d triggers",
+			len(created.Steps), len(created.Triggers))
+	}
+
+	// The rename. Nothing else is sent.
+	var patched struct {
+		Name     string `json:"name"`
+		Steps    []any  `json:"steps"`
+		Triggers []any  `json:"triggers"`
+		Enabled  bool   `json:"enabled"`
+	}
+	decodeInto(t, h.req(t, http.StatusOK, http.MethodPatch,
+		"/api/v1/workflows/"+created.ID, admin,
+		map[string]any{"name": "renamed"}).Data, &patched)
+
+	if patched.Name != "renamed" {
+		t.Errorf("name = %q, want the patched value", patched.Name)
+	}
+	if len(patched.Steps) != 1 {
+		t.Errorf("a rename left %d steps; the automation was deleted by a request "+
+			"that only meant to change its name", len(patched.Steps))
+	}
+	if len(patched.Triggers) != 1 {
+		t.Errorf("a rename left %d triggers; the workflow still says enabled and "+
+			"nothing will ever fire it", len(patched.Triggers))
+	}
+	if !patched.Enabled {
+		t.Error("a rename disabled the workflow")
+	}
+
+	// And emptying it deliberately still works — absent and empty are different.
+	decodeInto(t, h.req(t, http.StatusOK, http.MethodPatch,
+		"/api/v1/workflows/"+created.ID, admin,
+		map[string]any{"steps": []any{}}).Data, &patched)
+	if len(patched.Steps) != 0 {
+		t.Errorf("an explicit empty steps list was ignored: %d steps", len(patched.Steps))
+	}
+	if len(patched.Triggers) != 1 {
+		t.Errorf("emptying the steps also dropped the triggers: %d", len(patched.Triggers))
+	}
+}

@@ -330,6 +330,23 @@ func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 		capability = parsed
 	}
 
+	// LINKS ARE FILE AND FOLDER ONLY, and this is a product decision rather
+	// than a limitation to route around.
+	//
+	// shareTarget is shared by all five sharing routes, so widening it for
+	// per-user mailbox grants silently widened this one too — and
+	// drive_share_links still CHECKs object_type IN ('file','folder'), so the
+	// insert failed with a 500 rather than a refusal. Widening the CHECK would
+	// be worse: a link is ANONYMOUS access, and a link over a mailbox is an
+	// unauthenticated read of an entire customer inbox handed out by anyone who
+	// can share it. RevokeLink also maps everything that is not a file to a
+	// FOLDER object, so such a link could not even be revoked through the API.
+	if t := httputil.PathParam(r, "object_type"); t != EntryFolder && t != EntryFile {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST",
+			`a share link may be created for a folder or a file only; grant a person or a group instead`)
+		return
+	}
+
 	ref, _, ok := h.shareTarget(w, r, authz.CapShare)
 	if !ok {
 		return
@@ -452,9 +469,21 @@ func (h *Handler) RevokeLink(w http.ResponseWriter, r *http.Request) {
 		fail(w, ErrNotFound)
 		return
 	}
-	ref := authz.FolderObject(objectID)
-	if objectType == EntryFile {
+	// EXPLICIT, not "file or else folder". The fallback silently authorized a
+	// link on any other object type against folder:<thatUUID> — an acl_object
+	// row that does not exist, so CapNone, so a 404 the holder could never
+	// resolve. CreateLink now refuses those types outright; this refuses a row
+	// that predates that or arrived some other way, rather than guessing.
+	var ref authz.ObjectRef
+	switch objectType {
+	case EntryFolder:
+		ref = authz.FolderObject(objectID)
+	case EntryFile:
 		ref = authz.FileObject(objectID)
+	default:
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST",
+			"that link is for an object type this route cannot authorize")
+		return
 	}
 	if _, ok := h.authorize(w, r, ref, authz.CapShare); !ok {
 		return

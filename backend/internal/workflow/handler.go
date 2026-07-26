@@ -126,6 +126,27 @@ type saveRequest struct {
 	Triggers    []Trigger `json:"triggers"`
 }
 
+// patchRequest is saveRequest with every field OPTIONAL.
+//
+// PATCH is a partial update and the handler treated it as a replacement: the
+// body decoded into saveRequest, so omitting `steps` meant an empty slice, and
+// Save writes a new version from whatever it is given and replaces the triggers
+// wholesale. A request as small as {"name": "renamed"} therefore wrote an EMPTY
+// version and deleted every trigger — the automation still existed, still said
+// enabled, and did nothing. An audit did exactly that and watched a
+// one-step, one-trigger workflow become zero and zero.
+//
+// Pointers rather than a merge helper because absent and empty are genuinely
+// different here: `"steps": []` is somebody deliberately emptying a workflow,
+// and that must still work.
+type patchRequest struct {
+	Name        *string    `json:"name"`
+	Description *string    `json:"description"`
+	Enabled     *bool      `json:"enabled"`
+	Steps       *[]Step    `json:"steps"`
+	Triggers    *[]Trigger `json:"triggers"`
+}
+
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	workspaceID, err := httputil.RequirePathParam(r, "workspace_id")
 	if err != nil {
@@ -169,22 +190,55 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req saveRequest
+	var req patchRequest
 	if err := httputil.DecodeJSONLimit(r, &req, maxWorkflowBody); err != nil {
 		httputil.HandleError(w, err)
 		return
 	}
 
+	// WHAT IS NOT SENT IS NOT CHANGED. Save takes a whole workflow, so the
+	// current one is read first and the request is laid over it. Without this a
+	// rename deleted the steps and the triggers.
+	current, err := h.load(r.Context(), id)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	name, description, enabled := current.Name, current.Description, current.Enabled
+	steps, triggers := current.Steps, current.Triggers
+	if req.Name != nil {
+		name = *req.Name
+	}
+	if req.Description != nil {
+		description = *req.Description
+	}
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	if req.Steps != nil {
+		steps = *req.Steps
+	}
+	if req.Triggers != nil {
+		triggers = *req.Triggers
+	}
+
 	// Save appends a VERSION rather than mutating the existing one, so a run
 	// already queued still executes what it was queued with.
-	wf, err := h.repo.Save(r.Context(), workspaceID, id, req.Name, req.Description,
-		req.Steps, req.Triggers, req.Enabled, authctx.UserID(r.Context()))
+	wf, err := h.repo.Save(r.Context(), workspaceID, id, name, description,
+		steps, triggers, enabled, authctx.UserID(r.Context()))
 	if err != nil {
 		h.saveFailed(w, err)
 		return
 	}
+	// OWNER RECORDED. A save moves ownership — that is the rule that makes the
+	// executor's per-action authorization mean anything — and the audit entry
+	// said only "version" and "enabled", so the transfer left no trace at all.
 	h.record(r.Context(), workspaceID, "workflow.updated", wf.ID,
-		map[string]any{"version": wf.Version, "enabled": wf.Enabled})
+		map[string]any{
+			"version": wf.Version, "enabled": wf.Enabled,
+			"owner_id": wf.OwnerID, "previous_owner_id": current.OwnerID,
+			"steps": len(steps), "triggers": len(triggers),
+		})
 	httputil.JSON(w, http.StatusOK, wf)
 }
 
@@ -280,7 +334,22 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row := h.pool.QueryRow(r.Context(), `
+	wf, err := h.load(r.Context(), id)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	httputil.JSON(w, http.StatusOK, wf)
+}
+
+// load reads a workflow with its latest version's steps and its triggers.
+//
+// One query, shared by the read route and the patch route — the patch route
+// needs the current state to preserve what a partial body omits, and a second
+// copy of this SELECT is how the two would come to disagree about what "the
+// current workflow" means.
+func (h *Handler) load(ctx context.Context, id string) (*Workflow, error) {
+	row := h.pool.QueryRow(ctx, `
 		SELECT w.id::text, w.workspace_id::text, w.owner_id::text, w.name, w.description,
 		       w.enabled, w.created_at, w.archived_at,
 		       COALESCE(v.version, 0),
@@ -296,12 +365,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		        FROM workflow_triggers WHERE workflow_id = w.id
 		  ) t ON TRUE
 		 WHERE w.id = $1`, id)
-	wf, err := scanWorkflow(row)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	httputil.JSON(w, http.StatusOK, wf)
+	return scanWorkflow(row)
 }
 
 // RunSummary is a run as the history list shows it.
