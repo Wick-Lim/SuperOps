@@ -103,9 +103,24 @@ jobs:
           grep -q -- '--- PASS: TestChainDetectsTamper' /tmp/dbtests.txt \
             || { echo "::error::the audit chain test did not run (Postgres unreachable?)"; exit 1; }
 
+      # REPORTING, and it now fails when it cannot report.
+      #
+      # This was `go tool cover … | tail -1 | tee …` with no pipefail, so a
+      # failing `go tool cover` was masked by tail's exit 0 and the step printed
+      # an empty line among the gates. There is still deliberately no coverage
+      # THRESHOLD — a number that must not fall is gamed by tests written to
+      # move it — but "the tool ran and produced a total" is a real assertion
+      # and it was not being made.
       - name: Coverage summary
         working-directory: backend
-        run: go tool cover -func=coverage.out | tail -1 | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          set -o pipefail
+          total=$(go tool cover -func=coverage.out | tail -1)
+          case "$total" in
+            *total:*%*) ;;
+            *) echo "::error::coverage produced no total line: $total"; exit 1 ;;
+          esac
+          echo "$total" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
