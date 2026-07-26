@@ -139,18 +139,24 @@ func TestScanRows(t *testing.T) {
 			// come back as one: a rebuild that wrote it as a file would leave
 			// ?type=spreadsheet empty for the whole corpus.
 			row: fakeRow{objID, wsID, userID, "budget.xlsx", "", folderID, "spreadsheet",
-				[]string{"w-" + wsID, "f-" + folderID, "u-" + otherID}, createdAt},
+				[]string{"w-" + wsID, "f-" + folderID, "u-" + otherID},
+				"Acme Corp 42000 revenue", createdAt},
 			wantACL: []string{"w-" + wsID, "f-" + folderID, "u-" + otherID},
 			want: search.Doc{
 				Type: search.TypeSpreadsheet, ID: objID, WorkspaceID: wsID, FolderID: folderID,
-				UserID: userID, Title: "budget.xlsx", CreatedAt: createdAt.Unix(),
+				UserID: userID, Title: "budget.xlsx",
+				// THE BODY MUST SURVIVE A REBUILD. Both index writes replace the
+				// document, so a reindex that dropped this blanked `content` for
+				// every collab object in the corpus.
+				Content:   "Acme Corp 42000 revenue",
+				CreatedAt: createdAt.Unix(),
 			},
 		},
 		{
 			name: "attached file is keyed on the channel of its message",
 			typ:  search.TypeFile,
 			row: fakeRow{objID, wsID, userID, "plan.pdf", chID, "", "file",
-				[]string{"c-" + chID}, createdAt},
+				[]string{"c-" + chID}, "", createdAt},
 			wantACL: []string{"c-" + chID},
 			want: search.Doc{
 				Type: search.TypeFile, ID: objID, WorkspaceID: wsID, ChannelID: chID,
@@ -163,7 +169,7 @@ func TestScanRows(t *testing.T) {
 			// stays, for exactly this case.
 			name:    "unattached file with no materialized keys falls back to its uploader",
 			typ:     search.TypeFile,
-			row:     fakeRow{objID, wsID, userID, "draft.pdf", "", "", "file", []string(nil), createdAt},
+			row:     fakeRow{objID, wsID, userID, "draft.pdf", "", "", "file", []string(nil), "", createdAt},
 			wantACL: []string{"u-" + userID},
 			want: search.Doc{
 				Type: search.TypeFile, ID: objID, WorkspaceID: wsID,

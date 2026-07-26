@@ -139,8 +139,29 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
     }, 2000)
   }, [publish, fileType, sheet, design, seq])
 
+  // FLUSH ON UNMOUNT, do not merely cancel.
+  //
+  // Cancelling the pending timer was silently dropping the projection for any
+  // sheet or canvas edited and closed inside the 2 s debounce — permanently, in
+  // practice, because nothing on the server produces content and the next
+  // projection only happens if somebody opens the object again. The block
+  // editor already flushes on unmount (Editor.web.tsx); this is the same rule
+  // for the two surfaces that project from here.
+  //
+  // The refs are read rather than the state values so this effect can have an
+  // empty dependency list and actually run on unmount rather than on every
+  // change of seq.
+  const flushRef = useRef<() => void>(() => {})
+  flushRef.current = () => {
+    if (!fileId || fileType === 'document') return
+    publish(fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq))
+  }
   useEffect(() => () => {
-    if (projectTimer.current) clearTimeout(projectTimer.current)
+    if (projectTimer.current) {
+      clearTimeout(projectTimer.current)
+      projectTimer.current = null
+      flushRef.current()
+    }
   }, [])
 
   if (!documentId) {

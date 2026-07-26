@@ -364,8 +364,14 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		            ELSE array_append(p.references_ids, p.message_id) END,
 		       '',
 		       COALESCE(NULLIF($3, ''), 'Re: ' || COALESCE(p.subject, '')),
-		       $4, $5, $6, NOW()
-		  FROM parent p
+		       $4, $5, $6,
+		       -- NULL, NOT NOW(). Migration 055 defines a NULL sent_at on an
+		       -- outbound row as "written, not yet delivered", and the CHECK
+		       -- allows it for exactly this. Stamping NOW() here claimed the
+		       -- reply had been sent before anything had tried — which made the
+		       -- undelivered backlog unqueryable, so the delivery consumer had
+		       -- no way to find what was written before it existed.
+		       NULL
 		RETURNING id::text, conversation_id::text, direction, message_id, in_reply_to,
 		          subject, body_text, body_html, author_id::text, sent_at, created_at`,
 		id, newMessageID(), req.Subject, req.BodyText, req.BodyHTML, actor,

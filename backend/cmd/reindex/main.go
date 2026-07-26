@@ -229,6 +229,15 @@ const messageSQL = `
 // The messages join is still not filtered by messages.is_deleted: a
 // soft-deleted message keeps its channel, and the materialized keys already say
 // so.
+//
+// THE BODY IS JOINED IN FOR THE SAME REASON THE KEYS ARE. Both index writes are
+// add-or-REPLACE, so a rebuild that selected no body wrote an empty `content`
+// over every document, spreadsheet and design in the index — and only a fresh
+// client projection would ever put it back. That is the same shape as the
+// acl_key bug this query already carries the fix for: the recovery path
+// destroying the thing it exists to restore. The live indexer reads the body
+// through search.BodySource (drive.Repository.BodyForFile); this is the same
+// read, expressed as a join because there is no per-row lookup here.
 const fileSQL = `
 	SELECT f.id, f.workspace_id, f.user_id, f.name,
 	       COALESCE(m.channel_id::text, ''),
@@ -236,9 +245,11 @@ const fileSQL = `
 	       f.file_type,
 	       COALESCE(ARRAY(SELECT k.key FROM acl_key k
 	                       WHERE k.object_type = 'file' AND k.object_id = f.id), '{}'),
+	       COALESCE(p.body_text, ''),
 	       f.created_at
 	  FROM files f
 	  LEFT JOIN messages m ON m.id = f.message_id
+	  LEFT JOIN file_projections p ON p.file_id = f.id
 	 WHERE ($1::uuid IS NULL OR f.workspace_id = $1::uuid)
 	   AND (f.created_at, f.id) > ($2::timestamptz, $3::uuid)
 	 ORDER BY f.created_at, f.id
@@ -271,7 +282,8 @@ func sources() []source {
 				)
 				var fileType string
 				if err := row.Scan(&doc.ID, &doc.WorkspaceID, &doc.UserID, &doc.Name,
-					&doc.ChannelID, &doc.FolderID, &fileType, &doc.ACL, &createdAt); err != nil {
+					&doc.ChannelID, &doc.FolderID, &fileType, &doc.ACL, &doc.Body,
+					&createdAt); err != nil {
 					return search.Doc{}, cursor{}, fmt.Errorf("scan file: %w", err)
 				}
 				// The same mapper the live indexer uses. Without it a rebuild

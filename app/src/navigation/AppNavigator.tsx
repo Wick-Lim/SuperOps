@@ -136,6 +136,18 @@ const linking: LinkingOptions<RootStackParamList> = {
       Pins: 'channels/:channelId/pins',
       Scheduled: 'channels/:channelId/scheduled',
       Bookmarks: 'bookmarks',
+      // Work tracking and Drive. These screens were registered and had no URL,
+      // which on web means a document has no shareable link and a refresh drops
+      // the reader back to Workspace — including the recipient of a Drive share,
+      // who was being granted access to something they could not open by link.
+      Board: 'projects/:projectId/board',
+      IssueDetail: 'issues/:issueId',
+      Drive: 'drive',
+      DriveFile: 'drive/files/:fileId',
+      DriveTrash: 'drive/trash',
+      DriveShare: 'drive/:objectType/:objectId/share',
+      // The editor. documentId is the collab ROOM; fileId is the Drive object.
+      CollabDocument: 'documents/:documentId',
       Settings: 'settings',
       Admin: 'admin',
     },
