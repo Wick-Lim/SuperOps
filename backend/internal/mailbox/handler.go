@@ -111,6 +111,10 @@ func (h *Handler) CreateMailbox(w http.ResponseWriter, r *http.Request) {
 
 	mb, err := h.repo.CreateMailbox(ctx, workspaceID, req.Address, req.DisplayName, req.Prefix, actor)
 	switch {
+	case errors.Is(err, ErrDomainNotYours):
+		httputil.JSONError(w, http.StatusForbidden, "DOMAIN_NOT_YOURS",
+			"that domain is registered to another workspace")
+		return
 	case errors.Is(err, ErrAddressTaken):
 		httputil.JSONError(w, http.StatusConflict, "ADDRESS_TAKEN", "that address already exists")
 		return
@@ -510,6 +514,7 @@ func (h *Handler) Inbound(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conv, msg, err := h.repo.Ingest(ctx, Inbound{
+		WorkspaceID:     workspaceID,
 		ProviderEventID: req.EventID,
 		Recipient:       req.Recipient,
 		MessageID:       req.MessageID,
@@ -547,22 +552,17 @@ func (h *Handler) Inbound(w http.ResponseWriter, r *http.Request) {
 	// logged: an email whose body arrived is worth more than one rejected for
 	// an attachment we could not store, and the raw original is archived under
 	// raw_key regardless.
+	//
+	// Reached only once Ingest has accepted, and Ingest resolves the mailbox
+	// within the token's workspace — so this can no longer write files into a
+	// tenant the caller does not hold a credential for. It used to: the
+	// tenancy comparison lived BELOW this block.
 	if len(req.Attachments) > 0 {
 		if n, err := h.repo.storeAttachments(ctx, h.storage, conv.WorkspaceID, msg.ID,
 			"", req.Attachments); err != nil {
 			h.logger.Warn("could not store every attachment on an inbound message",
 				"mail_message_id", msg.ID, "stored", n, "error", err)
 		}
-	}
-
-	// The token's workspace must own the mailbox. A token for tenant A that
-	// could file into tenant B's mailbox would be a cross-tenant write with a
-	// legitimate credential.
-	if workspaceID != "" && conv.WorkspaceID != workspaceID {
-		h.logger.Error("an ingest token filed into another workspace",
-			"token_workspace", workspaceID, "conversation_workspace", conv.WorkspaceID)
-		httputil.JSONError(w, http.StatusForbidden, "FORBIDDEN", "that mailbox belongs to another workspace")
-		return
 	}
 
 	httputil.JSON(w, http.StatusCreated, map[string]any{

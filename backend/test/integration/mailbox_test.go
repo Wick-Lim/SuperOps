@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -1077,5 +1078,121 @@ func TestAnAgentCannotAttachAFileTheyCannotRead(t *testing.T) {
 	}
 	if attached != 0 {
 		t.Fatal("the file was attached despite the refusal")
+	}
+}
+
+// AN INGEST TOKEN FILES ONLY INTO ITS OWN TENANT.
+//
+// The tenancy comparison used to live in the handler AFTER Ingest had
+// committed and after attachments had been stored, so tenant A's token planted
+// a real message — sender, subject, body, files — in tenant B's mailbox and got
+// back a 403 describing a write that had already happened.
+//
+// It also burned the globally unique provider_event_id, so the victim's genuine
+// delivery of that event then answered "duplicate" and vanished. That is the
+// second half of this test and the reason the fix had to be a lookup scope
+// rather than an earlier check: nothing may be written at all.
+func TestAnIngestTokenCannotFileIntoAnotherTenant(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	victimWS := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	attacker := h.newTenant(t, "ingest-attacker")
+	repo := mailRepo(t)
+	ctx := context.Background()
+
+	victimBox := newMailbox(t, victimWS, me)
+	n := time.Now().UnixNano()
+
+	plant := inbound(victimBox, fmt.Sprintf("cross-%d", n))
+	plant.Subject = "PLANTED BY ANOTHER TENANT"
+	plant.WorkspaceID = attacker.workspaceID
+
+	conv, _, err := repo.Ingest(ctx, plant)
+	if !errors.Is(err, mailbox.ErrNoMailbox) {
+		t.Fatalf("Ingest with a foreign token returned (%v, %v), want ErrNoMailbox", conv, err)
+	}
+
+	var landed int
+	if err := h.app.DB.QueryRow(ctx, `
+		SELECT count(*) FROM mail_messages m
+		  JOIN mail_conversations c ON c.id = m.conversation_id
+		 WHERE c.mailbox_id = $1 AND m.subject = 'PLANTED BY ANOTHER TENANT'`,
+		victimBox.ID).Scan(&landed); err != nil {
+		t.Fatal(err)
+	}
+	if landed != 0 {
+		t.Fatalf("%d message(s) reached the victim's mailbox through a foreign ingest token", landed)
+	}
+
+	// AND the idempotency key survives, so the victim's real delivery lands.
+	// A rolled-back transaction is what makes this true; an early return after
+	// the INSERT would not have.
+	genuine := inbound(victimBox, fmt.Sprintf("cross-%d", n))
+	genuine.Subject = "the customer's actual email"
+	genuine.WorkspaceID = victimWS
+	if _, _, err := repo.Ingest(ctx, genuine); err != nil {
+		t.Fatalf("the victim's genuine delivery was refused after the attempt: %v", err)
+	}
+}
+
+// A MAILBOX ADDRESS BELONGS TO WHOEVER REGISTERED ITS DOMAIN.
+//
+// mail_domains has been globally unique from the start — "one tenant per
+// domain" — but the constraint only governed SENDING, because 055 reasoned that
+// "receiving is harmless". Inbound routing resolves a recipient across every
+// tenant by address alone, so it is not: whoever claims an address first
+// receives its mail.
+//
+// The attack is pre-claiming billing@ on a competitor's verified domain. It
+// reads their customer email, and because addresses are globally unique it also
+// permanently denies the real owner that address.
+func TestAMailboxCannotClaimAnotherTenantsDomain(t *testing.T) {
+	h := getHarness(t)
+	victim := h.newTenant(t, "domain-victim")
+	attacker := h.newTenant(t, "domain-attacker")
+	repo := mailRepo(t)
+	ctx := context.Background()
+
+	// Registered directly: domain creation lives on the admin handler, and the
+	// fixture only needs the row that the ownership rule reads.
+	domain := fmt.Sprintf("victim-%d.test", time.Now().UnixNano())
+	if _, err := h.app.DB.Exec(ctx,
+		`INSERT INTO mail_domains (workspace_id, domain, verify_token, verified_at)
+		 VALUES ($1, $2, $3, NOW())`,
+		victim.workspaceID, domain, "tok-"+domain); err != nil {
+		t.Fatalf("register the victim's domain: %v", err)
+	}
+
+	_, err := repo.CreateMailbox(ctx, attacker.workspaceID,
+		"billing@"+domain, "Billing", "BIL", attacker.id)
+	if !errors.Is(err, mailbox.ErrDomainNotYours) {
+		t.Fatalf("the attacker created a mailbox on the victim's domain: err = %v", err)
+	}
+
+	// The owner may still open one, before verification — registration is the
+	// ownership claim; verified_at gates sending, not receiving.
+	mb, err := repo.CreateMailbox(ctx, victim.workspaceID,
+		"billing@"+domain, "Billing", "BIL", victim.id)
+	if err != nil {
+		t.Fatalf("the domain's own tenant was refused: %v", err)
+	}
+	// And the mailbox is bound to the domain row, which nothing but VerifyDomain
+	// used to write.
+	var boundTo *string
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT d.workspace_id::text FROM mailboxes m
+		   JOIN mail_domains d ON d.id = m.domain_id WHERE m.id = $1`, mb.ID).Scan(&boundTo); err != nil {
+		t.Fatalf("the mailbox was not bound to its domain: %v", err)
+	}
+	if boundTo == nil || *boundTo != victim.workspaceID {
+		t.Fatalf("mailbox domain belongs to %v, want %s", boundTo, victim.workspaceID)
+	}
+
+	// An unclaimed domain stays open — a shared demo deployment depends on it.
+	if _, err := repo.CreateMailbox(ctx, attacker.workspaceID,
+		fmt.Sprintf("support-%d@unclaimed.test", time.Now().UnixNano()),
+		"Support", "SUP", attacker.id); err != nil {
+		t.Fatalf("an unclaimed domain was refused: %v", err)
 	}
 }

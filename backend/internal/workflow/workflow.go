@@ -163,12 +163,27 @@ func (r *Repository) Save(ctx context.Context, workspaceID, id, name, descriptio
 				return fmt.Errorf("insert workflow: %w", err)
 			}
 		} else {
+			// OWNER_ID MOVES TO THE SAVER. This is the whole of the
+			// "you cannot automate what you could not do by hand" rule on the
+			// edit path, and leaving it out made the rule enforce itself
+			// against the wrong person: one admin could rewrite another
+			// admin's steps and have them execute under the original owner's
+			// capability. The victim's private-channel write, comment and
+			// notify reach became the editor's, silently and repeatedly.
+			//
+			// Every save rewrites the steps — they come from the request, and
+			// a new workflow_versions row is inserted below — so the saver is
+			// unambiguously responsible for what the workflow now does. Making
+			// them the owner is the only assignment under which the executor's
+			// per-action authorization is a real constraint.
 			err := tx.QueryRow(ctx, `
-				UPDATE workflows SET name = $3, description = $4, enabled = $5, updated_at = NOW()
+				UPDATE workflows
+				   SET name = $3, description = $4, enabled = $5,
+				       owner_id = $6, updated_at = NOW()
 				 WHERE id = $1 AND workspace_id = $2 AND archived_at IS NULL
 				RETURNING id::text, workspace_id::text, owner_id::text, name, description, enabled,
 				          created_at, archived_at`,
-				id, workspaceID, name, description, enabled,
+				id, workspaceID, name, description, enabled, actorID,
 			).Scan(&wf.ID, &wf.WorkspaceID, &wf.OwnerID, &wf.Name, &wf.Description, &wf.Enabled,
 				&wf.CreatedAt, &wf.ArchivedAt)
 			if errors.Is(err, pgx.ErrNoRows) {

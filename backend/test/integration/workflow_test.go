@@ -1106,3 +1106,95 @@ func TestTheRateCapStopsALoopWithNoProvenance(t *testing.T) {
 		t.Fatalf("%d runs queued, cap is %d", queued, workflow.MaxRunsPerMinute)
 	}
 }
+
+// EDITING A WORKFLOW TAKES OWNERSHIP OF IT.
+//
+// The handler's authorization note says a workflow "runs as its OWNER … and the
+// owner is always the saver, so it can never be used to act as somebody else."
+// Save's UPDATE arm did not touch owner_id, so that sentence was false on every
+// path but creation, and the rule enforced itself against the wrong person:
+// admin A rewrote admin B's steps and they executed under B's capability.
+//
+// This is the escalation as a test. A holds nothing on the private channel; B
+// holds admin. A rewrites the steps to post there. If ownership does not move,
+// A's message lands under B's authority.
+func TestEditingAWorkflowMovesOwnershipToTheEditor(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	repo := wfRepo(t)
+	ctx := context.Background()
+
+	// B can reach the private channel; A cannot.
+	victim := h.whoami(t, admin)
+	attacker := h.newGuest(t, admin, ws, "wf-editor")
+	private := h.createTypedChannel(t, admin, ws, uniqueSlug("wf-takeover"), "private")
+
+	name := fmt.Sprintf("takeover-%d", time.Now().UnixNano())
+	wf, err := repo.Save(ctx, ws, "", name, "",
+		[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{
+			"channel_id": private, "body": "the owner's own message",
+		}}},
+		[]workflow.Trigger{{EventType: "wf.test.takeover"}}, true, victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wf.OwnerID != victim {
+		t.Fatalf("owner_id after create = %q, want %q", wf.OwnerID, victim)
+	}
+
+	// The attacker saves over it. Steps come from the request on every save, so
+	// they are unambiguously the editor's.
+	edited, err := repo.Save(ctx, ws, wf.ID, name, "",
+		[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{
+			"channel_id": private, "body": "planted by the editor",
+		}}},
+		[]workflow.Trigger{{EventType: "wf.test.takeover"}}, true, attacker.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edited.OwnerID != attacker.id {
+		t.Fatalf("owner_id after edit = %q, want the editor %q — the editor's steps "+
+			"would execute under the previous owner's capability", edited.OwnerID, attacker.id)
+	}
+
+	// And the run really does act as the editor, who cannot write there.
+	matches, _ := repo.MatchingWorkflows(ctx, ws, "wf.test.takeover")
+	var match workflow.Matching
+	for _, m := range matches {
+		if m.WorkflowID == wf.ID {
+			match = m
+		}
+	}
+	runID, err := repo.EnqueueRun(ctx, match, "wf.test.takeover",
+		fmt.Sprintf("evt-takeover-%d", time.Now().UnixNano()), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, claimedSteps, err := repo.ClaimRun(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for claimed != nil && claimed.ID != runID {
+		claimed, claimedSteps, err = repo.ClaimRun(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if claimed == nil {
+		t.Fatal("the run was never claimable")
+	}
+	if claimed.OwnerID != attacker.id {
+		t.Fatalf("the claimed run acts as %q, want the editor %q", claimed.OwnerID, attacker.id)
+	}
+
+	poster := &countingPoster{}
+	exec := workflow.NewExecutor(repo, nil,
+		workflow.NewMessageAction(h.app.Authz, &recordingCreator{poster: poster}))
+	// The step is refused, so Run returns an error — that is the point.
+	_ = exec.Run(ctx, claimed, claimedSteps)
+	if poster.count() != 0 {
+		t.Fatalf("%d messages reached a private channel the editor cannot write to",
+			poster.count())
+	}
+}

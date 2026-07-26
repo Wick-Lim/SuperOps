@@ -35,6 +35,11 @@ var (
 	ErrDuplicate    = errors.New("mailbox: already processed")
 	ErrNotVerified  = errors.New("mailbox: the sending domain is not verified")
 	ErrAddressTaken = errors.New("mailbox: that address already exists")
+	// ErrDomainNotYours is returned when the address's domain is registered to
+	// a different workspace. Deliberately distinct from ErrAddressTaken: the
+	// address is free, and the operator needs to be told that the DOMAIN is
+	// the obstacle so they go and verify it rather than trying another prefix.
+	ErrDomainNotYours = errors.New("mailbox: that domain is registered to another workspace")
 )
 
 // Conversation states, as a closed Go set mirroring the CHECK.
@@ -114,6 +119,19 @@ type Inbound struct {
 	BodyHTML        string
 	RawKey          string
 	ReceivedAt      time.Time
+
+	// WorkspaceID scopes the mailbox lookup to the tenant whose ingest token
+	// authenticated the request. Empty means "any", which is only correct for
+	// a deployment-wide token.
+	//
+	// It is a LOOKUP SCOPE, not a post-hoc check. The tenancy comparison used
+	// to happen in the handler after Ingest had committed and after
+	// attachments had been stored, so a token for tenant A could plant a
+	// message — sender, subject, body and files — in tenant B's mailbox and
+	// receive a 403 describing a write that had already happened. It also
+	// burned the globally unique provider_event_id, which made the victim's
+	// real delivery return "duplicate" and disappear.
+	WorkspaceID string
 }
 
 type Repository struct {
@@ -137,12 +155,46 @@ func (r *Repository) CreateMailbox(ctx context.Context, workspaceID, address, di
 
 	var mb Mailbox
 	err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		// THE DOMAIN DECIDES WHO MAY RECEIVE ON IT.
+		//
+		// mail_domains is globally unique — "one tenant per domain" — but that
+		// constraint only governed who may SEND, because 055's comment reasoned
+		// that "receiving is harmless". It is not. Inbound routing resolves a
+		// recipient across every tenant by address alone, so whoever registers
+		// an address first receives its mail: a tenant could claim billing@ on
+		// a competitor's verified domain and read their customer email, and —
+		// addresses being globally unique — permanently deny the real owner
+		// that address.
+		//
+		// Registration, not verification, is the ownership claim. A workspace
+		// that registered its own domain may open mailboxes on it before DNS
+		// has propagated; sending still waits for verified_at. A domain nobody
+		// has registered stays open, which is what a shared demo deployment
+		// needs.
+		var domainID *string
+		if at := strings.LastIndex(address, "@"); at >= 0 {
+			var owner, id string
+			err := tx.QueryRow(ctx,
+				`SELECT id::text, workspace_id::text FROM mail_domains WHERE domain = $1`,
+				address[at+1:]).Scan(&id, &owner)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				// Unclaimed. Nothing to enforce.
+			case err != nil:
+				return fmt.Errorf("resolve mail domain: %w", err)
+			case owner != workspaceID:
+				return ErrDomainNotYours
+			default:
+				domainID = &id
+			}
+		}
+
 		err := tx.QueryRow(ctx, `
-			INSERT INTO mailboxes (workspace_id, address, display_name, prefix, created_by)
-			VALUES ($1, $2, $3, $4, $5)
+			INSERT INTO mailboxes (workspace_id, address, display_name, prefix, created_by, domain_id)
+			VALUES ($1, $2, $3, $4, $5, $6)
 			RETURNING id::text, workspace_id::text, address, display_name, prefix,
 			          archived_at, created_at, auto_reply_enabled`,
-			workspaceID, address, displayName, prefix, actorID,
+			workspaceID, address, displayName, prefix, actorID, domainID,
 		).Scan(&mb.ID, &mb.WorkspaceID, &mb.Address, &mb.DisplayName, &mb.Prefix,
 			&mb.ArchivedAt, &mb.CreatedAt, &mb.AutoReply)
 		if err != nil {
@@ -208,10 +260,19 @@ func (r *Repository) Ingest(ctx context.Context, in Inbound) (*Conversation, *Me
 		// Which mailbox. Case-insensitive, because addresses are, and an
 		// archived mailbox does not accept mail — silently filing into one
 		// nobody reads is worse than bouncing.
+		//
+		// SCOPED TO THE TOKEN'S TENANT. A message addressed to another
+		// workspace's mailbox resolves to nothing and takes the ErrNoMailbox
+		// path, so the transaction rolls back and neither the message nor the
+		// idempotency key survives. Answering "no mailbox" rather than
+		// "forbidden" is also the right answer to give a provider: from its
+		// side the address is simply not deliverable through this credential,
+		// and a 4xx would have it retry a message that can never land.
 		var mailboxID, workspaceID string
 		err = tx.QueryRow(ctx, `
 			SELECT id::text, workspace_id::text FROM mailboxes
-			 WHERE lower(address) = $1 AND archived_at IS NULL`, recipient,
+			 WHERE lower(address) = $1 AND archived_at IS NULL
+			   AND ($2 = '' OR workspace_id = $2::uuid)`, recipient, in.WorkspaceID,
 		).Scan(&mailboxID, &workspaceID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			_, _ = tx.Exec(ctx,
