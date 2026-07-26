@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import HuddleBar from './HuddleBar'
 import {
   Alert,
   KeyboardAvoidingView,
@@ -540,6 +541,11 @@ export default function ChannelView({ channel, onBack, onOpenMembers, showBack }
           </Pressable>
         )}
       </View>
+
+      {/* Huddles. Renders nothing at all when this deployment has no media
+          server — a button that 404s is worse than no button. A DM is a
+          channel, so the bar works there too. */}
+      <HuddleBar channelId={channel.id} canWrite={!channel.is_archived} />
 
       {/* Messages */}
       {loadError && rootMessages.length === 0 ? (

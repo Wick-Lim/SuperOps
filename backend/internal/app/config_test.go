@@ -319,3 +319,70 @@ func TestDBConfigDSNKeywordValueFormPassedThrough(t *testing.T) {
 		t.Errorf("keyword/value DSN was rewritten to %q; pgx accepts this form verbatim", got)
 	}
 }
+
+// A HALF-CONFIGURED MEDIA SERVER MUST FAIL THE BOOT.
+//
+// RTCConfig.IsEnabled() returns false when any of the three is missing, so a
+// deployment that set RTC_HOST and forgot RTC_API_SECRET got huddles silently
+// ABSENT — and a log line saying "no media server configured" about a
+// configuration that plainly names one. Every other deployment-dependent
+// capability here fails loudly; this was the exception.
+func TestPartialRTCConfigurationFailsTheBoot(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("JWT_SECRET", "a_jwt_secret_that_is_long_enough_to_pass")
+		t.Setenv("ADMIN_EMAIL", "admin@company.com")
+		t.Setenv("ADMIN_PASSWORD", "changeme_admin_password")
+		t.Setenv("PUBLIC_BASE_URL", "http://localhost:8080")
+	}
+
+	t.Run("host without a secret is refused", func(t *testing.T) {
+		base(t)
+		t.Setenv("RTC_HOST", "http://sfu:7880")
+		t.Setenv("RTC_API_KEY", "devkey")
+		if _, err := LoadConfig(); err == nil {
+			t.Fatal("loaded a configuration that names a media server it cannot authenticate to")
+		} else if !strings.Contains(err.Error(), "RTC_API_SECRET") {
+			t.Errorf("the error does not name the missing variable: %v", err)
+		}
+	})
+
+	t.Run("nothing set at all is fine", func(t *testing.T) {
+		base(t)
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("a deployment with no media server must boot: %v", err)
+		}
+	})
+
+	t.Run("all three set is fine", func(t *testing.T) {
+		base(t)
+		t.Setenv("RTC_HOST", "http://sfu:7880")
+		t.Setenv("RTC_API_KEY", "devkey")
+		t.Setenv("RTC_API_SECRET", "devsecret-at-least-32-characters!!")
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("a complete configuration was refused: %v", err)
+		}
+		if !cfg.RTC.IsEnabled() {
+			t.Error("a complete configuration reports itself disabled")
+		}
+	})
+
+	// An open relay on the customer's network is not a configuration mistake to
+	// discover in production.
+	t.Run("TURN without a shared secret is refused", func(t *testing.T) {
+		base(t)
+		t.Setenv("RTC_ICE_URLS", "turn:relay.example:3478")
+		if _, err := LoadConfig(); err == nil {
+			t.Fatal("loaded a configuration that would serve an open relay")
+		}
+	})
+
+	t.Run("STUN alone needs no secret", func(t *testing.T) {
+		base(t)
+		t.Setenv("RTC_ICE_URLS", "stun:stun.example:3478")
+		if _, err := LoadConfig(); err != nil {
+			t.Fatalf("STUN-only was refused: %v", err)
+		}
+	})
+}

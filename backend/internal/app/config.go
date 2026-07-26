@@ -678,6 +678,7 @@ func (c *Config) validate() error {
 
 	errs = append(errs, c.Mail.validate()...)
 	errs = append(errs, c.validateSSO()...)
+	errs = append(errs, c.validateRTC()...)
 
 	return errors.Join(errs...)
 }
@@ -689,6 +690,54 @@ func (c *Config) validate() error {
 // The key is parsed here rather than at first use so a mistyped SSO_SECRET_KEY
 // fails the boot instead of surfacing as "single sign-on is not configured" the
 // first time a workspace admin saves a provider.
+// validateRTC fails the boot on a half-configured media server.
+//
+// Without it RTCConfig.IsEnabled() silently returns false for a deployment
+// that set RTC_HOST and forgot RTC_API_SECRET, so huddles are simply ABSENT
+// with no explanation — the operator sees a missing feature and no error, and
+// the logs say "huddles disabled: no media server configured" about a
+// configuration that plainly names one.
+//
+// Every other deployment-dependent capability in this product fails loudly on a
+// partial configuration. This is the one that did not.
+func (c *Config) validateRTC() []error {
+	var errs []error
+
+	configured := c.RTC.Host != "" || c.RTC.APIKey != "" || c.RTC.APISecret != "" ||
+		c.RTC.WebhookSecret != ""
+	if configured && !c.RTC.IsEnabled() {
+		var missing []string
+		if c.RTC.Host == "" {
+			missing = append(missing, "RTC_HOST")
+		}
+		if c.RTC.APIKey == "" {
+			missing = append(missing, "RTC_API_KEY")
+		}
+		if c.RTC.APISecret == "" {
+			missing = append(missing, "RTC_API_SECRET")
+		}
+		errs = append(errs, fmt.Errorf("real-time media is partly configured but unusable; "+
+			"missing %s. Set them, or unset every RTC_* variable to disable huddles",
+			strings.Join(missing, ", ")))
+	}
+
+	// TURN with no shared secret would be an OPEN RELAY: anybody on the
+	// internet could move traffic through the customer's network. internal/rtc
+	// refuses it at request time; failing at boot means an operator finds out
+	// before a user does.
+	if c.RTC.ICESecret == "" {
+		for _, u := range c.RTC.ICEURLs {
+			if strings.HasPrefix(u, "turn:") || strings.HasPrefix(u, "turns:") {
+				errs = append(errs, errors.New(
+					"RTC_ICE_URLS contains a TURN server but RTC_ICE_SECRET is empty, "+
+						"which would serve an open relay on your network"))
+				break
+			}
+		}
+	}
+	return errs
+}
+
 func (c *Config) validateSSO() []error {
 	var errs []error
 

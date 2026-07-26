@@ -13,9 +13,9 @@ named, and explicit cuts.
 | [04-docs](04-docs.md) | Phase 3 — block editor | **Implemented** (`035`) |
 | [05-spreadsheet](05-spreadsheet.md) | Phase 4 — grid + formula engine | **Implemented** — no migration; see ruling 8 |
 | [06-design-surface](06-design-surface.md) | Phase 5 — bounded design surface | **Implemented** — no migration; see ruling 8 |
-| [07-huddle](07-huddle.md) | — huddles (order-independent) | **Implemented** (`050`) — media is a §3c capability, off by default |
+| [07-huddle](07-huddle.md) | — huddles (order-independent) | **Implemented** (`050`). Media is a §3c capability, off by default. Client shows the call, its roster and start/end; joining the media itself is deferred with `livekit-client` — see the cut in the plan. |
 | [08-email](08-email.md) | Phase 6 — shared inbox | **Implemented** (`055`) |
-| [09-workflow](09-workflow.md) | Phase 7 — automation | **Implemented** (`060`; `061` earmarked, unspent) |
+| [09-workflow](09-workflow.md) | Phase 7 — automation | **Implemented** (`060`, `062`; `061` earmarked, unspent) |
 
 Already shipped or in flight, so not planned here: outbound mail
 (`internal/mail`), unified search, the collaboration layer (`internal/collab`)
@@ -47,7 +47,7 @@ without colliding with a phase that has not started:
 | `045`–`049` | design surface (plan 06) — **DELIBERATELY UNSPENT**, for the same reason. Plan 06's `preview_seq` column is not built: a preview is a thumbnail, and Drive already has one. |
 | `050`–`054` | huddle (plan 07) — `050` taken (`huddles`, `huddle_participants`, `huddle_webhook_events`); `051`–`054` free. Adds ZERO arms to `acl_object_expected` and zero to `acl_key_expected`: a huddle is not an ACL object, it is exactly as accessible as its scope. |
 | `055`–`059` | email (plan 08) — `055` taken (mail domains, mailboxes, conversations, messages, inbound events, ingest tokens; `files.mail_message_id`; the `idx_files_unowned` rebuild; one new arm in `acl_object_expected`). `acl_key_expected` is UNCHANGED — a conversation is a container and the container arm already inherits its grants. `056`–`059` free. |
-| `060`–`064` | workflow (plan 09) — `060` taken (workflows, versions, triggers, runs, step runs, effects, trigger rejections). **`061` is EARMARKED and unspent**: it is reserved for the credential vault and schedule columns that arrive with the HTTP node, and must not be taken for anything else. `062`–`064` free. |
+| `060`–`064` | workflow (plan 09) — `060` and `062` taken (`062` adds `workflows.owner_id`, the principal every action authorizes against). `060` taken (workflows, versions, triggers, runs, step runs, effects, trigger rejections). **`061` is EARMARKED and unspent**: it is reserved for the credential vault and schedule columns that arrive with the HTTP node, and must not be taken for anything else. `062`–`064` free. |
 
 Rules:
 

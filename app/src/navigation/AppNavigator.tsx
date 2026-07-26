@@ -30,6 +30,8 @@ import DriveFileScreen from '../screens/DriveFileScreen'
 import DriveTrashScreen from '../screens/DriveTrashScreen'
 import DriveShareScreen from '../screens/DriveShareScreen'
 import CollabDocumentScreen from '../screens/CollabDocumentScreen'
+import WorkflowsScreen from '../screens/WorkflowsScreen'
+import InboxScreen, { ConversationScreen } from '../screens/InboxScreen'
 import SettingsScreen from '../screens/SettingsScreen'
 import AdminScreen from '../screens/AdminScreen'
 import ChannelDetailScreen from '../screens/ChannelDetailScreen'
@@ -72,6 +74,9 @@ export type RootStackParamList = {
    * is the obvious first bug of this phase. `fileId` is carried alongside
    * because the projection is posted against the Drive object. */
   CollabDocument: { documentId: string; fileId: string; name?: string; fileType?: string }
+  Workflows: undefined
+  Inbox: undefined
+  Conversation: { conversationId: string }
   /** Internal: shown while the post-login workspace lookup is in flight. */
   Bootstrap: undefined
 }
@@ -148,6 +153,9 @@ const linking: LinkingOptions<RootStackParamList> = {
       DriveShare: 'drive/:objectType/:objectId/share',
       // The editor. documentId is the collab ROOM; fileId is the Drive object.
       CollabDocument: 'documents/:documentId',
+      Workflows: 'automation',
+      Inbox: 'inbox',
+      Conversation: 'conversations/:conversationId',
       Settings: 'settings',
       Admin: 'admin',
     },
@@ -343,6 +351,9 @@ export default function AppNavigator() {
       <Stack.Screen name="DriveTrash" component={DriveTrashScreen} />
       <Stack.Screen name="DriveShare" component={DriveShareScreen} />
       <Stack.Screen name="CollabDocument" component={CollabDocumentScreen} />
+      <Stack.Screen name="Workflows" component={WorkflowsScreen} />
+      <Stack.Screen name="Inbox" component={InboxScreen} />
+      <Stack.Screen name="Conversation" component={ConversationScreen} />
       <Stack.Screen name="Settings" component={SettingsScreen} />
       <Stack.Screen name="Admin" component={AdminScreen} />
     </>

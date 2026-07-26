@@ -106,32 +106,22 @@ func TestARetriedRunDoesNotPerformItsEffectTwice(t *testing.T) {
 	poster := &countingPoster{}
 	exec := workflow.NewExecutor(repo, nil, workflow.NewPostMessageAction(poster))
 
-	// First delivery.
+	// The run is constructed directly rather than claimed from the queue.
 	//
-	// The queue is shared with every other test in this package, so claim until
-	// OUR run comes up. It must never t.Skip: a skip here makes the assertion
-	// below vacuous, and this is the one property the whole package exists for
-	// — verified by disabling the effects guard and watching this go red.
-	var run *workflow.Run
-	var steps []workflow.Step
-	for attempt := 0; attempt < 200; attempt++ {
-		r, s, err := repo.ClaimRun(ctx)
-		if errors.Is(err, workflow.ErrNotFound) {
-			t.Fatalf("the queue drained without producing our run (%s)", runID)
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		if r.ID == runID {
-			run, steps = r, s
-			break
-		}
-		// Somebody else's run: put it back so its own test still finds it.
-		_ = repo.FinishRun(ctx, r.ID, "cancelled", "claimed by another test's drain loop")
+	// The property under test is the EFFECTS TABLE — that a second execution of
+	// the same run does not repeat its side effect — and claiming from a queue
+	// this whole suite shares made that assertion depend on which test's run
+	// came up first. It also must never t.Skip: a skip here is a vacuous pass
+	// on the one property the package exists for.
+	//
+	// ClaimRun is covered by TestClaimRunTakesAPendingRunWithItsSteps and by
+	// the stale-run test, which are about the queue rather than about this.
+	run := &workflow.Run{
+		ID: runID, WorkflowID: wf.ID, WorkspaceID: ws, OwnerID: me,
+		Payload: []byte(`{"channel_id":"x"}`),
 	}
-	if run == nil {
-		t.Fatalf("never claimed our own run after 200 attempts")
-	}
+	steps := match.Steps
+
 	if err := exec.Run(ctx, run, steps); err != nil {
 		t.Fatal(err)
 	}
@@ -897,4 +887,61 @@ func TestATriggerWithNoStableIdentityIsRefused(t *testing.T) {
 		t.Fatal("a message with no stable identity was enqueued; every redelivery would start " +
 			"another run of the same workflow")
 	}
+}
+
+// ClaimRun hands back a pending run together with the steps of the version it
+// was queued with. Separated from the idempotency test because it is about the
+// QUEUE, and mixing the two made the more important assertion depend on which
+// test's run came up first.
+func TestClaimRunTakesAPendingRunWithItsSteps(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	channel := h.createChannel(t, admin, ws, uniqueSlug("wf-claim"))
+	repo := wfRepo(t)
+	ctx := context.Background()
+
+	wf := saveWorkflow(t, ws, me,
+		[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{
+			"channel_id": channel, "body": "claimed",
+		}}},
+		[]workflow.Trigger{{EventType: "wf.test.claim"}})
+	matches, _ := repo.MatchingWorkflows(ctx, ws, "wf.test.claim")
+	var match workflow.Matching
+	for _, m := range matches {
+		if m.WorkflowID == wf.ID {
+			match = m
+		}
+	}
+	if _, err := repo.EnqueueRun(ctx, match, "wf.test.claim",
+		fmt.Sprintf("evt-claim-%d", time.Now().UnixNano()), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// SOME run comes back — the queue is shared with the rest of the suite, so
+	// asserting it is ours would be asserting the scheduler's order.
+	run, steps, err := repo.ClaimRun(ctx)
+	if err != nil {
+		t.Fatalf("nothing could be claimed from a non-empty queue: %v", err)
+	}
+	if run.ID == "" || run.WorkspaceID == "" {
+		t.Fatalf("claimed run is incomplete: %+v", run)
+	}
+	if run.OwnerID == "" {
+		t.Fatal("the claimed run carries no owner, so no step could be authorized")
+	}
+	if steps == nil {
+		t.Fatal("the claim returned no steps; the run would execute nothing")
+	}
+	// It is marked running, so a second worker does not take it.
+	var status string
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT status FROM workflow_runs WHERE id = $1`, run.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" {
+		t.Fatalf("claimed run status = %q, want running — two workers would take it", status)
+	}
+	_ = repo.FinishRun(ctx, run.ID, "cancelled", "claimed by a test")
 }

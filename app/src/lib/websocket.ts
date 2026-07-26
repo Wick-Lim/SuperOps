@@ -26,6 +26,23 @@ export type ResyncReason = 'seq-gap' | 'reconnect' | 'revoked' | 'manual'
  * different thing for each. Collapsing them would tell somebody who was removed
  * from a document that they had left it.
  */
+/**
+ * A huddle event, delivered to a channel's SUBSCRIBERS.
+ *
+ * Subscribing requires read on the channel, so a stranger never learns a call
+ * exists. Somebody who can read a public channel but has not subscribed finds
+ * out from GET /channels/{id}/huddle instead — the pull path, which authorizes
+ * per request.
+ *
+ * The server has published all three of these since huddles shipped and the
+ * client dropped them on the floor: the dispatch switch is closed, so an
+ * unhandled type reaches the generic handlers and nothing else.
+ */
+export type HuddleEvent =
+  | { kind: 'started'; channelId: string; huddleId: string; startedBy: string }
+  | { kind: 'ended'; channelId: string; huddleId: string; reason: string }
+  | { kind: 'roster'; channelId: string; huddleId: string }
+
 export type RoomEvent =
   | { kind: 'joined'; documentId: string; headSeq: number; canWrite: boolean }
   | { kind: 'left'; documentId: string; reason: 'client' | 'revoked' }
@@ -109,6 +126,7 @@ class WebSocketManager {
   /** Rooms the server has acknowledged on THIS connection. */
   private joinedRooms: Map<string, { canWrite: boolean; headSeq: number }> = new Map()
   private roomListeners: Set<(e: RoomEvent) => void> = new Set()
+  private huddleListeners: Set<(e: HuddleEvent) => void> = new Set()
   /** Channels the server has acknowledged with a `subscribed` frame. */
   private confirmedChannels: Set<string> = new Set()
   private typingTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
@@ -244,6 +262,7 @@ class WebSocketManager {
     this.handlers.clear()
     this.resyncListeners.clear()
     this.roomListeners.clear()
+    this.huddleListeners.clear()
     this.everConnected = false
     this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS
   }
@@ -440,6 +459,15 @@ class WebSocketManager {
     this.send('collab.awareness', { document_id: documentId, state: stateBase64 })
   }
 
+  onHuddle(listener: (e: HuddleEvent) => void) {
+    this.huddleListeners.add(listener)
+    return () => this.huddleListeners.delete(listener)
+  }
+
+  private emitHuddle(e: HuddleEvent) {
+    this.huddleListeners.forEach((l) => l(e))
+  }
+
   onRoom(listener: (e: RoomEvent) => void) {
     this.roomListeners.add(listener)
     return () => this.roomListeners.delete(listener)
@@ -629,6 +657,38 @@ class WebSocketManager {
         }
         break
       }
+      // --- huddles -----------------------------------------------------------
+      case 'huddle.started': {
+        const channelId = str(d, 'channel_id')
+        const huddleId = str(d, 'huddle_id')
+        if (!channelId || !huddleId) break
+        this.emitHuddle({
+          kind: 'started',
+          channelId,
+          huddleId,
+          startedBy: str(d, 'started_by') ?? '',
+        })
+        break
+      }
+      case 'huddle.ended': {
+        const channelId = str(d, 'channel_id')
+        const huddleId = str(d, 'huddle_id')
+        if (!channelId || !huddleId) break
+        this.emitHuddle({ kind: 'ended', channelId, huddleId, reason: str(d, 'reason') ?? '' })
+        break
+      }
+      case 'huddle.roster': {
+        const channelId = str(d, 'channel_id')
+        const huddleId = str(d, 'huddle_id')
+        if (!channelId || !huddleId) break
+        // The frame is a NUDGE, not a payload: it says the roster changed and
+        // the reader refetches. Sending the roster itself would mean deciding
+        // per subscriber what they may see, which is what the pull path
+        // already does correctly.
+        this.emitHuddle({ kind: 'roster', channelId, huddleId })
+        break
+      }
+
       // --- collaboration -----------------------------------------------------
       //
       // These arms keep no document state. The CRDT lives in the provider and
