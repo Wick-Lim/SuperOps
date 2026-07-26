@@ -448,3 +448,128 @@ func TestCollabFramesUseTheirOwnBudget(t *testing.T) {
 		}
 	}
 }
+
+// TestAskRoomLeaderReachesAnotherReplica.
+//
+// SendToRoomLeader is LOCAL ONLY, and for a long time its caller's comment
+// claimed that "another replica's leader may still answer" — which nothing in
+// the system made true. That mattered the moment the projection repair sweep
+// arrived: the worker has no hub at all, so every request it made would have
+// reached nobody, and stale documents would have stayed stale while the log
+// said they had been asked.
+//
+// The asking hub holds NO member of the room. That is the case the local-only
+// path cannot serve, so a bridge that does not publish fails here.
+func TestAskRoomLeaderReachesAnotherReplica(t *testing.T) {
+	nc, cleanup := testNATS(t)
+	defer cleanup()
+
+	holder := NewHub(testLogger())
+	go holder.Run()
+	defer holder.Shutdown()
+	holder.StartRoomBridge(nc, testLogger())
+
+	asker := NewHub(testLogger())
+	go asker.Run()
+	defer asker.Shutdown()
+	asker.StartRoomBridge(nc, testLogger())
+
+	members := make([]*Client, 3)
+	for i := range members {
+		members[i] = newTestClient(holder, "u1")
+		holder.register <- members[i]
+		members[i].JoinRoom(testDocumentID, true)
+	}
+	waitFor(t, "members registered", func() bool { return holder.ConnectionCount() == 3 })
+
+	// No local member, so this returns false — and must still reach the room.
+	if asker.AskRoomLeader(testDocumentID, TypeCollabProject, map[string]any{
+		"document_id": testDocumentID, "head_seq": int64(400), "projection_seq": int64(0),
+	}) {
+		t.Fatal("the asking hub claimed a local member it does not have")
+	}
+
+	waitFor(t, "the room's replica delivered", func() bool {
+		n := 0
+		for _, c := range members {
+			n += len(c.send)
+		}
+		return n > 0
+	})
+
+	asked := 0
+	for _, c := range members {
+		asked += len(c.send)
+	}
+	if asked != 1 {
+		t.Fatalf("%d of 3 room members were asked, want exactly 1", asked)
+	}
+}
+
+// TestWorkerWithNoHubReachesARoom: the projection repair sweep runs in a
+// process that holds a NATS connection and nothing else, which is why the
+// publish is a free function rather than a Hub method.
+func TestWorkerWithNoHubReachesARoom(t *testing.T) {
+	nc, cleanup := testNATS(t)
+	defer cleanup()
+
+	hub := NewHub(testLogger())
+	go hub.Run()
+	defer hub.Shutdown()
+	hub.StartRoomBridge(nc, testLogger())
+
+	c := newTestClient(hub, "u1")
+	hub.register <- c
+	c.JoinRoom(testDocumentID, true)
+	waitFor(t, "registered", func() bool { return hub.ConnectionCount() == 1 })
+
+	if err := PublishRoomLeaderRequest(nc, "", testDocumentID, TypeCollabProject, map[string]any{
+		"document_id": testDocumentID, "head_seq": int64(400), "projection_seq": int64(0),
+	}); err != nil {
+		t.Fatalf("publish leader request: %v", err)
+	}
+	waitFor(t, "delivered", func() bool { return len(c.send) == 1 })
+}
+
+// TestAskRoomLeaderDoesNotAskItsOwnReplicaTwice: AskRoomLeader delivers locally
+// AND publishes, so a hub that acted on the echo of its own publish would have
+// its leader upload two copies of every snapshot.
+//
+// THE SETTLE IS A SECOND MESSAGE, not a sleep. NATS preserves publish order on
+// one connection and the subscription callback runs them in order, so once the
+// sentinel has been delivered the echo has already been processed — or dropped,
+// which is the thing under test. A timer here would pass whenever the machine
+// was busy, which is exactly how the first version of this test passed against
+// a hub with the suppression removed.
+func TestAskRoomLeaderDoesNotAskItsOwnReplicaTwice(t *testing.T) {
+	nc, cleanup := testNATS(t)
+	defer cleanup()
+
+	hub := NewHub(testLogger())
+	go hub.Run()
+	defer hub.Shutdown()
+	hub.StartRoomBridge(nc, testLogger())
+
+	c := newTestClient(hub, "u1")
+	hub.register <- c
+	c.JoinRoom(testDocumentID, true)
+	waitFor(t, "registered", func() bool { return hub.ConnectionCount() == 1 })
+
+	if !hub.AskRoomLeader(testDocumentID, TypeCollabProject, map[string]string{"document_id": testDocumentID}) {
+		t.Fatal("AskRoomLeader reported no local member of a room with one")
+	}
+	waitFor(t, "the local delivery landed", func() bool { return len(c.send) >= 1 })
+
+	// The sentinel, from a different origin so it is never suppressed.
+	if err := PublishRoomLeaderRequest(nc, "other-replica", testDocumentID,
+		TypeCollabCompact, map[string]string{"document_id": testDocumentID}); err != nil {
+		t.Fatalf("publish sentinel: %v", err)
+	}
+	waitFor(t, "the sentinel arrived", func() bool { return len(c.send) >= 2 })
+
+	// Local delivery + sentinel. A third frame is the echo the hub should have
+	// dropped.
+	if n := len(c.send); n != 2 {
+		t.Fatalf("the leader holds %d frames, want 2 (local + sentinel); the echo was not suppressed", n)
+	}
+}

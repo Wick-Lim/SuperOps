@@ -59,13 +59,17 @@ function connectOpen(): FakeWebSocket {
   return socket
 }
 
-function makeProvider(onStatus?: (s: ProviderStatus, d?: string) => void) {
+function makeProvider(
+  onStatus?: (s: ProviderStatus, d?: string) => void,
+  onProjectRequest?: () => void,
+) {
   const doc = new Y.Doc()
   const provider = new CollabProvider({
     documentId: DOC,
     doc,
     user: { id: 'u-self', name: 'Self', color: '#f00' },
     onStatus,
+    onProjectRequest,
   })
   return { doc, provider }
 }
@@ -374,5 +378,85 @@ describe('the collaboration provider', () => {
     doc.getText('body').insert(0, 'after destroy')
     await flush()
     expect(socket.sentOfType('collab.update').length).toBe(before)
+  })
+})
+
+// THE FOURTH REPAIR PATH.
+//
+// A document's searchable text can only be produced by a client that has the
+// CRDT in memory — the server never interprets an update. Three paths do that
+// and all three need somebody to be in the document: the editor's debounce, its
+// flush on unmount, and its catch-up on open. A document edited and then closed
+// by a browser that was killed runs none of them and is then wrong in search
+// with nothing able to notice.
+//
+// The worker's sweep is what notices, and this is the client end of it.
+describe('a server request to re-project', () => {
+  it('reaches a writer', async () => {
+    const socket = connectOpen()
+    let asked = 0
+    const { provider } = makeProvider(undefined, () => {
+      asked++
+    })
+    await flush()
+    socket.emit({ type: 'collab.joined', data: { document_id: DOC, head_seq: 0, can_write: true } })
+    await settle()
+
+    socket.emit({
+      type: 'collab.project',
+      data: { document_id: DOC, head_seq: 400, projection_seq: 0 },
+    })
+    await settle()
+
+    expect(asked).toBe(1)
+    provider.destroy()
+  })
+
+  // A reader has no capability to project and the server would refuse the
+  // write. Answering anyway would mean every reader in a room posting a body
+  // that is thrown away — and the sweep would keep asking, because the stored
+  // projection never advances.
+  it('is ignored by a reader', async () => {
+    const socket = connectOpen()
+    let asked = 0
+    const { provider } = makeProvider(undefined, () => {
+      asked++
+    })
+    await flush()
+    socket.emit({ type: 'collab.joined', data: { document_id: DOC, head_seq: 0, can_write: false } })
+    await settle()
+
+    socket.emit({
+      type: 'collab.project',
+      data: { document_id: DOC, head_seq: 400, projection_seq: 0 },
+    })
+    await settle()
+
+    expect(asked).toBe(0)
+    provider.destroy()
+  })
+
+  // The sweep re-asks every ten minutes. A one-shot guard anywhere on this path
+  // would mean a document that failed to repair once was never asked again.
+  it('is answered every time it is asked', async () => {
+    const socket = connectOpen()
+    let asked = 0
+    const { provider } = makeProvider(undefined, () => {
+      asked++
+    })
+    await flush()
+    socket.emit({ type: 'collab.joined', data: { document_id: DOC, head_seq: 0, can_write: true } })
+    await settle()
+
+    for (let i = 0; i < 3; i++) {
+      socket.emit({
+        type: 'collab.project',
+        data: { document_id: DOC, head_seq: 400, projection_seq: 0 },
+      })
+      await settle()
+    }
+
+    expect(asked).toBe(3)
+    provider.destroy()
   })
 })

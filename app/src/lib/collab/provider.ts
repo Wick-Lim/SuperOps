@@ -50,6 +50,12 @@ export interface ProviderOptions {
   /** The local user, for the awareness state other people render as a cursor. */
   user: { id: string; name: string; color: string }
   onStatus?: (status: ProviderStatus, detail?: string) => void
+  /** The server has noticed this document's stored projection sitting behind
+   * the log and is asking for a fresh one. It cannot produce one itself — it
+   * never interprets a CRDT update — so this is the repair path for a document
+   * whose last editor's browser died before it could flush. Ignored when this
+   * client cannot write: the server would refuse the projection anyway. */
+  onProjectRequest?: () => void
 }
 
 export class CollabProvider {
@@ -78,11 +84,13 @@ export class CollabProvider {
   private awarenessHandler: ((changes: unknown, origin: unknown) => void) | null = null
   private destroyed = false
   private readonly onStatus?: (status: ProviderStatus, detail?: string) => void
+  private readonly onProjectRequest?: () => void
 
   constructor(opts: ProviderOptions) {
     this.documentId = opts.documentId
     this.doc = opts.doc
     this.onStatus = opts.onStatus
+    this.onProjectRequest = opts.onProjectRequest
     this.awareness = new Awareness(this.doc)
     this.awareness.setLocalStateField('user', opts.user)
 
@@ -162,6 +170,13 @@ export class CollabProvider {
         break
       case 'compact':
         void this.compact(e.headSeq)
+        break
+      case 'project':
+        // Only a writer answers. Every replica holding a member of this room
+        // asks its own leader, so several clients may answer one request —
+        // harmless, because the server's monotonic guard keeps the first and
+        // discards the rest.
+        if (this.canWrite) this.onProjectRequest?.()
         break
     }
   }

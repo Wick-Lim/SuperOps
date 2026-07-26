@@ -228,7 +228,7 @@ func (s *Service) maybeRequestCompaction(documentID string, headSeq, snapshotSeq
 		return
 	}
 
-	sent := s.hub.SendToRoomLeader(documentID, ws.TypeCollabCompact, map[string]interface{}{
+	sent := s.hub.AskRoomLeader(documentID, ws.TypeCollabCompact, map[string]interface{}{
 		"document_id":  documentID,
 		"head_seq":     headSeq,
 		"snapshot_seq": snapshotSeq,

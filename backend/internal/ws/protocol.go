@@ -111,6 +111,18 @@ const (
 	// the document and POST it back, because the server cannot merge CRDT
 	// state itself.
 	TypeCollabCompact = "collab.compact"
+	// TypeCollabProject asks one client in the room to re-publish the document's
+	// projection — the searchable text, outline and refs.
+	//
+	// Same shape as compaction and for the same reason: THE SERVER CANNOT READ A
+	// CRDT. A document edited and then closed by a browser that was killed never
+	// ran its flush, so its stored projection sits behind the log and the
+	// document is stale in search with nothing able to notice. Opening it is one
+	// repair path; this is the other, for a document nobody opens.
+	//
+	// It is a REQUEST, not a command. A client that cannot write ignores it —
+	// the server would refuse its projection anyway.
+	TypeCollabProject = "collab.project"
 )
 
 // Reasons carried by an "unsubscribed" frame.

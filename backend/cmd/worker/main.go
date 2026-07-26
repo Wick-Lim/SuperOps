@@ -45,6 +45,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
+	"github.com/Wick-Lim/SuperOps/backend/internal/collab"
 	"github.com/Wick-Lim/SuperOps/backend/internal/comment"
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive"
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive/registry"
@@ -62,6 +63,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/thumb"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/internal/workflow"
+	"github.com/Wick-Lim/SuperOps/backend/internal/ws"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/logger"
 	natspkg "github.com/Wick-Lim/SuperOps/backend/pkg/nats"
@@ -69,20 +71,21 @@ import (
 
 // Job names, also used as the keys in the /health payload.
 const (
-	jobSessionCleanup  = "session_cleanup"
-	jobScheduledSend   = "scheduled_messages"
-	jobRetention       = "retention"
-	jobObjectGC        = "object_gc"
-	jobACLDrift        = "acl_drift"
-	jobInboxDigest     = "inbox_digest"
-	jobInboxReconcile  = "inbox_reconcile"
-	jobAuditPartition  = "audit_partitions"
-	jobAuditVerify     = "audit_verify"
-	jobDriveTrash      = "drive_trash_purge"
-	jobHuddleReconcile = "huddle_reconcile"
-	jobWorkflowStep    = "workflow_step"
-	jobWorkflowReaper  = "workflow_reaper"
-	jobMailSweep       = "mail_unsent_sweep"
+	jobSessionCleanup   = "session_cleanup"
+	jobScheduledSend    = "scheduled_messages"
+	jobRetention        = "retention"
+	jobObjectGC         = "object_gc"
+	jobACLDrift         = "acl_drift"
+	jobInboxDigest      = "inbox_digest"
+	jobInboxReconcile   = "inbox_reconcile"
+	jobAuditPartition   = "audit_partitions"
+	jobAuditVerify      = "audit_verify"
+	jobDriveTrash       = "drive_trash_purge"
+	jobHuddleReconcile  = "huddle_reconcile"
+	jobWorkflowStep     = "workflow_step"
+	jobWorkflowReaper   = "workflow_reaper"
+	jobMailSweep        = "mail_unsent_sweep"
+	jobProjectionRepair = "projection_repair"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -138,6 +141,23 @@ const (
 	// ago.
 	mailSweepInterval   = 5 * time.Minute
 	mailSweepStartDelay = 2 * time.Minute
+
+	// Projection repair. Slow on purpose: the healthy paths — the editor's
+	// debounce, its unmount flush, and the catch-up on open — repair almost
+	// everything, and this exists for what they miss. Running it often would
+	// mean asking rooms for snapshots that a debounce two seconds away was
+	// about to produce anyway.
+	projectionRepairInterval   = 10 * time.Minute
+	projectionRepairStartDelay = 3 * time.Minute
+	// How far behind the log a projection must be before it is worth a request.
+	// Below this the gap is ordinary in-flight editing.
+	projectionRepairGap = 200
+	// And how long it must have been behind. A document being actively typed in
+	// is always somewhat behind; one untouched for this long is not mid-edit.
+	projectionRepairAge = 30 * time.Minute
+	// Per sweep. A bounded, visible amount of work rather than a thundering
+	// request to every room in a backlog.
+	projectionRepairBatch = 100
 )
 
 // Advisory-lock keys. Distinct 64-bit constants; any other application taking
@@ -171,6 +191,10 @@ const (
 	// The unsent-mail sweep. Locked because it SENDS: two replicas sweeping
 	// concurrently would each load the same unstamped row and deliver it twice.
 	lockMailSweep int64 = 0x50_000C
+	// The projection repair sweep. Locked because it PUBLISHES: two replicas
+	// sweeping the same stale documents would ask each room's leader twice for
+	// the same snapshot.
+	lockProjectionRepair int64 = 0x50_000D
 )
 
 // aclDriftSamples bounds how many concrete disagreements one drift report
@@ -543,6 +567,37 @@ func run() int {
 	start(jobWorkflowStep, workflowStepStartDelay, workflowStepInterval, func(c context.Context) error {
 		return drainWorkflowRuns(c, workflowRepo, workflowExec, l)
 	})
+
+	// Projection repair.
+	//
+	// THE SERVER CANNOT PRODUCE A PROJECTION. It never interprets a CRDT update,
+	// so a document whose stored text sits behind its log can only be repaired
+	// by a client that has the document in memory. Three paths do that — the
+	// editor's debounce, its flush on unmount, and its catch-up on open — and
+	// all three need somebody to be there. This is the fourth, for the document
+	// that was edited, closed by a browser that was killed before it could
+	// flush, and then never opened again: stale in search, with nothing else in
+	// the system able to notice.
+	//
+	// It ASKS rather than fixes. If a room is empty there is nobody to ask, and
+	// the log is not growing either — so the staleness is logged and waits for
+	// the next person to open the document, which is exactly what the catch-up
+	// path is for.
+	if natsClient.Conn != nil {
+		start(jobProjectionRepair, projectionRepairStartDelay, projectionRepairInterval,
+			func(c context.Context) error {
+				ran, err := withSingletonLock(c, pool, lockProjectionRepair, func(c context.Context) error {
+					return repairProjections(c, pool, natsClient.Conn, l)
+				})
+				if err != nil {
+					return err
+				}
+				if !ran {
+					l.Debug("projection repair skipped: another replica holds the lock")
+				}
+				return nil
+			})
+	}
 
 	// The unsent-mail sweep. The publish from the reply handler is best effort
 	// by design — an agent's reply must not fail because a message bus was
@@ -1029,6 +1084,43 @@ func runLoop(
 			return
 		}
 	}
+}
+
+// repairProjections asks the rooms of stale documents to re-project.
+//
+// The query is the whole design. It compares the collaboration log's head
+// against the stored projection's seq, and the LEFT JOIN matters: a document
+// that has never been projected has no row at all, and an inner join would hide
+// exactly the documents that are most wrong.
+func repairProjections(ctx context.Context, pool *pgxpool.Pool, nc *nats.Conn, l *slog.Logger) error {
+	found, err := collab.FindStaleProjections(ctx, pool,
+		projectionRepairGap, projectionRepairAge, projectionRepairBatch)
+	if err != nil {
+		return err
+	}
+	if len(found) == 0 {
+		return nil
+	}
+
+	for _, s := range found {
+		// Published with no origin: this process has no hub, so there is no
+		// local delivery to suppress.
+		if err := ws.PublishRoomLeaderRequest(nc, "", s.DocumentID, ws.TypeCollabProject, map[string]any{
+			"document_id":    s.DocumentID,
+			"head_seq":       s.HeadSeq,
+			"projection_seq": s.ProjectionSeq,
+		}); err != nil {
+			return fmt.Errorf("request projection for %s: %w", s.DocumentID, err)
+		}
+	}
+
+	// WARN, not Debug. Every one of these is a document that is wrong in search
+	// right now, and if the number does not fall over successive sweeps then the
+	// rooms are empty and the requests are going nowhere — which an operator
+	// needs to be able to see without turning on debug logging.
+	l.Warn("asked rooms to repair stale projections",
+		"documents", len(found), "oldest_gap", found[0].Gap())
+	return nil
 }
 
 // withSingletonLock runs fn while holding a session-scoped Postgres advisory

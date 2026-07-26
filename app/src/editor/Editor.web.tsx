@@ -38,6 +38,15 @@ export interface EditorProps {
   /** The Drive object, for resolving reference labels against THIS document —
    * the resolve endpoint authorizes on the document as well as the target. */
   fileId?: string
+  /** Publish a projection once the document has loaded, because the stored one
+   * is behind the log. Raised by the descriptor's head_seq/projection_seq gap
+   * on open and by the server's `collab.project` request — the two backstops
+   * for a document whose browser was killed before its debounce fired, since
+   * the server cannot produce content on its own.
+   *
+   * A COUNTER rather than a flag: the server re-asks, and a consumed boolean
+   * would swallow every request after the first. 0 means nothing is asked. */
+  catchUp?: number
   editable: boolean
   user: { name: string; color: string }
   /** Called when the document settles, with the projection to publish. */
@@ -56,7 +65,9 @@ export interface EditorProps {
  */
 const PROJECT_DEBOUNCE_MS = 2000
 
-export default function Editor({ doc, awareness, editable, user, onProject, seq, fileId }: EditorProps) {
+export default function Editor({
+  doc, awareness, editable, user, onProject, seq, fileId, catchUp,
+}: EditorProps) {
   // One resolver per open document. Thrown away with the editor, which is what
   // keeps its cache scoped to the file it was authorized against — a global one
   // would let a name learned through a document you may read leak into one you
@@ -120,6 +131,33 @@ export default function Editor({ doc, awareness, editable, user, onProject, seq,
       if (timer.current) clearTimeout(timer.current)
     }
   }, [editor, editable, onProject])
+
+  // CATCH UP once, when the stored projection is behind and this caller may
+  // write.
+  //
+  // Delayed rather than immediate: the Y.Doc is empty until the provider has
+  // fetched state, and projecting then would write an EMPTY body over a good
+  // one — the server's monotonic guard cannot catch it, because the seq is the
+  // log head either way. Waiting for a non-empty document is the check that
+  // actually distinguishes "loaded and empty" from "not loaded yet".
+  const caughtUp = useRef(0)
+  useEffect(() => {
+    if (!editor || !editable || !catchUp || caughtUp.current === catchUp) return
+    const timer = setTimeout(() => {
+      if (caughtUp.current === catchUp) return
+      const json = editor.getJSON()
+      const projection = extract(json, seqRef.current)
+      if (projection.body_text.trim() === '' && projection.refs.length === 0) {
+        // Still empty. Either the document genuinely is, in which case there is
+        // nothing to catch up, or state has not arrived — and in both cases
+        // publishing would be a lie or a loss.
+        return
+      }
+      caughtUp.current = catchUp
+      onProject(projection)
+    }, 2500)
+    return () => clearTimeout(timer)
+  }, [editor, editable, catchUp, onProject])
 
   // And once more on unmount, which is the case the reconciler exists for: a
   // document edited and closed before the debounce fired would otherwise stay

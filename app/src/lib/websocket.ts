@@ -49,6 +49,7 @@ export type RoomEvent =
   | { kind: 'update'; documentId: string; seq: number; actorId: string; originConn: string; update: string }
   | { kind: 'awareness'; documentId: string; actorId: string; originConn: string; state: string }
   | { kind: 'compact'; documentId: string; headSeq: number; snapshotSeq: number }
+  | { kind: 'project'; documentId: string; headSeq: number; projectionSeq: number }
   /** The socket dropped and came back; every room was re-joined from scratch. */
   | { kind: 'resumed'; documentId: string }
 
@@ -752,6 +753,17 @@ class WebSocketManager {
           documentId,
           headSeq: num(d, 'head_seq') ?? 0,
           snapshotSeq: num(d, 'snapshot_seq') ?? 0,
+        })
+        break
+      }
+      case 'collab.project': {
+        const documentId = str(d, 'document_id')
+        if (!documentId) break
+        this.emitRoom({
+          kind: 'project',
+          documentId,
+          headSeq: num(d, 'head_seq') ?? 0,
+          projectionSeq: num(d, 'projection_seq') ?? 0,
         })
         break
       }

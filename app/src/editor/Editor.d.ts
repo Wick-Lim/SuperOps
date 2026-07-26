@@ -28,6 +28,15 @@ export interface EditorProps {
    * placeholder rather than resolving it, because resolving costs a request per
    * open on a connection that may be a phone's. */
   fileId?: string
+  /** Publish a projection once the document has loaded, because the stored one
+   * is behind the log. Raised by the descriptor's head_seq/projection_seq gap
+   * on open and by the server's `collab.project` request — the two backstops
+   * for a document whose browser was killed before its debounce fired, since
+   * the server cannot produce content on its own.
+   *
+   * A COUNTER rather than a flag: the server re-asks, and a consumed boolean
+   * would swallow every request after the first. 0 means nothing is asked. */
+  catchUp?: number
   /** The server decides; a read-only surface is rendered, not failed on submit. */
   editable: boolean
   user: { name: string; color: string }

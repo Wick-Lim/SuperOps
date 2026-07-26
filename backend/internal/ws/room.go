@@ -25,6 +25,9 @@ const (
 	// Deliberately not "ws.room.revoke": that would fall inside the
 	// "ws.room.>" wildcard the room bridge subscribes to.
 	natsRoomRevokeSubject = "ws.roomrevoke"
+	// Asks every replica to put a message to its own room leader. See
+	// PublishRoomLeaderRequest.
+	natsRoomLeaderSubject = "ws.roomleader"
 )
 
 // Errors a RoomHandler returns to say what went wrong in terms the socket can
@@ -394,6 +397,60 @@ func (h *Hub) SendToRoomLeader(documentID, msgType string, data interface{}) boo
 	return true
 }
 
+// RoomLeaderEnvelope carries a leader-directed message between replicas.
+type RoomLeaderEnvelope struct {
+	OriginID   string          `json:"origin_id"`
+	DocumentID string          `json:"document_id"`
+	Type       string          `json:"type"`
+	Data       json.RawMessage `json:"data"`
+}
+
+// PublishRoomLeaderRequest asks EVERY replica to deliver to its own room
+// leader, and is a free function because its most important caller has no Hub:
+// the worker repairing a stale projection runs in a separate process that holds
+// a NATS connection and nothing else.
+//
+// Fan-out to one leader per replica rather than a true election. A room spread
+// over three replicas produces up to three answers to one request, which is the
+// tradeoff SendToRoomLeader already documents and takes — the duplicates lose
+// the monotonic compare-and-set and cost one rejected write each, while a
+// cross-replica election would cost a consensus round on every request.
+//
+// originID is the publisher's hub id, so a hub that already delivered locally
+// does not deliver twice. A caller with no hub passes "".
+func PublishRoomLeaderRequest(nc *nats.Conn, originID, documentID, msgType string, data interface{}) error {
+	if nc == nil {
+		return nil
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	env, err := json.Marshal(RoomLeaderEnvelope{
+		OriginID: originID, DocumentID: documentID, Type: msgType, Data: payload,
+	})
+	if err != nil {
+		return err
+	}
+	return nc.Publish(natsRoomLeaderSubject, env)
+}
+
+// AskRoomLeader delivers to a local leader if there is one, and asks the other
+// replicas either way.
+//
+// BOTH, not one or the other: "no local member" does not mean "no member", and
+// choosing between them by whether a local client happened to be connected is
+// what made cross-replica rooms silently unrepairable.
+func (h *Hub) AskRoomLeader(documentID, msgType string, data interface{}) bool {
+	local := h.SendToRoomLeader(documentID, msgType, data)
+	if h.natsConn != nil {
+		if err := PublishRoomLeaderRequest(h.natsConn, h.id, documentID, msgType, data); err != nil {
+			h.logger.Warn("room leader request: publish", "error", err, "document_id", documentID)
+		}
+	}
+	return local
+}
+
 // ---------------------------------------------------------------------------
 // Revocation
 // ---------------------------------------------------------------------------
@@ -490,6 +547,22 @@ func (h *Hub) StartRoomBridge(nc *nats.Conn, logger *slog.Logger) {
 		logger.Error("room bridge: subscribe failed", "error", err)
 	} else {
 		logger.Info("WebSocket collaboration room bridge started", "subject", natsRoomSubjectPrefix+">")
+	}
+
+	_, err = nc.Subscribe(natsRoomLeaderSubject, func(msg *nats.Msg) {
+		var env RoomLeaderEnvelope
+		if err := json.Unmarshal(msg.Data, &env); err != nil {
+			logger.Warn("room bridge: unmarshal leader request", "error", err)
+			return
+		}
+		// Our own publish, echoed back: AskRoomLeader already delivered locally.
+		if env.OriginID == h.id {
+			return
+		}
+		h.SendToRoomLeader(env.DocumentID, env.Type, env.Data)
+	})
+	if err != nil {
+		logger.Error("room bridge: subscribe leader failed", "error", err)
 	}
 
 	_, err = nc.Subscribe(natsRoomRevokeSubject, func(msg *nats.Msg) {

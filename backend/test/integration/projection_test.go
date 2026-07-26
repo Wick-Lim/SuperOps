@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/Wick-Lim/SuperOps/backend/internal/collab"
 )
 
 // The projection is the one place the server stores something it cannot verify:
@@ -455,5 +457,110 @@ func TestADocumentIsFindableByItsBody(t *testing.T) {
 	other := h.newTenant(t, "body-outsider")
 	if contains(h.searchHits(t, other.token, other.workspaceID, phrase), doc.ID) {
 		t.Fatal("another tenant found the document by its body text")
+	}
+}
+
+// RULE 6: A DOCUMENT NOBODY OPENS IS STILL REPAIRABLE.
+//
+// The three healthy projection paths — the editor's debounce, its flush on
+// unmount, and its catch-up on open — all need somebody to be in the document.
+// A document edited and then closed by a browser that was killed runs none of
+// them, and is then stale in search with nothing able to notice. The repair
+// sweep is what notices.
+//
+// THE LEFT JOIN IS WHAT THIS TEST IS FOR. A document that has never been
+// projected has no row in file_projections at all; an inner join would find
+// every mildly-stale document and miss precisely the ones with no searchable
+// text whatsoever.
+func TestStaleProjectionSweepFindsTheNeverProjected(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	wsID := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+
+	// Never projected: 300 updates, no projection row.
+	never := h.newDocument(t, admin, wsID, fmt.Sprintf("never-%d", time.Now().UnixNano()))
+	if never.CollabDocumentID == nil {
+		t.Fatal("the document has no collaborative document")
+	}
+	h.setHeadSeq(t, *never.CollabDocumentID, 300)
+
+	// Projected, but far behind.
+	behind := h.newDocument(t, admin, wsID, fmt.Sprintf("behind-%d", time.Now().UnixNano()))
+	if behind.CollabDocumentID == nil {
+		t.Fatal("the document has no collaborative document")
+	}
+	h.appendUpdate(t, *behind.CollabDocumentID, me, []byte{1})
+	if code, _ := h.project(t, admin, behind.ID, map[string]any{
+		"seq": 1, "schema_version": 1, "body_text": "hello",
+	}); code != http.StatusOK {
+		t.Fatalf("seed projection: %d", code)
+	}
+	h.setHeadSeq(t, *behind.CollabDocumentID, 500)
+
+	// Caught up. Must NOT be swept.
+	fresh := h.newDocument(t, admin, wsID, fmt.Sprintf("fresh-%d", time.Now().UnixNano()))
+	if fresh.CollabDocumentID == nil {
+		t.Fatal("the document has no collaborative document")
+	}
+	h.appendUpdate(t, *fresh.CollabDocumentID, me, []byte{1})
+	if code, _ := h.project(t, admin, fresh.ID, map[string]any{
+		"seq": 1, "schema_version": 1, "body_text": "current",
+	}); code != http.StatusOK {
+		t.Fatalf("seed fresh projection: %d", code)
+	}
+	h.setHeadSeq(t, *fresh.CollabDocumentID, 1)
+
+	// Mid-edit: a big gap, but touched a moment ago. Must NOT be swept — the
+	// debounce two seconds away was about to do this work anyway.
+	live := h.newDocument(t, admin, wsID, fmt.Sprintf("live-%d", time.Now().UnixNano()))
+	if live.CollabDocumentID == nil {
+		t.Fatal("the document has no collaborative document")
+	}
+	if _, err := h.app.DB.Exec(ctx,
+		`UPDATE collab_documents SET head_seq = 900, updated_at = NOW() WHERE id = $1`,
+		*live.CollabDocumentID); err != nil {
+		t.Fatalf("age live document: %v", err)
+	}
+
+	stale, err := collab.FindStaleProjections(ctx, h.app.DB, 200, 30*time.Minute, 100)
+	if err != nil {
+		t.Fatalf("find stale projections: %v", err)
+	}
+	found := map[string]int64{}
+	for _, s := range stale {
+		found[s.DocumentID] = s.Gap()
+	}
+
+	if gap, ok := found[*never.CollabDocumentID]; !ok {
+		t.Error("a document that was never projected was not swept — the join lost it")
+	} else if gap != 300 {
+		t.Errorf("never-projected gap = %d, want 300", gap)
+	}
+	if gap, ok := found[*behind.CollabDocumentID]; !ok {
+		t.Error("a document 499 behind its log was not swept")
+	} else if gap != 499 {
+		t.Errorf("behind gap = %d, want 499", gap)
+	}
+	if _, ok := found[*fresh.CollabDocumentID]; ok {
+		t.Error("a caught-up document was swept; the sweep would ask rooms for work already done")
+	}
+	if _, ok := found[*live.CollabDocumentID]; ok {
+		t.Error("a document being edited right now was swept; the age filter did not hold")
+	}
+}
+
+// setHeadSeq advances the log head and ages the row past the sweep's minimum,
+// which is what a document edited and then abandoned looks like.
+func (h *harness) setHeadSeq(t *testing.T, documentID string, head int64) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := h.app.DB.Exec(ctx,
+		`UPDATE collab_documents
+		    SET head_seq = $2, updated_at = NOW() - INTERVAL '2 hours'
+		  WHERE id = $1`, documentID, head); err != nil {
+		t.Fatalf("set head seq: %v", err)
 	}
 }

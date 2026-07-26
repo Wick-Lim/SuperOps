@@ -73,6 +73,11 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
         setStatus(s)
         setDetail(d ?? null)
       },
+      // The server asking for a projection it cannot produce itself. Routed
+      // through the same `behind` flag as the gap on open, so one code path
+      // answers both — and so it waits for `synced` rather than projecting an
+      // empty document that has not received its state yet.
+      onProjectRequest: () => setProjectNonce((n) => n + 1),
     })
     providerRef.current = provider
     return () => {
@@ -85,13 +90,30 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   // descriptor rather than guessed. A projection above the head is refused —
   // correctly, since it would be a client describing content the log does not
   // have.
+  //
+  // THE GAP IS ALSO THE BACKSTOP, and reading it without acting on it was the
+  // whole of what the design called one. A document edited and closed while its
+  // browser was killed — no unmount, so no flush — is unsearchable until
+  // somebody opens it, and the server cannot produce content on its own. So
+  // opening it re-projects when it is behind. `behind` is state rather than a
+  // ref because the projection cannot run until the CRDT has actually loaded.
+  //
+  // A COUNTER, not a flag. The worker re-asks every ten minutes, and a boolean
+  // that had already been consumed would swallow every request after the first
+  // — so a document that failed to repair once would never be asked again.
+  const [projectNonce, setProjectNonce] = useState(0)
   useEffect(() => {
     if (!fileId) return
     let cancelled = false
     void driveApi
       .open(fileId)
       .then((res) => {
-        if (!cancelled) setSeq(res.data?.projection?.head_seq ?? 0)
+        if (cancelled) return
+        const p = res.data?.projection
+        setSeq(p?.head_seq ?? 0)
+        // Strictly behind. Equal means somebody already projected this exact
+        // state, and re-sending it would be a write the server discards.
+        if (p && p.head_seq > p.projection_seq) setProjectNonce((n) => n + 1)
       })
       .catch(() => {
         /* the gap is an optimisation; the document still opens */
@@ -157,6 +179,27 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
     if (!fileId || fileType === 'document') return
     publish(fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq))
   }
+  // Catch up once the document is loaded and writable.
+  //
+  // Gated on `synced` rather than firing on open: projecting an empty Y.Doc
+  // that has not received its state yet would write an EMPTY body over a good
+  // one, and the server's monotonic guard would not stop it — the seq is the
+  // log head either way. Read-only callers do not project at all; they have no
+  // capability for it and the server would refuse.
+  const caughtUp = useRef(0)
+  useEffect(() => {
+    if (projectNonce === 0 || caughtUp.current === projectNonce) return
+    if (status !== 'synced' || !fileId) return
+    caughtUp.current = projectNonce
+    const timer = setTimeout(() => {
+      if (fileType === 'spreadsheet') publish(extractSheet(sheet, seq))
+      else if (fileType === 'design') publish(extractDesign(design, seq))
+      // The block editor projects through its own settle path, which its
+      // mount already schedules; projecting from here as well would race it.
+    }, 1500)
+    return () => clearTimeout(timer)
+  }, [projectNonce, status, fileId, fileType, sheet, design, seq, publish])
+
   useEffect(() => () => {
     if (projectTimer.current) {
       clearTimeout(projectTimer.current)
