@@ -44,6 +44,8 @@ import (
 type fileEvent struct {
 	id        string
 	createdAt string
+	fileType  string
+	channelID string
 }
 
 type fileEvents struct {
@@ -84,11 +86,16 @@ func watchFileEvents(t *testing.T, workspaceID string) *fileEvents {
 			Data struct {
 				ID        string `json:"id"`
 				CreatedAt string `json:"created_at"`
+				FileType  string `json:"file_type"`
+				ChannelID string `json:"channel_id"`
 			} `json:"data"`
 		}
 		if json.Unmarshal(m.Data(), &env) == nil {
 			select {
-			case fe.msgs <- fileEvent{id: env.Data.ID, createdAt: env.Data.CreatedAt}:
+			case fe.msgs <- fileEvent{
+				id: env.Data.ID, createdAt: env.Data.CreatedAt,
+				fileType: env.Data.FileType, channelID: env.Data.ChannelID,
+			}:
 			default:
 			}
 		}
@@ -100,6 +107,25 @@ func watchFileEvents(t *testing.T, workspaceID string) *fileEvents {
 	fe.stop = func() { cc.Stop(); cancel() }
 	t.Cleanup(fe.stop)
 	return fe
+}
+
+// waitFor returns the first event for fileID that satisfies match.
+//
+// Needed because several events for one file can be in flight at once — a
+// document's creation and the re-index published when a message claims it — and
+// "the last one to arrive" is not a stable way to name either.
+func (fe *fileEvents) waitFor(fileID string, match func(fileEvent) bool, d time.Duration) (fileEvent, bool) {
+	deadline := time.After(d)
+	for {
+		select {
+		case ev := <-fe.msgs:
+			if ev.id == fileID && match(ev) {
+				return ev, true
+			}
+		case <-deadline:
+			return fileEvent{}, false
+		}
+	}
 }
 
 // countFor returns how many events named fileID, waiting up to d.
@@ -432,5 +458,47 @@ func TestAnUploadedAttachmentIsIndexedWithItsRowTimestamp(t *testing.T) {
 			"attachment sorts differently from the same file after a rebuild, "+
 			"because cmd/reindex reads the column",
 			published.UTC(), rowCreated.UTC())
+	}
+}
+
+// A DRIVE OBJECT ATTACHED TO A MESSAGE MUST NOT GET A SECOND INDEX DOCUMENT.
+//
+// The re-index published when a message claims its attachments hardcoded
+// file_type "file". The indexer derives its document id from that — "<type>_
+// <uuid>" — so a Drive document already indexed as document_<id> got a second
+// document written at file_<id>, and search returned the same file twice. The
+// twin sweep only removes the untyped copy when a TYPED event arrives, never
+// the other way round, so nothing cleared it: not the next attach, not
+// cmd/reindex.
+func TestAttachingADriveDocumentDoesNotDuplicateItInTheIndex(t *testing.T) {
+	h := getHarness(t)
+	h.requireSearch(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+
+	doc := h.newDocument(t, admin, ws, fmt.Sprintf("attachdup-%d", time.Now().UnixNano()))
+	watch := watchFileEvents(t, ws)
+
+	channel := h.createTypedChannel(t, admin, ws, uniqueSlug("attachdup"), "public")
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/channels/"+channel+"/messages", admin,
+		map[string]any{"content": "see this", "file_ids": []string{doc.ID}})
+
+	// THE ATTACH EVENT SPECIFICALLY, identified by the channel it names — the
+	// document's own creation event may still be in flight and would otherwise
+	// be mistaken for it. The first version of this test read "the last event to
+	// arrive" and passed with file_type hardcoded back to "file".
+	ev, ok := watch.waitFor(doc.ID, func(e fileEvent) bool { return e.channelID == channel },
+		8*time.Second)
+	if !ok {
+		t.Fatal("no attach event named the channel; the re-index never happened")
+	}
+
+	// The type on the wire decides the document id. "file" for a document is
+	// the duplicate.
+	if ev.fileType != "document" {
+		t.Fatalf("the attach event carried file_type=%q for a document — the indexer "+
+			"writes file_%s beside document_%s and search returns it twice",
+			ev.fileType, doc.ID, doc.ID)
 	}
 }

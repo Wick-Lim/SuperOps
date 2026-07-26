@@ -405,7 +405,12 @@ func (h *Handler) respondWithMessage(w http.ResponseWriter, r *http.Request, sta
 					Name:      f.Name,
 					UserID:    msg.UserID,
 					ChannelID: msg.ChannelID,
-					FileType:  "file",
+					// THE REAL KIND. Hardcoding "file" made the indexer derive
+					// file_<id> for a Drive document whose own document is
+					// document_<id>, so search returned it twice and nothing
+					// removed the duplicate — the twin sweep only clears the
+					// untyped copy.
+					FileType:  f.FileType,
 					CreatedAt: msg.CreatedAt.UTC().Format(time.RFC3339Nano),
 				})
 		}

@@ -1465,6 +1465,35 @@ func publishPromoted(
 	); err != nil {
 		l.Error("scheduled: publish message", "message_id", p.id, "error", err)
 	}
+
+	// AND ITS ATTACHMENTS, which nothing re-indexed.
+	//
+	// CreateScheduled already called linkFiles, so the file's message_id is set
+	// and its ACL has been re-materialized onto the channel — but the send path
+	// hands respondWithMessage an empty workspace id (nothing is broadcast for a
+	// message that has not been sent yet), so the re-index loop there never
+	// ran, and this function only ever emitted message.created. The attachment
+	// kept its upload-time index state: readable by its uploader alone, with no
+	// channel, so nobody in the channel could find it and `?channel=` never
+	// matched. An audit found it by scheduling a message and watching zero file
+	// events cross the wire.
+	for _, f := range msg.Files {
+		if err := nc.PublishDurable(pubCtx,
+			"superops."+workspaceID+".file.updated",
+			"file.updated:"+f.ID+":"+msg.ID,
+			natspkg.Event{Type: "file.updated", Data: map[string]any{
+				"id":         f.ID,
+				"channel_id": msg.ChannelID,
+				"file_type":  f.FileType,
+				"user_id":    msg.UserID,
+				"name":       f.Name,
+				"created_at": msg.CreatedAt.UTC().Format(time.RFC3339Nano),
+			}},
+		); err != nil {
+			l.Error("scheduled: publish attachment re-index",
+				"message_id", p.id, "file_id", f.ID, "error", err)
+		}
+	}
 }
 
 // --- retention ----------------------------------------------------------------

@@ -192,12 +192,25 @@ func (r *Repository) AttachToOutbound(ctx context.Context, messageID, actorID st
 		return fmt.Errorf("mailbox: at most %d attachments per message", maxAttachmentsPerMessage)
 	}
 
+	// SHARE, NOT READ — and this is the whole security story of the route.
+	//
+	// Attaching RE-PARENTS the file: 055 hangs a file with mail_message_id off
+	// its conversation, and internal/authz now follows that on the DECISION
+	// path too. So setting the column hands every grantee of the mailbox the
+	// ability to download the file. That is a share, and "you cannot give away
+	// more than you hold" is the rule the sharing route already enforces.
+	//
+	// It used to require CapRead, and read is not share: a channel member holds
+	// CapWrite on a file posted in that channel, which /drive/file/{id}/shares
+	// correctly refuses to let them share. An audit demonstrated the escalation
+	// end to end — a private-channel file reaching somebody outside the channel
+	// through a reply — so this route now asks the same question that one does.
 	for _, id := range fileIDs {
 		got, err := r.authz.Capability(ctx, authz.UserSubject(actorID), authz.FileObject(id))
 		if err != nil {
 			return fmt.Errorf("authorize attachment %s: %w", id, err)
 		}
-		if !got.Implies(authz.CapRead) {
+		if !got.Implies(authz.CapShare) {
 			// 404-shaped: naming the file would confirm one exists at that id.
 			return ErrNotFound
 		}
@@ -224,8 +237,22 @@ func (r *Repository) AttachToOutbound(ctx context.Context, messageID, actorID st
 	// from before the UPDATE — so counting the end state here returns zero on a
 	// first attach. The count has to be "what this statement linked" plus "what
 	// was already linked", and UNION deduplicates the overlap.
+	// IN A TRANSACTION, because the count check below is a REFUSAL and a refusal
+	// that has already written is not one. On the pool this statement committed
+	// the rows it did link before ErrNotFound was returned, so a reply the API
+	// reported as failed still moved files onto the conversation — and, through
+	// the re-parenting above, still widened who could read them. Demonstrated by
+	// an audit: a refused batch left its first file linked and downloadable by
+	// a mailbox grantee.
+	//
+	// The ACL is materialized in the SAME commit, for the reason storeAttachments
+	// already does it: leaving it to the hourly drift job means an attachment
+	// whose stored path still says "the uploader alone" is invisible to every
+	// acl_key-driven listing — search, backlinks — while being downloadable. The
+	// two authorities must not disagree, in either direction.
 	var attached int
-	err := r.pool.QueryRow(ctx, `
+	err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
 		WITH linked AS (
 			UPDATE files f
 			   SET mail_message_id = $2
@@ -241,16 +268,26 @@ func (r *Repository) AttachToOutbound(ctx context.Context, messageID, actorID st
 		)
 		SELECT count(*) FROM (
 			SELECT id FROM linked UNION SELECT id FROM already
-		) AS attached`, fileIDs, messageID).Scan(&attached)
+		) AS attached`, fileIDs, messageID).Scan(&attached); err != nil {
+			return fmt.Errorf("attach files to message: %w", err)
+		}
+		if attached != len(dedupeIDs(fileIDs)) {
+			// 404-shaped and all-or-nothing: a partially attached reply is one
+			// whose author believes they sent something they did not. The usual
+			// cause is a file in another tenant — authorization passes for
+			// somebody who belongs to both, and the tenancy predicate above is
+			// what refuses it. Returning here rolls the link back.
+			return ErrNotFound
+		}
+		for _, id := range dedupeIDs(fileIDs) {
+			if err := authz.MaterializeTx(ctx, tx, authz.FileObject(id)); err != nil {
+				return fmt.Errorf("materialize attached file ACL: %w", err)
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("attach files to message: %w", err)
-	}
-	if attached != len(dedupeIDs(fileIDs)) {
-		// 404-shaped and all-or-nothing: a partially attached reply is one whose
-		// author believes they sent something they did not. The usual cause is
-		// a file in another tenant — authorization passes for somebody who
-		// belongs to both, and the tenancy predicate above is what refuses it.
-		return ErrNotFound
+		return err
 	}
 	return nil
 }

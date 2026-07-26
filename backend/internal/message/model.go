@@ -50,6 +50,16 @@ type FileRef struct {
 	Name        string `json:"name"`
 	ContentType string `json:"content_type"`
 	SizeBytes   int64  `json:"size_bytes"`
+
+	// FileType is the EDITOR KIND — "file" for an ordinary upload, "document",
+	// "spreadsheet" or "design" for a Drive object somebody attached.
+	//
+	// It is here because the search index derives a document id from it, and the
+	// re-index published when a message claims its attachments used to hardcode
+	// "file". A Drive document attached to a message then got a SECOND index
+	// document written beside its own, and search returned the same file twice —
+	// the twin sweep only removes the untyped copy, never the other way round.
+	FileType string `json:"file_type"`
 }
 
 type Reaction struct {

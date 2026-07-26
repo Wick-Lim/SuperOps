@@ -251,6 +251,16 @@ const fileSQL = `
 	  LEFT JOIN messages m ON m.id = f.message_id
 	  LEFT JOIN file_projections p ON p.file_id = f.id
 	 WHERE ($1::uuid IS NULL OR f.workspace_id = $1::uuid)
+	   -- TRASHED FILES ARE NOT SEARCHABLE, and this rebuild is the documented
+	   -- recovery path — so without the predicate it UNDOES the unindexing that
+	   -- trashing does, and every document anybody ever threw away comes back
+	   -- into search the first time an operator runs it. There were 54 such
+	   -- rows in a development database of 1039.
+	   --
+	   -- Removal is still the delete arm's job; this is only about what a full
+	   -- rebuild writes. A trashed file that is somehow still in the index stays
+	   -- there until it is purged, which publishes file.deleted.
+	   AND f.trashed_at IS NULL
 	   AND (f.created_at, f.id) > ($2::timestamptz, $3::uuid)
 	 ORDER BY f.created_at, f.id
 	 LIMIT $4`

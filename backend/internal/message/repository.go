@@ -644,7 +644,8 @@ func (r *Repository) hydrateFiles(ctx context.Context, messages []*Message) erro
 	}
 
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, message_id, name, content_type, size_bytes FROM files WHERE message_id = ANY($1)`, ids)
+		`SELECT id, message_id, name, content_type, size_bytes, file_type
+		   FROM files WHERE message_id = ANY($1)`, ids)
 	if err != nil {
 		return fmt.Errorf("hydrate files: %w", err)
 	}
@@ -653,7 +654,8 @@ func (r *Repository) hydrateFiles(ctx context.Context, messages []*Message) erro
 	var found []attachedFile
 	for rows.Next() {
 		af := attachedFile{Ref: &FileRef{}}
-		if err := rows.Scan(&af.Ref.ID, &af.MessageID, &af.Ref.Name, &af.Ref.ContentType, &af.Ref.SizeBytes); err != nil {
+		if err := rows.Scan(&af.Ref.ID, &af.MessageID, &af.Ref.Name, &af.Ref.ContentType,
+			&af.Ref.SizeBytes, &af.Ref.FileType); err != nil {
 			return fmt.Errorf("scan file: %w", err)
 		}
 		found = append(found, af)

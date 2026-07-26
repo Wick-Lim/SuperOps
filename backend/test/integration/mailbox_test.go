@@ -1422,3 +1422,111 @@ func TestAttachingIsIdempotentAndDuplicateSafe(t *testing.T) {
 		}
 	}
 }
+
+// ATTACHING IS SHARING, AND A REFUSED ATTACH MUST NOT WRITE.
+//
+// Two holes an audit demonstrated end to end, both created by making the
+// DECISION path follow a file's mail conversation:
+//
+//  1. Attaching RE-PARENTS the file, so setting mail_message_id hands every
+//     grantee of the mailbox the ability to download it. The route asked for
+//     CapRead. Read is not share — a channel member holds write on a file posted
+//     in that channel, and /drive/file/{id}/shares correctly refuses to let them
+//     share it. The reply route did not.
+//
+//  2. The link ran on the pool, so the count check — which is a REFUSAL — came
+//     after the write had already committed. A batch the API reported as 404
+//     still moved its earlier files onto the conversation, and through (1) still
+//     widened who could read them.
+func TestAttachingARepliesFileRequiresShareAndIsAllOrNothing(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := mailRepo(t)
+	ctx := context.Background()
+
+	mb := newMailbox(t, ws, me)
+	in := inbound(mb, fmt.Sprintf("share-%d", time.Now().UnixNano()))
+	in.WorkspaceID = ws
+	_, msg, err := repo.Ingest(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An agent who may write the mailbox but only READ a file.
+	agent := h.newUser(t, admin, ws, "attach-agent")
+	if err := h.app.Authz.Grant(ctx, authz.UserSubject(me), authz.UserSubject(agent.id),
+		authz.ObjectRef{Type: "mailbox", ID: mb.ID}, authz.CapWrite); err != nil {
+		t.Fatal(err)
+	}
+	readable := h.upload(t, admin, ws, fmt.Sprintf("readable-%d.txt", time.Now().UnixNano()))
+	if readable == "" {
+		t.Skip("file storage is not wired")
+	}
+	if err := h.app.Authz.Grant(ctx, authz.UserSubject(me), authz.UserSubject(agent.id),
+		authz.FileObject(readable), authz.CapRead); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := h.app.Authz.Capability(ctx, authz.UserSubject(agent.id), authz.FileObject(readable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Implies(authz.CapRead) || got.Implies(authz.CapShare) {
+		t.Fatalf("the agent holds %q; this test needs read-but-not-share", got)
+	}
+
+	// 1. Read alone must not be enough to attach.
+	if err := repo.AttachToOutbound(ctx, msg.ID, agent.id, []string{readable}); err == nil {
+		t.Fatal("a caller with read but not share attached a file, which hands every " +
+			"mailbox grantee the ability to download it")
+	}
+
+	// 2. A refused batch must leave nothing behind.
+	owned := h.upload(t, admin, ws, fmt.Sprintf("owned-%d.txt", time.Now().UnixNano()))
+	spent := h.upload(t, admin, ws, fmt.Sprintf("spent-%d.txt", time.Now().UnixNano()))
+	if owned == "" || spent == "" {
+		t.Skip("file storage is not wired")
+	}
+	// `spent` is already attached elsewhere, so the batch must fail.
+	other := inbound(mb, fmt.Sprintf("share2-%d", time.Now().UnixNano()))
+	other.WorkspaceID = ws
+	_, msg2, err := repo.Ingest(ctx, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AttachToOutbound(ctx, msg2.ID, me, []string{spent}); err != nil {
+		t.Fatalf("seeding the spent attachment: %v", err)
+	}
+
+	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{owned, spent}); err == nil {
+		t.Fatal("a batch containing an already-attached file succeeded")
+	}
+	var linked *string
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT mail_message_id::text FROM files WHERE id = $1`, owned).Scan(&linked); err != nil {
+		t.Fatal(err)
+	}
+	if linked != nil {
+		t.Fatalf("a REFUSED attach still linked %s to message %v — the refusal came "+
+			"after the write, so the API reported a failure that had already happened",
+			owned, *linked)
+	}
+
+	// 3. And a successful attach materializes in the same commit, so the two
+	//    authorities do not disagree until the hourly drift job runs.
+	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{owned}); err != nil {
+		t.Fatalf("the owner attaching their own file: %v", err)
+	}
+	var storedPath string
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT path FROM acl_object WHERE object_type = 'file' AND object_id = $1`,
+		owned).Scan(&storedPath); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(storedPath, "conversation:") {
+		t.Fatalf("acl_object.path = %q after attaching; the listing path still says "+
+			"'the uploader alone' while the decision path says otherwise", storedPath)
+	}
+}

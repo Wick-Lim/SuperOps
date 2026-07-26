@@ -221,3 +221,27 @@ func TestSourceSQLSharesTheSameParameters(t *testing.T) {
 		}
 	}
 }
+
+// A REBUILD MUST NOT RESURRECT WHAT WAS THROWN AWAY.
+//
+// Trashing a file unindexes it, and this rebuild is the documented recovery
+// path for an index that has drifted — so a query with no `trashed_at`
+// predicate UNDOES that, and every document anybody ever threw away comes back
+// into search the first time an operator runs it. A development database had 58
+// such rows out of 1206.
+//
+// Checked as a property of the SQL rather than against a live database, because
+// the defect is the absence of a clause: a database that happens to hold no
+// trashed rows would make a behavioural test pass while the clause was missing.
+func TestTheFileRebuildExcludesTrashedRows(t *testing.T) {
+	if !strings.Contains(fileSQL, "trashed_at IS NULL") {
+		t.Error("fileSQL has no trashed_at predicate: a full rebuild will restore " +
+			"every trashed file to the search index")
+	}
+	// The message rebuild has no equivalent — messages are hard-deleted, and a
+	// soft-delete predicate there would be describing a column that does not
+	// exist. Asserted so this test does not quietly become a copy-paste rule.
+	if strings.Contains(messageSQL, "trashed_at") {
+		t.Error("messageSQL references trashed_at; messages have no trash")
+	}
+}
