@@ -396,3 +396,29 @@ func (h *Handler) PutProjection(w http.ResponseWriter, r *http.Request) {
 		"status":  status,
 	})
 }
+
+// ChannelForFile resolves the channel a file hangs off, through the message it
+// is attached to. Empty when it is not a chat attachment, which is every Drive
+// file.
+//
+// It sits beside BodyForFile because they are the same kind of thing: a fact
+// the index needs that belongs to the database rather than to an event. See
+// search.ChannelSource for why the indexer reads it instead of trusting the
+// publisher to have carried it.
+func (r *Repository) ChannelForFile(ctx context.Context, fileID string) (string, error) {
+	var channelID string
+	err := r.pool.QueryRow(ctx, `
+		SELECT COALESCE(m.channel_id::text, '')
+		  FROM files f
+		  LEFT JOIN messages m ON m.id = f.message_id
+		 WHERE f.id = $1`, fileID).Scan(&channelID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Already purged. Not an error: the delete arm does not reach here, and
+		// an index write for a row that is gone is one the next event corrects.
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve channel for file: %w", err)
+	}
+	return channelID, nil
+}

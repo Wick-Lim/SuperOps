@@ -26,6 +26,13 @@ const (
 	evtMessageDeleted  = "message.deleted"
 	evtReactionAdded   = "reaction.added"
 	evtReactionRemoved = "reaction.removed"
+
+	// The search index's vocabulary, not the realtime one. Posting a message
+	// re-indexes its attachments — see respondWithMessage — and internal/drive
+	// owns this event type; it is restated here for the same reason the others
+	// are, to avoid an import cycle. The subject is superops.<ws>.file.updated,
+	// which is what cmd/worker's file-indexer binds to.
+	evtFileUpdated = "file.updated"
 )
 
 // contentTypeMarkdown is the only content_type a client may post. 'system' and
@@ -114,6 +121,19 @@ func (h *Handler) publish(ctx context.Context, workspaceID, eventType, dedupeID 
 	if err := h.nats.PublishDurable(ctx, subject, dedupeID, natspkg.Event{Type: eventType, Data: data}); err != nil {
 		h.log.Error("publish message event", "subject", subject, "event", eventType, "error", err)
 	}
+}
+
+// fileAttachedEvent matches the shape internal/search decodes for a file event.
+// It is stated here rather than imported so this package does not depend on the
+// indexer; the subject and the field names are the contract, as everywhere else
+// in the product.
+type fileAttachedEvent struct {
+	ID        string `json:"id"`
+	ChannelID string `json:"channel_id"`
+	FileType  string `json:"file_type"`
+	UserID    string `json:"user_id"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
 }
 
 // eventKey identifies one logical event for JetStream's duplicate window, so a
@@ -368,6 +388,27 @@ func (h *Handler) respondWithMessage(w http.ResponseWriter, r *http.Request, sta
 
 	if publishWorkspaceID != "" {
 		h.publish(r.Context(), publishWorkspaceID, evtMessageNew, eventKey(evtMessageNew, msg.ID), msg)
+		// RE-INDEX THE ATTACHMENTS, because attaching a file changes two facts
+		// the index holds about it and neither is visible from the upload event.
+		//
+		// A chat attachment is uploaded BEFORE it is posted, so at upload time
+		// it has no channel and its key set is "the uploader alone". Claiming it
+		// relocates it: acl_object_expected hangs an attached file off its
+		// message's channel, so its readers become everyone who may read the
+		// channel. linkFiles re-materializes the ACL in the same transaction —
+		// and nothing told the index, so the file stayed searchable by its
+		// uploader alone and `?channel=` never matched it.
+		for _, f := range msg.Files {
+			h.publish(r.Context(), publishWorkspaceID, evtFileUpdated,
+				eventKey(evtFileUpdated, f.ID, msg.ID), fileAttachedEvent{
+					ID:        f.ID,
+					Name:      f.Name,
+					UserID:    msg.UserID,
+					ChannelID: msg.ChannelID,
+					FileType:  "file",
+					CreatedAt: msg.CreatedAt.UTC().Format(time.RFC3339Nano),
+				})
+		}
 	}
 	httputil.JSON(w, status, msg)
 }

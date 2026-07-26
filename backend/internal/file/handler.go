@@ -46,10 +46,12 @@ type Handler struct {
 	pool    *pgxpool.Pool
 	authz   *authz.Checker
 	audit   Auditor
+	events  Events
 }
 
-func NewHandler(storage storage.Backend, pool *pgxpool.Pool, az *authz.Checker, auditor Auditor) *Handler {
-	return &Handler{storage: storage, pool: pool, authz: az, audit: auditor}
+func NewHandler(storage storage.Backend, pool *pgxpool.Pool, az *authz.Checker,
+	auditor Auditor, events Events) *Handler {
+	return &Handler{storage: storage, pool: pool, authz: az, audit: auditor, events: events}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -168,6 +170,13 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
+
+	// Index it. Post-commit and best effort, like every other publish in the
+	// product: the row is the truth and the index is derived.
+	h.publish(ctx, ChatFileEvent{
+		ID: fileID, WorkspaceID: workspaceID, UserID: userID,
+		Name: name, CreatedAt: time.Now().UTC(),
+	})
 
 	httputil.JSON(w, http.StatusCreated, map[string]interface{}{
 		"id":           fileID,
@@ -358,6 +367,14 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "file not found")
 		return
 	}
+
+	// Unindex. This is the only moment the id still exists — the row is gone
+	// and cmd/reindex has no prune pass, so without it the deleted attachment
+	// answers searches for its own name forever.
+	h.publish(ctx, ChatFileEvent{
+		ID: fileID, WorkspaceID: f.WorkspaceID, UserID: f.UserID,
+		Name: f.Name, CreatedAt: f.CreatedAt, Deleted: true,
+	})
 
 	httputil.JSON(w, http.StatusOK, map[string]string{"message": "file deleted"})
 }

@@ -75,17 +75,44 @@ type BodySource interface {
 	BodyForFile(ctx context.Context, fileID string) (string, error)
 }
 
+// ChannelSource reads the channel a file hangs off, through the message it is
+// attached to.
+//
+// SAME REASON AGAIN, and this one was a live defect. `?channel=` returned no
+// files, ever: the fact lives in files.message_id -> messages.channel_id, only
+// the chat-attachment path knows it, and that path did not set it on the event.
+// cmd/reindex read it from the database and the live indexer did not, so the
+// same file's channel scoping depended on which of the two had last touched it.
+//
+// Reading it here fixes it once, for every publisher, present and future — the
+// alternative was teaching each one a join it has no other reason to know.
+//
+// nil is allowed and leaves channel_id empty, which is the narrow end: the
+// file is still findable, just not by channel.
+type ChannelSource interface {
+	ChannelForFile(ctx context.Context, fileID string) (string, error)
+}
+
 type Indexer struct {
 	service *Service
 	// acl reads the materialized keys for an object. Optional; see ACLSource.
 	acl ACLSource
 	// bodies reads the client-published projection. Optional; see BodySource.
 	bodies BodySource
-	logger *slog.Logger
+	// channels resolves a chat attachment's channel. Optional; see ChannelSource.
+	channels ChannelSource
+	logger   *slog.Logger
 }
 
 func NewIndexer(service *Service, acl ACLSource, bodies BodySource, logger *slog.Logger) *Indexer {
-	return &Indexer{service: service, acl: acl, bodies: bodies, logger: logger}
+	idx := &Indexer{service: service, acl: acl, bodies: bodies, logger: logger}
+	// A BodySource that can also answer the channel question answers it. One
+	// constructor rather than two, so no caller can be updated for the body and
+	// silently miss the channel.
+	if cs, ok := bodies.(ChannelSource); ok {
+		idx.channels = cs
+	}
+	return idx
 }
 
 // HandleMessage indexes — or unindexes — the message an event describes.
@@ -202,6 +229,18 @@ func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
 	createdAt, err := eventTime(event.CreatedAt, "file "+event.ID)
 	if err != nil {
 		return err
+	}
+
+	// The channel, when the event did not carry one. An attachment is uploaded
+	// BEFORE it is posted, so at upload time it genuinely has none — the event
+	// is republished when the message claims it, and this read is what makes
+	// both events agree with cmd/reindex.
+	if event.ChannelID == "" && idx.channels != nil {
+		ch, err := idx.channels.ChannelForFile(ctx, event.ID)
+		if err != nil {
+			return fmt.Errorf("resolve channel for file %s: %w", event.ID, err)
+		}
+		event.ChannelID = ch
 	}
 
 	// The materialized keys, not a second derivation of them. A failure here is

@@ -265,3 +265,77 @@ func TestTheTrashLifecycleReachesTheIndex(t *testing.T) {
 		t.Fatalf("the purge left %d rows; this test is not exercising a purge", alive)
 	}
 }
+
+// A CHAT ATTACHMENT IS SEARCHABLE, AND SEARCHABLE IN ITS CHANNEL.
+//
+// POST /api/v1/files/upload — the route the client actually calls for a chat
+// attachment — published nothing at all. A file posted into a conversation was
+// findable only after an operator ran cmd/reindex by hand, and a deleted one
+// became an index orphan no operation could remove.
+//
+// `?channel=` was the same defect seen from the other side. channel_id reaches
+// the index from files.message_id -> messages.channel_id, which only this path
+// knows, so a live-indexed attachment carried an empty channel while a rebuilt
+// one carried the real value. The filter matched nothing, ever.
+func TestAChatAttachmentIsIndexedAndScopedToItsChannel(t *testing.T) {
+	h := getHarness(t)
+	h.requireSearch(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+
+	watch := watchFileEvents(t, ws)
+	name := fmt.Sprintf("ledger-%d.txt", time.Now().UnixNano())
+	fileID := h.upload(t, admin, ws, name)
+	if fileID == "" {
+		t.Fatal("file storage is not wired; this test cannot verify anything")
+	}
+
+	// 1. Uploading publishes at all — it did not before.
+	if got := watch.countFor(fileID, 6*time.Second); got != 1 {
+		t.Fatalf("uploading a chat attachment produced %d events, want 1 — the file is "+
+			"unsearchable until somebody runs cmd/reindex", got)
+	}
+
+	// 2. Posting it re-indexes, because attaching relocates the file: its
+	//    readers become the channel's and it finally has a channel_id.
+	channel := h.createTypedChannel(t, admin, ws, uniqueSlug("attach"), "public")
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/channels/"+channel+"/messages", admin,
+		map[string]any{"content": "here it is", "file_ids": []string{fileID}})
+	if got := watch.countFor(fileID, 6*time.Second); got != 1 {
+		t.Fatalf("posting the attachment produced %d events, want 1 — the file stays "+
+			"searchable by its uploader alone and never matches ?channel=", got)
+	}
+
+	// 3. And the index agrees, through the real indexer.
+	h.indexDriveFile(t, ws, fileID)
+	inChannel := h.searchHitsInChannel(t, admin, ws, name, channel)
+	found := false
+	for _, id := range inChannel {
+		if id == fileID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("?channel= did not return the attachment posted into that channel: %v", inChannel)
+	}
+}
+
+// searchHitsInChannel narrows a search to one channel, which is the filter that
+// returned nothing for files.
+func (h *harness) searchHitsInChannel(t *testing.T, token, workspaceID, query, channelID string) []string {
+	t.Helper()
+	r := h.req(t, http.StatusOK, "GET",
+		"/api/v1/workspaces/"+workspaceID+"/search?q="+query+"&channel="+channelID, token, nil)
+	var res struct {
+		Hits []struct {
+			ID string `json:"id"`
+		} `json:"hits"`
+	}
+	decodeInto(t, r.Data, &res)
+	out := make([]string, 0, len(res.Hits))
+	for _, hit := range res.Hits {
+		out = append(out, hit.ID)
+	}
+	return out
+}

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	natspkg "github.com/Wick-Lim/SuperOps/backend/pkg/nats"
 )
 
@@ -128,6 +129,45 @@ func (p *Publisher) PublishFileDeletions(ctx context.Context, files []FileRef) {
 		p.publishFile(ctx, ActionDeleted, &File{
 			ID: f.ID, WorkspaceID: f.WorkspaceID, FileType: f.FileType,
 		}, rev)
+	}
+}
+
+// PublishChatFile emits an event for a CHAT attachment, whose route lives in
+// internal/file and had no publisher of its own.
+//
+// It is on this type because this is where the JetStream client is, and the
+// dependency only runs one way: internal/drive imports internal/file, so the
+// payload type is defined there and this satisfies file.Events.
+func (p *Publisher) PublishChatFile(ctx context.Context, e file.ChatFileEvent) {
+	if p == nil || e.ID == "" || e.WorkspaceID == "" {
+		return
+	}
+	action := ActionUploaded
+	revision := strconv.FormatInt(e.CreatedAt.UTC().UnixNano(), 10)
+	if e.Deleted {
+		action = ActionDeleted
+		// Terminal: the row is gone, so nothing can collide with it later.
+		revision = "delete"
+	}
+
+	subject := fmt.Sprintf("superops.%s.%s", e.WorkspaceID, action)
+	msgID := fmt.Sprintf("%s:%s:%s", action, e.ID, revision)
+
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), publishTimeout)
+	defer cancel()
+
+	if err := p.nats.PublishDurable(pubCtx, subject, msgID, natspkg.Event{
+		Type: action,
+		Data: fileEvent{
+			ID: e.ID, UserID: e.UserID, Name: e.Name,
+			ChannelID: e.ChannelID,
+			// A chat attachment is a plain file; it has no editor type.
+			FileType:  "file",
+			CreatedAt: e.CreatedAt.UTC().Format(time.RFC3339Nano),
+			IsDeleted: e.Deleted,
+		},
+	}); err != nil {
+		p.logger.Warn("publish chat file event", "id", e.ID, "action", action, "error", err)
 	}
 }
 

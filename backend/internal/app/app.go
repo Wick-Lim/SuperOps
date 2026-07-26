@@ -378,8 +378,13 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	workflowHandler := workflow.NewHandler(pool, az, auditService, logger)
 
 	driveRepo := drive.NewRepository(pool, az, driveKinds)
+	// ONE publisher, shared. The chat-attachment route lives in internal/file
+	// and had none at all, which is why a file posted into a conversation was
+	// unsearchable until somebody ran cmd/reindex and why `?channel=` returned
+	// nothing: channel_id reaches the index only from that path.
+	drivePublisher := drive.NewPublisher(natsClient, logger)
 	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService,
-		drive.NewPublisher(natsClient, logger))
+		drivePublisher)
 
 	// The comment surface. ONE per product: plan 02 §13 cut per-file comments
 	// so that Phase 2 could build this once and Drive adopt it, and a second
@@ -455,7 +460,13 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	presenceHandler := presence.NewHandler(presenceService, az, pool)
 	var fileHandler *file.Handler
 	if fileStorage != nil {
-		fileHandler = file.NewHandler(fileStorage, pool, az, auditService)
+		// drivePublisher is nil-safe and satisfies file.Events; a deployment
+		// without NATS gets a working no-op rather than a branch here.
+		var fileEvents file.Events
+		if drivePublisher != nil {
+			fileEvents = drivePublisher
+		}
+		fileHandler = file.NewHandler(fileStorage, pool, az, auditService, fileEvents)
 	}
 	// The inbox owns notifications for the whole product (docs/plans/README.md
 	// "Resolved conflicts" §1). The API only READS it — every write happens in
