@@ -45,8 +45,15 @@ func TestSinkConstructionFailuresAreBootFailures(t *testing.T) {
 				// MkdirAll creates the tree, so this one legitimately succeeds;
 				// keep it as a documented non-failure rather than deleting it,
 				// because "the directory is created for you" is the behaviour.
+				//
+				// NOT a t.Skip. This is the only conditional skip in the
+				// backend that is gated on the filesystem rather than on a
+				// service, so CI's "nothing skipped with every service running"
+				// gate would fail the job with the wrong diagnosis if it ever
+				// fired. Either outcome is acceptable HERE, so it is recorded
+				// rather than skipped.
 				if err != nil {
-					t.Skipf("environment refused the path: %v", err)
+					t.Logf("this environment refused the path (also acceptable): %v", err)
 				}
 				return
 			}

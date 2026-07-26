@@ -115,10 +115,23 @@ jobs:
         working-directory: backend
         run: |
           set -o pipefail
+          # A PROFILE THAT MEASURED NOTHING IS NOT A TOTAL. `go tool cover` on a
+          # zero-byte or mode-line-only profile prints "total: (statements) 0.0%"
+          # and exits 0 — so "the tool ran and produced a total" was satisfied by
+          # exactly the vacuity this step was rewritten to reject. There is still
+          # no THRESHOLD, deliberately: a number that must not fall is a number
+          # tests get written to move. But zero means the profile is broken, not
+          # that the code is untested.
+          lines=$(grep -c . coverage.out || true)
+          if [ "${lines:-0}" -lt 2 ]; then
+            echo "::error::coverage.out has $lines line(s) — the unit test step did not produce a profile"
+            exit 1
+          fi
           total=$(go tool cover -func=coverage.out | tail -1)
           case "$total" in
-            *total:*%*) ;;
-            *) echo "::error::coverage produced no total line: $total"; exit 1 ;;
+            *total:*0.0%) echo "::error::coverage is 0.0% — the profile measured nothing: $total"; exit 1 ;;
+            *total:*%*)   ;;
+            *)            echo "::error::coverage produced no total line: $total"; exit 1 ;;
           esac
           echo "$total" | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -137,11 +150,13 @@ jobs:
           go-version: '1.25'
           cache-dependency-path: backend/go.sum
       - name: Install govulncheck
-        # PINNED, for the same reason golangci-lint is: @latest silently changes
-        # the rule set between runs, so a green result stops being comparable to
-        # the previous green result and a new finding looks like a regression in
-        # this tree. Bump deliberately.
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+        # PINNED — but be clear about what that buys. The advisory DATABASE is
+        # fetched live from vuln.go.dev at run time, so findings still change
+        # between runs; a new advisory landing is a real signal, not a
+        # regression in this tree. What the pin stabilises is the ANALYSIS
+        # ENGINE: reachability results that shift because the scanner changed
+        # are indistinguishable from results that shifted because the code did.
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
       - name: Scan
         working-directory: backend
         run: govulncheck ./...
@@ -336,6 +351,10 @@ jobs:
         run: |
           set -o pipefail
           go test ./internal/... ./pkg/... -race -count=1 -v -timeout 20m | tee /tmp/infra-units.txt
+          # A missing or empty log is not a clean run: `grep -q` on a file that
+          # is not there exits 2, and `if` reads that as "no skips".
+          [ -s /tmp/infra-units.txt ] \
+            || { echo "::error::the infrastructure-backed unit run produced no output"; exit 1; }
           if grep -q -- '--- SKIP' /tmp/infra-units.txt; then
             echo "::error::a unit test skipped with every service running; it is gated on something it should not be"
             grep -- '--- SKIP' /tmp/infra-units.txt
@@ -350,6 +369,8 @@ jobs:
         # NATS, Meilisearch and MinIO, which is every dependency the harness
         # knows about, so the correct number is zero.
         run: |
+          [ -s /tmp/integration.txt ] \
+            || { echo "::error::the integration run produced no output"; exit 1; }
           if grep -q -- '--- SKIP' /tmp/integration.txt; then
             echo "::error::the integration suite skipped tests; every dependency is running, so a skip means a test is gated on something it should not be"
             grep -- '--- SKIP' /tmp/integration.txt
@@ -401,9 +422,16 @@ jobs:
           npx expo export --platform web --output-dir /tmp/bundle-web >/dev/null
           npx expo export --platform ios --output-dir /tmp/bundle-ios >/dev/null
 
-          web=$(ls /tmp/bundle-web/_expo/static/js/web/*.js | head -1)
+          # EVERY file, not `ls | head -1`.
+          #
+          # Both exports produce exactly one file today, so this is latent — and
+          # it goes live the moment code splitting or a second entry point is
+          # enabled, at which point a leak in the second chunk would be invisible
+          # while the step printed its success line.
+          cat /tmp/bundle-web/_expo/static/js/web/*.js > /tmp/web-bundle.js
+          web=/tmp/web-bundle.js
           # iOS ships Hermes bytecode; its string table still carries literals.
-          ios=$(ls /tmp/bundle-ios/_expo/static/js/ios/* | head -1)
+          strings /tmp/bundle-ios/_expo/static/js/ios/* > /tmp/ios-strings.txt
 
           # STRINGS ONCE, INTO A FILE. Never `strings "$ios" | grep -q`.
           #
@@ -417,7 +445,14 @@ jobs:
           # Reproduced: PIPESTATUS=141 0 on a 25 MB input with an early match.
           # Reading the table into a file removes the pipe, and it also runs
           # `strings` once instead of four times.
-          strings "$ios" > /tmp/ios-strings.txt
+          #
+          # A TABLE THAT IS NOT THERE IS NOT A CLEAN BUNDLE. `grep -q` on a
+          # missing file exits 2, and `if` reads that as "no match" — so every
+          # leak check would pass on a bundle that failed to export.
+          if [ ! -s /tmp/ios-strings.txt ]; then
+            echo "::error::the iOS bundle produced no string table; there is nothing to check"
+            exit 1
+          fi
 
           leak() {
             if grep -q${3:-} -- "$1" /tmp/ios-strings.txt; then
@@ -434,22 +469,27 @@ jobs:
           grep -qi 'livekit' "$web" \
             || { echo "::error::the web bundle has no call client — the huddle platform split resolved the wrong file"; exit 1; }
 
-          leak 'prosemirror' 'prosemirror leaked into the iOS bundle; the mobile app grew ~400 KB for a feature it does not have'
+          leak 'prosemirror' 'prosemirror leaked into the iOS bundle; the mobile app grew ~400 KB for a feature it does not have' i
           leak 'livekit' 'livekit-client leaked into the iOS bundle; that is ~200 KB of WebRTC for a join path the mobile dev-build cut removes' i
           present 'Editing documents is available on the web' 'the iOS bundle has no document renderer at all'
           present 'Join this huddle from the web app' 'the iOS bundle has no huddle surface at all'
 
-          # SELF-CHECK. The bug above made these assertions carry no information
-          # while still printing a verdict, so the step now proves its own
-          # detector works before trusting its silence: a string that is
-          # certainly in the table must be found, and one that certainly is not
-          # must not be.
-          grep -q -- 'Editing documents is available on the web' /tmp/ios-strings.txt \
-            || { echo "::error::the leak detector cannot find a string that is present; its silence means nothing"; exit 1; }
-          if grep -q -- 'zzz-this-string-is-never-in-any-bundle-zzz' /tmp/ios-strings.txt; then
-            echo "::error::the leak detector matches a string that cannot be present"
-            exit 1
-          fi
+          # SELF-CHECK, ON THE FUNCTIONS THEMSELVES.
+          #
+          # The bug this step used to have made every assertion carry no
+          # information while still printing a verdict, so silence has to be
+          # earned. These run `leak` in a SUBSHELL — it exits on a match, which
+          # is the behaviour under test — against a string certainly in the
+          # table and one that cannot be, in both the case-sensitive and the
+          # case-insensitive form.
+          ( leak 'Editing documents is available on the web' 'self-check' ) >/dev/null 2>&1 \
+            && { echo "::error::leak() did not fire on a string that IS present; its silence means nothing"; exit 1; }
+          ( leak 'editing DOCUMENTS is available on the WEB' 'self-check' i ) >/dev/null 2>&1 \
+            && { echo "::error::leak()'s case-insensitive form did not fire on a string that IS present"; exit 1; }
+          ( leak 'zzz-this-string-is-never-in-any-bundle-zzz' 'self-check' ) >/dev/null 2>&1 \
+            || { echo "::error::leak() fired on a string that cannot be present"; exit 1; }
+          ( leak 'Editing documents is AVAILABLE on the web' 'self-check' ) >/dev/null 2>&1 \
+            || { echo "::error::leak() is matching case-insensitively when it was not asked to"; exit 1; }
           echo "editor and call client are web-only; both native fallbacks are present"
 
       # A GATE THAT CANNOT RUN IS NOT A GATE THAT PASSED.
@@ -543,24 +583,47 @@ jobs:
             || { echo "::error::the frontend image is running but serves nothing"; docker logs fe-ci; exit 1; }
           docker rm -f fe-ci >/dev/null
 
-          # The backend with no database. It must refuse, not hang: a config or
-          # connection failure that produces no output and never exits is the
-          # shape that turns a bad deploy into a silent outage.
+          # The backend against an UNREACHABLE DATABASE — not a bare `docker run`.
+          #
+          # A bare run dies at config validation ("JWT_SECRET is required") in
+          # under a second, so the step passed while asserting nothing about the
+          # database at all. Worse, it hid a real defect: the binary used to sit
+          # for 35 seconds and counting with ZERO output when the database was
+          # black-holed, because neither the dial nor the ping had a deadline.
+          # A full config plus 192.0.2.1 (TEST-NET-1: routable-looking, never
+          # routed) is what actually exercises that path.
           set +e
-          timeout 30 docker run --name be-ci superops-backend:ci > /tmp/be.log 2>&1
+          timeout 45 docker run --name be-ci \
+            -e JWT_SECRET=ci-secret-at-least-32-characters-long \
+            -e ADMIN_EMAIL=ci@example.test \
+            -e ADMIN_PASSWORD=ci-admin-password-long-enough \
+            -e DB_HOST=192.0.2.1 -e DB_PORT=5432 \
+            -e DB_USER=ci -e DB_PASSWORD=ci -e DB_NAME=ci -e DB_SSLMODE=disable \
+            superops-backend:ci > /tmp/be.log 2>&1
           code=$?
           set -e
           docker rm -f be-ci >/dev/null 2>&1 || true
+
           if [ "$code" -eq 124 ]; then
-            echo "::error::the backend image hung for 30s with no database instead of failing"
+            echo "::error::the backend image hung for 45s against an unreachable database instead of failing"
             cat /tmp/be.log
             exit 1
           fi
+          # NON-ZERO, and specifically not docker's own failure codes. 0 would
+          # mean it exited cleanly with no database, which is wrong; 125/126/127
+          # are docker failing to run the image at all — a bad ENTRYPOINT is 127
+          # and used to PASS here, which is exactly the defect this step names.
+          case "$code" in
+            0)         echo "::error::the backend image exited 0 with no database reachable"; exit 1 ;;
+            125|126|127) echo "::error::docker could not run the backend image (exit $code) — bad entrypoint or run flags"; cat /tmp/be.log; exit 1 ;;
+          esac
           if [ ! -s /tmp/be.log ]; then
-            echo "::error::the backend image exited with no diagnostic at all"
+            echo "::error::the backend image exited $code with no diagnostic at all"
             exit 1
           fi
-          echo "both images start; the backend refuses a missing database with a diagnostic"
+          grep -qi 'database' /tmp/be.log \
+            || { echo "::error::the backend failed for some reason other than the database:"; cat /tmp/be.log; exit 1; }
+          echo "both images start; the backend refuses an unreachable database in <45s with a diagnostic"
           head -5 /tmp/be.log
 
   helm:

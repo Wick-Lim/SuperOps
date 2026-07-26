@@ -27,7 +27,20 @@ type Config struct {
 	MaxConnLifetime   time.Duration
 	MaxConnIdleTime   time.Duration
 	HealthCheckPeriod time.Duration
+
+	// ConnectTimeout bounds ONE dial. Zero means DefaultConnectTimeout; a value
+	// already in the DSN wins over both, because that is the operator being
+	// explicit.
+	ConnectTimeout time.Duration
 }
+
+// DefaultConnectTimeout bounds the first connection so an unreachable database
+// is a fast, loud failure instead of a process that never says anything.
+//
+// Ten seconds: long enough to survive a slow DNS answer or a database still
+// coming up beside us in compose, short enough that a container which will
+// never become ready says so before an orchestrator's own patience runs out.
+const DefaultConnectTimeout = 10 * time.Second
 
 // Stats is a snapshot of pgxpool counters, exported so the metrics handler can
 // publish pool saturation without importing pgxpool itself.
@@ -80,12 +93,36 @@ func NewPool(ctx context.Context, cfg Config, logger *slog.Logger) (*pgxpool.Poo
 	setTimeoutParam(poolCfg.ConnConfig.RuntimeParams, "lock_timeout", cfg.LockTimeout)
 	setTimeoutParam(poolCfg.ConnConfig.RuntimeParams, "idle_in_transaction_session_timeout", cfg.IdleInTransactionTimeout)
 
+	// THE FIRST CONNECTION IS BOUNDED. Without this the process HANGS with no
+	// output at all when the database is unreachable — verified at 35 seconds
+	// and zero bytes against a black-holed address.
+	//
+	// That is the worst shape a boot failure can take. A crash is a page and a
+	// log line; a silent hang is a container that never becomes ready, an
+	// orchestrator that keeps waiting, and an operator with nothing to read.
+	// Two things were missing: pgx's default dial has no deadline of its own,
+	// and Ping was handed a context with none either.
+	//
+	// connect_timeout is set on the CONFIG rather than the DSN string so an
+	// operator's explicit DATABASE_URL value still wins — ParseConfig has
+	// already applied theirs by this point, and a zero here means they said
+	// nothing.
+	if poolCfg.ConnConfig.ConnectTimeout == 0 {
+		poolCfg.ConnConfig.ConnectTimeout = orDuration(cfg.ConnectTimeout, DefaultConnectTimeout)
+	}
+
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create connection pool: %w", err)
 	}
 
-	if err := pool.Ping(ctx); err != nil {
+	// And the ping gets its own deadline, because ConnectTimeout bounds one
+	// dial while the pool may retry: a name that resolves to several dead
+	// addresses is several timeouts in a row, which is a hang again with extra
+	// steps.
+	pingCtx, cancel := context.WithTimeout(ctx, orDuration(cfg.ConnectTimeout, DefaultConnectTimeout)*2)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
