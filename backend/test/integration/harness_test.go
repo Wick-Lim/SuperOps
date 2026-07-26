@@ -306,20 +306,35 @@ func decodeInto(t *testing.T, raw json.RawMessage, v any) {
 
 // --- identities ---
 
-// adminToken caches the seeded admin's access token for the whole package.
-// Logging in costs a bcrypt verify at cost 12; the suite does it dozens of
-// times per run otherwise.
+// adminToken caches the seeded admin's access token, and RE-LOGS IN before it
+// expires.
+//
+// Caching alone was correct when the suite ran in three minutes and became a
+// time bomb as it grew past ten: JWT_ACCESS_TTL is 15 minutes, the token was
+// minted once for the whole package, and every test after the fifteen-minute
+// mark failed with "invalid or expired token". Twenty-nine of them did, all at
+// once, for a reason that had nothing to do with the code under test — which is
+// the worst kind of red, because the obvious reading is that the last change
+// broke authentication.
+//
+// The refresh window is deliberately well short of the TTL: a token minted at
+// 9:59 must still be valid for whatever the test does with it, not merely at
+// the moment it is handed over.
+const adminTokenRefreshAfter = 8 * time.Minute
+
 var (
-	adminTokMu sync.Mutex
-	adminTok   string
+	adminTokMu   sync.Mutex
+	adminTok     string
+	adminTokenAt time.Time
 )
 
 func (h *harness) adminToken(t *testing.T) string {
 	t.Helper()
 	adminTokMu.Lock()
 	defer adminTokMu.Unlock()
-	if adminTok == "" {
+	if adminTok == "" || time.Since(adminTokenAt) > adminTokenRefreshAfter {
 		adminTok = h.login(t, adminEmail, adminPass)
+		adminTokenAt = time.Now()
 	}
 	return adminTok
 }

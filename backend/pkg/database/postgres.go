@@ -107,9 +107,7 @@ func NewPool(ctx context.Context, cfg Config, logger *slog.Logger) (*pgxpool.Poo
 	// operator's explicit DATABASE_URL value still wins — ParseConfig has
 	// already applied theirs by this point, and a zero here means they said
 	// nothing.
-	if poolCfg.ConnConfig.ConnectTimeout == 0 {
-		poolCfg.ConnConfig.ConnectTimeout = orDuration(cfg.ConnectTimeout, DefaultConnectTimeout)
-	}
+	applyConnectTimeout(poolCfg, cfg)
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -155,4 +153,14 @@ func orDuration(d, fallback time.Duration) time.Duration {
 		return d
 	}
 	return fallback
+}
+
+// applyConnectTimeout bounds ONE dial, deferring to a value the operator put in
+// the DSN. Extracted so it can be asserted directly: the ping deadline is
+// always twice this and therefore ends every construction first, so a
+// behavioural test of NewPool measures the ping no matter what it claims.
+func applyConnectTimeout(poolCfg *pgxpool.Config, cfg Config) {
+	if poolCfg.ConnConfig.ConnectTimeout == 0 {
+		poolCfg.ConnConfig.ConnectTimeout = orDuration(cfg.ConnectTimeout, DefaultConnectTimeout)
+	}
 }

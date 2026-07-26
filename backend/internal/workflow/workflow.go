@@ -126,15 +126,121 @@ func NewRepository(pool *pgxpool.Pool) *Repository { return &Repository{pool: po
 // A new VERSION rather than an edit, because a run records which version it
 // executed: without that, reading a two-week-old run tells you what the
 // workflow does now, which is a guess dressed up as an audit trail.
+// Patch is Save for a PARTIAL update: it reads the current workflow, lays the
+// caller's non-nil fields over it, and writes — all under one row lock.
+//
+// The handler did this with a read on the pool followed by Save in its own
+// transaction, which is a lost update. Two admins in two tabs, one saving new
+// steps and one renaming: both read the same state, the second commit writes
+// its stale copy of what it did not send, and because Save APPENDS a version
+// the reverted content becomes the version that runs. Reproduced in 5 of 40
+// paired concurrent requests.
+//
+// SELECT ... FOR UPDATE is what serialises them. The second request blocks
+// until the first commits and then reads what the first wrote, so a rename
+// lands on top of new steps instead of underneath them.
+func (r *Repository) Patch(ctx context.Context, workspaceID, id string, p PatchFields,
+	actorID string, load func(context.Context, pgx.Tx, string) (*Workflow, error),
+) (*Workflow, *Workflow, error) {
+
+	var current, saved *Workflow
+	err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		var locked string
+		err := tx.QueryRow(ctx,
+			`SELECT id::text FROM workflows
+			  WHERE id = $1 AND workspace_id = $2 AND archived_at IS NULL
+			  FOR UPDATE`, id, workspaceID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock workflow: %w", err)
+		}
+
+		cur, err := load(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		current = cur
+
+		name, description, enabled := cur.Name, cur.Description, cur.Enabled
+		steps, triggers := cur.Steps, cur.Triggers
+		if p.Name != nil {
+			name = *p.Name
+		}
+		if p.Description != nil {
+			description = *p.Description
+		}
+		if p.Enabled != nil {
+			enabled = *p.Enabled
+		}
+		if p.Steps != nil {
+			steps = *p.Steps
+		}
+		if p.Triggers != nil {
+			triggers = *p.Triggers
+		}
+
+		saved, err = r.saveTx(ctx, tx, workspaceID, id, name, description,
+			steps, triggers, enabled, actorID)
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return current, saved, nil
+}
+
+// PatchFields is a partial workflow, and the PATCH route decodes straight into
+// it.
+//
+// EVERY FIELD IS OPTIONAL, which is the difference between PATCH and PUT and
+// the reason this type exists. The route used to decode into the same struct
+// POST does, so an omitted `steps` arrived as an empty slice and Save — which
+// writes a new version from whatever it is handed and replaces the triggers
+// wholesale — deleted the automation. A body as small as {"name": "renamed"}
+// left a workflow that still existed, still said enabled, and did nothing.
+//
+// A nil field is one the caller did not send and must not change. A non-nil
+// EMPTY slice is somebody deliberately emptying a workflow, and must still
+// work — which is why these are pointers rather than a merge helper.
+type PatchFields struct {
+	Name        *string    `json:"name"`
+	Description *string    `json:"description"`
+	Enabled     *bool      `json:"enabled"`
+	Steps       *[]Step    `json:"steps"`
+	Triggers    *[]Trigger `json:"triggers"`
+}
+
 func (r *Repository) Save(ctx context.Context, workspaceID, id, name, description string,
+	steps []Step, triggers []Trigger, enabled bool, actorID string) (*Workflow, error) {
+
+	// Validation lives in saveTx, so the two entry points cannot disagree
+	// about what a valid workflow is.
+	var wf *Workflow
+	err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		var err error
+		wf, err = r.saveTx(ctx, tx, workspaceID, id, name, description, steps, triggers, enabled, actorID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return wf, nil
+}
+
+// saveTx is Save's body, so Patch can run it inside a transaction it already
+// holds — which is what makes read-merge-write one atomic step instead of a
+// lost update.
+func (r *Repository) saveTx(ctx context.Context, tx pgx.Tx, workspaceID, id, name, description string,
 	steps []Step, triggers []Trigger, enabled bool, actorID string) (*Workflow, error) {
 
 	if len(steps) > 20 {
 		return nil, ErrTooMany
 	}
-	for i, s := range steps {
-		if !validStepKind(s.Kind) {
-			return nil, fmt.Errorf("workflow: step %d has unknown kind %q", i, s.Kind)
+	for i, st := range steps {
+		if !validStepKind(st.Kind) {
+			return nil, fmt.Errorf("workflow: step %d has unknown kind %q", i, st.Kind)
 		}
 	}
 	for i, t := range triggers {
@@ -142,14 +248,13 @@ func (r *Repository) Save(ctx context.Context, workspaceID, id, name, descriptio
 			return nil, fmt.Errorf("workflow: trigger %d has invalid event type %q", i, t.EventType)
 		}
 	}
-
 	stepsJSON, err := json.Marshal(nonNilSteps(steps))
 	if err != nil {
 		return nil, fmt.Errorf("encode steps: %w", err)
 	}
 
 	var wf Workflow
-	err = database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+	if err := func(tx pgx.Tx) error {
 		if id == "" {
 			err := tx.QueryRow(ctx, `
 				INSERT INTO workflows (workspace_id, name, description, enabled, created_by, owner_id)
@@ -226,8 +331,7 @@ func (r *Repository) Save(ctx context.Context, workspaceID, id, name, descriptio
 		wf.Steps = steps
 		wf.Triggers = triggers
 		return nil
-	})
-	if err != nil {
+	}(tx); err != nil {
 		return nil, err
 	}
 	return &wf, nil

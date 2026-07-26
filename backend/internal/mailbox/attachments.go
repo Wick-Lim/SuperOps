@@ -185,26 +185,53 @@ func safeFilename(name string) string {
 // caller's capability on each file, checked here rather than assumed — a reply
 // must not be able to attach a file its author cannot read.
 func (r *Repository) AttachToOutbound(ctx context.Context, messageID, actorID string, fileIDs []string) error {
+	if err := r.authorizeAttachments(ctx, actorID, fileIDs); err != nil {
+		return err
+	}
+	return database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		return r.attachToOutboundTx(ctx, tx, messageID, fileIDs)
+	})
+}
+
+// AttachToOutboundIn is AttachToOutbound for a caller that already holds a
+// transaction, so the message and its attachments commit or fail together.
+//
+// The reply route is that caller. It INSERTed the outbound row and then
+// attached, in two separate commits — so a refused attach left a committed
+// reply with sent_at NULL, which is exactly what SweepUnsent looks for. Two
+// minutes later the customer received "please find the file attached" with
+// nothing attached, while the agent had been told the send failed and had
+// probably retried. Making the attach internally atomic did not help: the
+// message was never inside it.
+func (r *Repository) AttachToOutboundIn(ctx context.Context, tx pgx.Tx, messageID, actorID string, fileIDs []string) error {
+	if err := r.authorizeAttachments(ctx, actorID, fileIDs); err != nil {
+		return err
+	}
+	return r.attachToOutboundTx(ctx, tx, messageID, fileIDs)
+}
+
+// authorizeAttachments is the capability half, which needs no transaction.
+//
+// SHARE, NOT READ — and this is the whole security story of the route.
+//
+// Attaching RE-PARENTS the file: 055 hangs a file with mail_message_id off its
+// conversation, and internal/authz now follows that on the DECISION path too.
+// So setting the column hands every grantee of the mailbox the ability to
+// download the file. That is a share, and "you cannot give away more than you
+// hold" is the rule the sharing route already enforces.
+//
+// It used to require CapRead, and read is not share: a channel member holds
+// CapWrite on a file posted in that channel, which /drive/file/{id}/shares
+// correctly refuses to let them share. An audit demonstrated the escalation end
+// to end — a private-channel file reaching somebody outside the channel through
+// a reply — so this route now asks the same question that one does.
+func (r *Repository) authorizeAttachments(ctx context.Context, actorID string, fileIDs []string) error {
 	if len(fileIDs) == 0 {
 		return nil
 	}
 	if len(fileIDs) > maxAttachmentsPerMessage {
 		return fmt.Errorf("mailbox: at most %d attachments per message", maxAttachmentsPerMessage)
 	}
-
-	// SHARE, NOT READ — and this is the whole security story of the route.
-	//
-	// Attaching RE-PARENTS the file: 055 hangs a file with mail_message_id off
-	// its conversation, and internal/authz now follows that on the DECISION
-	// path too. So setting the column hands every grantee of the mailbox the
-	// ability to download the file. That is a share, and "you cannot give away
-	// more than you hold" is the rule the sharing route already enforces.
-	//
-	// It used to require CapRead, and read is not share: a channel member holds
-	// CapWrite on a file posted in that channel, which /drive/file/{id}/shares
-	// correctly refuses to let them share. An audit demonstrated the escalation
-	// end to end — a private-channel file reaching somebody outside the channel
-	// through a reply — so this route now asks the same question that one does.
 	for _, id := range fileIDs {
 		got, err := r.authz.Capability(ctx, authz.UserSubject(actorID), authz.FileObject(id))
 		if err != nil {
@@ -215,44 +242,35 @@ func (r *Repository) AttachToOutbound(ctx context.Context, messageID, actorID st
 			return ErrNotFound
 		}
 	}
+	return nil
+}
 
-	// SAME TENANT, checked in the statement.
+// attachToOutboundTx is the write half.
+//
+// SAME TENANT, checked in the statement. Capability alone is not enough: a
+// person who belongs to two workspaces legitimately holds read on a file in one
+// and write on a conversation in the other, so authorization passes while the
+// link crosses tenants. The ACL side then fails closed — 055's conversation arm
+// joins on mc.workspace_id = f.workspace_id and drops the branch — so the
+// file's bytes stayed unreachable, but its NAME, content type and size rendered
+// in the other tenant's thread.
+func (r *Repository) attachToOutboundTx(ctx context.Context, tx pgx.Tx, messageID string, fileIDs []string) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+
+	// Counted on the END STATE rather than on rows affected. Rows-affected is
+	// wrong twice: a duplicate id in the request updates one row and would look
+	// like a miss, and re-sending the same attach — which a client retrying a
+	// timed-out reply does — updates nothing at all because the file is already
+	// linked. Both are successes.
 	//
-	// Capability alone is not enough: a person who belongs to two workspaces
-	// legitimately holds read on a file in one and write on a conversation in
-	// the other, so authorization passes while the link crosses tenants. The
-	// ACL side then fails closed — 055's conversation arm joins on
-	// mc.workspace_id = f.workspace_id and drops the branch — so the file's
-	// bytes stayed unreachable, but its NAME, content type and size rendered in
-	// the other tenant's thread.
-	// Counted rather than compared against len(fileIDs), and counted on the
-	// END STATE rather than on rows affected.
-	//
-	// Rows-affected is wrong twice: a duplicate id in the request updates one
-	// row and would look like a miss, and re-sending the same attach — which a
-	// client retrying a timed-out reply does — updates nothing at all because
-	// the file is already linked. Both are successes.
 	// The UNION is not stylistic. A data-modifying CTE's writes are NOT visible
 	// to the rest of the same statement — the outer query reads the snapshot
-	// from before the UPDATE — so counting the end state here returns zero on a
-	// first attach. The count has to be "what this statement linked" plus "what
-	// was already linked", and UNION deduplicates the overlap.
-	// IN A TRANSACTION, because the count check below is a REFUSAL and a refusal
-	// that has already written is not one. On the pool this statement committed
-	// the rows it did link before ErrNotFound was returned, so a reply the API
-	// reported as failed still moved files onto the conversation — and, through
-	// the re-parenting above, still widened who could read them. Demonstrated by
-	// an audit: a refused batch left its first file linked and downloadable by
-	// a mailbox grantee.
-	//
-	// The ACL is materialized in the SAME commit, for the reason storeAttachments
-	// already does it: leaving it to the hourly drift job means an attachment
-	// whose stored path still says "the uploader alone" is invisible to every
-	// acl_key-driven listing — search, backlinks — while being downloadable. The
-	// two authorities must not disagree, in either direction.
+	// from before the UPDATE — so counting the end state alone returns zero on a
+	// first attach.
 	var attached int
-	err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		WITH linked AS (
 			UPDATE files f
 			   SET mail_message_id = $2
@@ -269,25 +287,24 @@ func (r *Repository) AttachToOutbound(ctx context.Context, messageID, actorID st
 		SELECT count(*) FROM (
 			SELECT id FROM linked UNION SELECT id FROM already
 		) AS attached`, fileIDs, messageID).Scan(&attached); err != nil {
-			return fmt.Errorf("attach files to message: %w", err)
+		return fmt.Errorf("attach files to message: %w", err)
+	}
+	if attached != len(dedupeIDs(fileIDs)) {
+		// 404-shaped and all-or-nothing: a partially attached reply is one whose
+		// author believes they sent something they did not. The usual cause is
+		// a file in another tenant — authorization passes for somebody who
+		// belongs to both, and the tenancy predicate above is what refuses it.
+		// Returning here rolls the link back.
+		return ErrNotFound
+	}
+	// The ACL in the SAME commit, for the reason storeAttachments already does
+	// it: leaving it to the hourly drift job means an attachment whose stored
+	// path still says "the uploader alone" is invisible to every acl_key-driven
+	// listing — search, backlinks — while being downloadable.
+	for _, id := range dedupeIDs(fileIDs) {
+		if err := authz.MaterializeTx(ctx, tx, authz.FileObject(id)); err != nil {
+			return fmt.Errorf("materialize attached file ACL: %w", err)
 		}
-		if attached != len(dedupeIDs(fileIDs)) {
-			// 404-shaped and all-or-nothing: a partially attached reply is one
-			// whose author believes they sent something they did not. The usual
-			// cause is a file in another tenant — authorization passes for
-			// somebody who belongs to both, and the tenancy predicate above is
-			// what refuses it. Returning here rolls the link back.
-			return ErrNotFound
-		}
-		for _, id := range dedupeIDs(fileIDs) {
-			if err := authz.MaterializeTx(ctx, tx, authz.FileObject(id)); err != nil {
-				return fmt.Errorf("materialize attached file ACL: %w", err)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 	return nil
 }

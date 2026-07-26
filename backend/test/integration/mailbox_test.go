@@ -1416,6 +1416,12 @@ func TestAMailboxCanBeSharedWithAnAgent(t *testing.T) {
 	if code != http.StatusBadRequest {
 		t.Fatalf("POST a link on a conversation = %d, want 400", code)
 	}
+	// AND LISTING ANSWERS THE SAME. It used to return 200 [] — a panel that
+	// renders an empty link list beside a Create button that always fails.
+	code, _ = h.do(t, http.MethodGet, "/api/v1/drive/mailbox/"+mb.ID+"/links", admin, nil)
+	if code != http.StatusBadRequest {
+		t.Fatalf("GET the links of a mailbox = %d, want 400 — the same answer POST gives", code)
+	}
 }
 
 // ATTACHING IS IDEMPOTENT AND TENANT-SCOPED.
@@ -1443,7 +1449,9 @@ func TestAttachingIsIdempotentAndDuplicateSafe(t *testing.T) {
 
 	fileID := h.upload(t, admin, ws, fmt.Sprintf("reply-%d.txt", time.Now().UnixNano()))
 	if fileID == "" {
-		t.Skip("file storage is not wired")
+		// FATAL, not skip. This is an authorization test: a skip reads as a
+		// pass, so MinIO being down would report the escalation as verified.
+		t.Fatal("file storage is not wired; this authorization test cannot verify anything")
 	}
 
 	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{fileID}); err != nil {
@@ -1507,7 +1515,9 @@ func TestAttachingARepliesFileRequiresShareAndIsAllOrNothing(t *testing.T) {
 	}
 	readable := h.upload(t, admin, ws, fmt.Sprintf("readable-%d.txt", time.Now().UnixNano()))
 	if readable == "" {
-		t.Skip("file storage is not wired")
+		// FATAL, not skip. This is an authorization test: a skip reads as a
+		// pass, so MinIO being down would report the escalation as verified.
+		t.Fatal("file storage is not wired; this authorization test cannot verify anything")
 	}
 	if err := h.app.Authz.Grant(ctx, authz.UserSubject(me), authz.UserSubject(agent.id),
 		authz.FileObject(readable), authz.CapRead); err != nil {
@@ -1532,9 +1542,16 @@ func TestAttachingARepliesFileRequiresShareAndIsAllOrNothing(t *testing.T) {
 	owned := h.upload(t, admin, ws, fmt.Sprintf("owned-%d.txt", time.Now().UnixNano()))
 	spent := h.upload(t, admin, ws, fmt.Sprintf("spent-%d.txt", time.Now().UnixNano()))
 	if owned == "" || spent == "" {
-		t.Skip("file storage is not wired")
+		// FATAL, not skip. This is an authorization test: a skip reads as a
+		// pass, so MinIO being down would report the escalation as verified.
+		t.Fatal("file storage is not wired; this authorization test cannot verify anything")
 	}
-	// `spent` is already attached elsewhere, so the batch must fail.
+	// `spent` is already attached elsewhere, so the batch must fail — A FILE
+	// BELONGS TO EXACTLY ONE MESSAGE (`mail_message_id IS NULL` in the link),
+	// which is also what makes the capability rule above safe to state as
+	// simply as it is: there is no "move it to another message" case for the
+	// share requirement to be too strict about. I briefly "fixed" one that does
+	// not exist, having read this refusal as a capability problem.
 	other := inbound(mb, fmt.Sprintf("share2-%d", time.Now().UnixNano()))
 	other.WorkspaceID = ws
 	_, msg2, err := repo.Ingest(ctx, other)
@@ -1574,4 +1591,154 @@ func TestAttachingARepliesFileRequiresShareAndIsAllOrNothing(t *testing.T) {
 		t.Fatalf("acl_object.path = %q after attaching; the listing path still says "+
 			"'the uploader alone' while the decision path says otherwise", storedPath)
 	}
+}
+
+// A REFUSED REPLY MUST NOT LEAVE A DELIVERABLE MESSAGE BEHIND.
+//
+// The outbound row was INSERTed and the attachments linked in two separate
+// commits, so a refused attach returned 404 with the reply already committed
+// and sent_at NULL — which is exactly what SweepUnsent selects. Two minutes
+// later the customer received "please find the file attached" with nothing
+// attached, while the agent had been told the send failed and had probably
+// retried, producing a second one.
+func TestARefusedReplyLeavesNothingToDeliver(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := mailRepo(t)
+	ctx := context.Background()
+
+	mb := newMailbox(t, ws, me)
+	in := inbound(mb, fmt.Sprintf("refuse-%d", time.Now().UnixNano()))
+	in.WorkspaceID = ws
+	conv, _, err := repo.Ingest(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A file the agent may read but not share: posted in a channel they are a
+	// plain member of.
+	agent := h.newUser(t, admin, ws, "refuse-agent")
+	if err := h.app.Authz.Grant(ctx, authz.UserSubject(me), authz.UserSubject(agent.id),
+		authz.ObjectRef{Type: "mailbox", ID: mb.ID}, authz.CapWrite); err != nil {
+		t.Fatal(err)
+	}
+	unshareable := h.upload(t, admin, ws, fmt.Sprintf("theirs-%d.txt", time.Now().UnixNano()))
+	if unshareable == "" {
+		// FATAL, not skip. This is an authorization test: a skip reads as a
+		// pass, so MinIO being down would report the escalation as verified.
+		t.Fatal("file storage is not wired; this authorization test cannot verify anything")
+	}
+
+	before := h.undeliveredCount(t, conv.ID)
+	code, _ := h.do(t, http.MethodPost, "/api/v1/conversations/"+conv.ID+"/reply", agent.token,
+		map[string]any{"body_text": "please find the file attached",
+			"attachment_file_ids": []string{unshareable}})
+	if code == http.StatusCreated {
+		t.Fatal("the agent attached a file they cannot share")
+	}
+	after := h.undeliveredCount(t, conv.ID)
+
+	if after != before {
+		t.Fatalf("a refused reply left %d undelivered outbound message(s) where there were %d — "+
+			"the sweeper will send it in two minutes, with no attachment, saying "+
+			"'please find the file attached'", after, before)
+	}
+}
+
+// undeliveredCount is what SweepUnsent would pick up for this conversation.
+func (h *harness) undeliveredCount(t *testing.T, conversationID string) int {
+	t.Helper()
+	var n int
+	if err := h.app.DB.QueryRow(context.Background(), `
+		SELECT count(*) FROM mail_messages
+		 WHERE conversation_id = $1 AND direction = 'outbound' AND sent_at IS NULL`,
+		conversationID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// THE DOMAIN SHAPE CONSTRAINT IS LOAD-BEARING FOR AUTHORIZATION.
+//
+// CreateMailbox's ownership check interpolates a stored domain into a LIKE
+// pattern (`$1 LIKE '%.' || domain`). That is safe only because
+// mail_domains_domain_shape forbids `%` and `_` — without it, registering the
+// domain `%` would let one tenant claim every unregistered domain in the
+// deployment. The constraint lives in a migration about data hygiene and is
+// doing security work; this is what says so.
+func TestTheDomainShapeConstraintRejectsLikeWildcards(t *testing.T) {
+	h := getHarness(t)
+	ctx := context.Background()
+	tenant := h.newTenant(t, "wildcard")
+
+	for _, bad := range []string{"%", "%.test", "_.test", "a%b.test", "a_b.test"} {
+		_, err := h.app.DB.Exec(ctx,
+			`INSERT INTO mail_domains (workspace_id, domain, verify_token) VALUES ($1, $2, 'tok')`,
+			tenant.workspaceID, bad)
+		if err == nil {
+			_, _ = h.app.DB.Exec(ctx, `DELETE FROM mail_domains WHERE domain = $1`, bad)
+			t.Errorf("the database accepted %q as a domain; a LIKE wildcard there lets one "+
+				"tenant claim every unregistered domain", bad)
+		}
+	}
+}
+
+// REGISTERING A SUBDOMAIN IS REGISTERING UNDER SOMEBODY ELSE'S NAME.
+//
+// CreateMailbox learned to walk up to ancestor domains; AddDomain did not, and
+// UNIQUE (domain) only stops an exact collision — `mail.victim.test` does not
+// collide with `victim.test`. So an attacker registered the SUBDOMAIN first,
+// and the "longest match wins" tiebreaker that CreateMailbox presents as
+// protection then resolved ownership in their favour. Inbound routing resolves
+// by address alone and never consults domain ownership, so mail for
+// billing@mail.victim.test landed in the attacker's mailbox.
+//
+// An audit demonstrated it end to end against a VERIFIED victim domain, one API
+// call after the subdomain fix I had just landed.
+func TestRegisteringADomainUnderAnothersIsRefused(t *testing.T) {
+	h := getHarness(t)
+	victim := h.newTenant(t, "dom-victim")
+	attacker := h.newTenant(t, "dom-attacker")
+	ctx := context.Background()
+
+	base := fmt.Sprintf("v%d.test", time.Now().UnixNano())
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+victim.workspaceID+"/mail/domains", victim.token,
+		map[string]string{"domain": base})
+
+	// Under it.
+	code, _ := h.do(t, http.MethodPost,
+		"/api/v1/workspaces/"+attacker.workspaceID+"/mail/domains", attacker.token,
+		map[string]string{"domain": "mail." + base})
+	if code != http.StatusConflict {
+		t.Fatalf("registering mail.%s as another tenant = %d, want 409 — the attacker "+
+			"then owns billing@mail.%s by longest-match", base, code, base)
+	}
+
+	// And the other direction: a name that would swallow theirs.
+	deep := fmt.Sprintf("a.b%d.test", time.Now().UnixNano())
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+victim.workspaceID+"/mail/domains", victim.token,
+		map[string]string{"domain": deep})
+	parent := deep[strings.Index(deep, ".")+1:]
+	code, _ = h.do(t, http.MethodPost,
+		"/api/v1/workspaces/"+attacker.workspaceID+"/mail/domains", attacker.token,
+		map[string]string{"domain": parent})
+	if code != http.StatusConflict {
+		t.Fatalf("registering %s over another tenant's %s = %d, want 409", parent, deep, code)
+	}
+
+	// The SAME tenant may hold both, which is the case the tiebreaker exists for.
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+victim.workspaceID+"/mail/domains", victim.token,
+		map[string]string{"domain": "mail." + base})
+
+	// And an unrelated name that merely shares a suffix is fine.
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+attacker.workspaceID+"/mail/domains", attacker.token,
+		map[string]string{"domain": "not" + base})
+
+	_ = ctx
 }

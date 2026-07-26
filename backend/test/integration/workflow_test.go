@@ -1381,3 +1381,66 @@ func TestPatchingAWorkflowPreservesWhatItOmits(t *testing.T) {
 		t.Errorf("emptying the steps also dropped the triggers: %d", len(patched.Triggers))
 	}
 }
+
+// CONCURRENT PATCHES MUST NOT REVERT EACH OTHER.
+//
+// Read-merge-write was a read on the pool followed by a write in its own
+// transaction — a lost update. Two admins in two tabs, one saving new steps and
+// one renaming: both read the same state, the second commit writes its stale
+// copy of what it did not send, and because Save APPENDS a version the reverted
+// content becomes the version that runs. An audit reproduced it in 5 of 40
+// paired requests.
+func TestConcurrentWorkflowPatchesDoNotRevertEachOther(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	channel := h.createTypedChannel(t, admin, ws, uniqueSlug("wf-race"), "public")
+
+	step := func(body string) []map[string]any {
+		return []map[string]any{{
+			"kind":   "post_message",
+			"config": map[string]any{"channel_id": channel, "body": body},
+		}}
+	}
+
+	for i := 0; i < 12; i++ {
+		var created struct {
+			ID string `json:"id"`
+		}
+		decodeInto(t, h.req(t, http.StatusCreated, http.MethodPost,
+			"/api/v1/workspaces/"+ws+"/workflows", admin,
+			map[string]any{
+				"name":    fmt.Sprintf("race-%d-%d", time.Now().UnixNano(), i),
+				"enabled": true, "steps": step("ORIGINAL"),
+				"triggers": []map[string]any{{"event_type": "message.created"}},
+			}).Data, &created)
+
+		want := fmt.Sprintf("NEW BODY %d", i)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// One saves steps; the other renames and sends no steps at all.
+		go func() {
+			defer wg.Done()
+			h.do(t, http.MethodPatch, "/api/v1/workflows/"+created.ID, admin,
+				map[string]any{"steps": step(want)})
+		}()
+		go func() {
+			defer wg.Done()
+			h.do(t, http.MethodPatch, "/api/v1/workflows/"+created.ID, admin,
+				map[string]any{"name": fmt.Sprintf("renamed-%d", i)})
+		}()
+		wg.Wait()
+
+		var latest string
+		if err := h.app.DB.QueryRow(context.Background(), `
+			SELECT steps::text FROM workflow_versions
+			 WHERE workflow_id = $1 ORDER BY version DESC LIMIT 1`,
+			created.ID).Scan(&latest); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(latest, want) {
+			t.Fatalf("iteration %d: the rename reverted the concurrent step edit — the "+
+				"version that will RUN is %s", i, latest)
+		}
+	}
+}

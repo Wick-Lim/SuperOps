@@ -132,6 +132,40 @@ func (h *Handler) CreateDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// REGISTRATION IS WHERE THE OWNERSHIP CLAIM IS MADE, so it is where the
+	// domain tree has to be checked.
+	//
+	// UNIQUE (domain) only stops an exact collision, and `mail.victim.test`
+	// does not collide with `victim.test`. CreateMailbox learned to walk up to
+	// ancestors; this did not — so an attacker registered the SUBDOMAIN first,
+	// and the "longest match wins" tiebreaker that mailbox.go presents as
+	// protection then resolved ownership in their favour. Inbound routing
+	// resolves by address alone and never consults domain ownership, so mail
+	// for billing@mail.victim.test landed in the attacker's mailbox. An audit
+	// demonstrated it end to end against a VERIFIED victim domain.
+	//
+	// Both directions: you may not register under somebody else's name, and you
+	// may not register a name that would swallow theirs.
+	var owner, clash string
+	err = h.pool.QueryRow(r.Context(), `
+		SELECT workspace_id::text, domain
+		  FROM mail_domains
+		 WHERE workspace_id <> $2
+		   AND (domain = $1 OR $1 LIKE '%.' || domain OR domain LIKE '%.' || $1)
+		 ORDER BY length(domain) DESC
+		 LIMIT 1`, domain, workspaceID).Scan(&owner, &clash)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Nothing in the tree belongs to anybody else.
+	case err != nil:
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	default:
+		httputil.JSONError(w, http.StatusConflict, "DOMAIN_TAKEN",
+			"that domain is already registered, or sits under one that is")
+		return
+	}
+
 	var d Domain
 	err = h.pool.QueryRow(r.Context(), `
 		INSERT INTO mail_domains (workspace_id, domain, verify_token)

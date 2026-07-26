@@ -17,16 +17,22 @@
 ALTER TABLE collab_documents
     ADD COLUMN repair_requested_at TIMESTAMPTZ;
 
--- DELIBERATELY NO INDEX on repair_requested_at.
+-- The sweep's ordering key, WITH THE NULLS ORDERING THE QUERY ASKS FOR.
 --
--- The obvious one — (repair_requested_at, updated_at) — was written and then
--- removed, because EXPLAIN shows the planner never reaches for it: the sweep's
--- WHERE filters on updated_at first (a far more selective predicate, already
--- indexed by idx_collab_documents_updated) and the LEFT JOIN against
--- file_projections forces a sort for the ORDER BY regardless. Even with
--- enable_seqscan off, the plan is a bitmap scan on updated_at plus a Sort.
+-- I removed this index once, having measured it going unused and concluded that
+-- no index could help. The measurement was right and the conclusion was wrong:
+-- Postgres defaults ASC to NULLS LAST, the query asks for NULLS FIRST, and a
+-- btree cannot serve an ordering it was not built in. Spelling the ordering out
+-- is the whole difference.
 --
--- It would not have been free. collab_documents.updated_at is bumped by EVERY
--- CRDT append, so an unused index there is write amplification on the hottest
--- path in the collaboration layer, paid on every keystroke somebody types, to
--- serve one query every ten minutes that would not use it.
+-- Measured here on 400,000 rows, the shipped statement verbatim:
+--   without         Parallel Seq Scan, 400,000 rows, top-N heapsort
+--   with, matching  Index Scan, 100 rows read, 0.15 ms
+--
+-- The write cost is real but not new: idx_collab_documents_updated already
+-- covers the same column and every CRDT append already bumps it, so this is one
+-- more entry per append rather than a new class of work — and the alternative
+-- is a full-table scan and an external sort every ten minutes, growing with the
+-- table.
+CREATE INDEX idx_collab_documents_repair
+    ON collab_documents (repair_requested_at ASC NULLS FIRST, updated_at);

@@ -126,27 +126,6 @@ type saveRequest struct {
 	Triggers    []Trigger `json:"triggers"`
 }
 
-// patchRequest is saveRequest with every field OPTIONAL.
-//
-// PATCH is a partial update and the handler treated it as a replacement: the
-// body decoded into saveRequest, so omitting `steps` meant an empty slice, and
-// Save writes a new version from whatever it is given and replaces the triggers
-// wholesale. A request as small as {"name": "renamed"} therefore wrote an EMPTY
-// version and deleted every trigger — the automation still existed, still said
-// enabled, and did nothing. An audit did exactly that and watched a
-// one-step, one-trigger workflow become zero and zero.
-//
-// Pointers rather than a merge helper because absent and empty are genuinely
-// different here: `"steps": []` is somebody deliberately emptying a workflow,
-// and that must still work.
-type patchRequest struct {
-	Name        *string    `json:"name"`
-	Description *string    `json:"description"`
-	Enabled     *bool      `json:"enabled"`
-	Steps       *[]Step    `json:"steps"`
-	Triggers    *[]Trigger `json:"triggers"`
-}
-
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	workspaceID, err := httputil.RequirePathParam(r, "workspace_id")
 	if err != nil {
@@ -190,42 +169,24 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req patchRequest
+	var req PatchFields
 	if err := httputil.DecodeJSONLimit(r, &req, maxWorkflowBody); err != nil {
 		httputil.HandleError(w, err)
 		return
 	}
 
-	// WHAT IS NOT SENT IS NOT CHANGED. Save takes a whole workflow, so the
-	// current one is read first and the request is laid over it. Without this a
-	// rename deleted the steps and the triggers.
-	current, err := h.load(r.Context(), id)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	name, description, enabled := current.Name, current.Description, current.Enabled
-	steps, triggers := current.Steps, current.Triggers
-	if req.Name != nil {
-		name = *req.Name
-	}
-	if req.Description != nil {
-		description = *req.Description
-	}
-	if req.Enabled != nil {
-		enabled = *req.Enabled
-	}
-	if req.Steps != nil {
-		steps = *req.Steps
-	}
-	if req.Triggers != nil {
-		triggers = *req.Triggers
-	}
-
-	// Save appends a VERSION rather than mutating the existing one, so a run
-	// already queued still executes what it was queued with.
-	wf, err := h.repo.Save(r.Context(), workspaceID, id, name, description,
-		steps, triggers, enabled, authctx.UserID(r.Context()))
+	// WHAT IS NOT SENT IS NOT CHANGED, and the read-merge-write is ONE step.
+	//
+	// Save takes a whole workflow, so the current one has to be read and the
+	// request laid over it — and doing that with a read on the pool followed by
+	// a write in its own transaction is a lost update. Two admins in two tabs,
+	// one saving steps and one renaming: both read the same state, the second
+	// commit writes its stale copy of what it did not send, and because Save
+	// APPENDS a version the reverted content becomes the version that runs.
+	// Reproduced in 5 of 40 paired concurrent requests before Patch took the
+	// row lock.
+	current, wf, err := h.repo.Patch(r.Context(), workspaceID, id, req,
+		authctx.UserID(r.Context()), h.loadTx)
 	if err != nil {
 		h.saveFailed(w, err)
 		return
@@ -237,7 +198,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		map[string]any{
 			"version": wf.Version, "enabled": wf.Enabled,
 			"owner_id": wf.OwnerID, "previous_owner_id": current.OwnerID,
-			"steps": len(steps), "triggers": len(triggers),
+			"steps": len(wf.Steps), "triggers": len(wf.Triggers),
 		})
 	httputil.JSON(w, http.StatusOK, wf)
 }
@@ -349,7 +310,19 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 // copy of this SELECT is how the two would come to disagree about what "the
 // current workflow" means.
 func (h *Handler) load(ctx context.Context, id string) (*Workflow, error) {
-	row := h.pool.QueryRow(ctx, `
+	return h.loadFrom(ctx, h.pool.QueryRow, id)
+}
+
+// loadTx is load inside a caller's transaction, so Patch reads the row it has
+// just locked rather than a snapshot from before it.
+func (h *Handler) loadTx(ctx context.Context, tx pgx.Tx, id string) (*Workflow, error) {
+	return h.loadFrom(ctx, tx.QueryRow, id)
+}
+
+type queryRower func(context.Context, string, ...any) pgx.Row
+
+func (h *Handler) loadFrom(ctx context.Context, q queryRower, id string) (*Workflow, error) {
+	row := q(ctx, `
 		SELECT w.id::text, w.workspace_id::text, w.owner_id::text, w.name, w.description,
 		       w.enabled, w.created_at, w.archived_at,
 		       COALESCE(v.version, 0),

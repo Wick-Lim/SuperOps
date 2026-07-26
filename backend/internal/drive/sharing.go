@@ -305,6 +305,31 @@ func refWorkspace(ctx context.Context, h *Handler, ref authz.ObjectRef) string {
 // ---------------------------------------------------------------------------
 
 // CreateLink mints a share link and returns the token ONCE.
+// linkableType refuses a share-link route for anything that is not a Drive
+// object, and answers the same way for every link route.
+//
+// shareTarget is shared by all five sharing routes, so widening it for per-user
+// mailbox grants widened these too — and drive_share_links still CHECKs
+// object_type IN ('file','folder'), so creating one was a 500 rather than a
+// refusal. Widening the CHECK would be worse: a link is ANONYMOUS access, and
+// one over a mailbox is an unauthenticated read of an entire customer inbox
+// handed out by whoever can share it. RevokeLink also mapped everything that is
+// not a file to a FOLDER object, so such a link could not have been revoked.
+//
+// It gates LISTING as well as creation. Answering 200 [] to "what links does
+// this mailbox have" while refusing to create one is a panel that renders an
+// empty list beside a button that always fails.
+func (h *Handler) linkableType(w http.ResponseWriter, r *http.Request) bool {
+	switch httputil.PathParam(r, "object_type") {
+	case EntryFolder, EntryFile:
+		return true
+	default:
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST",
+			`share links are for a folder or a file; grant a person or a group instead`)
+		return false
+	}
+}
+
 func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actor := authctx.UserID(ctx)
@@ -341,9 +366,7 @@ func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 	// unauthenticated read of an entire customer inbox handed out by anyone who
 	// can share it. RevokeLink also maps everything that is not a file to a
 	// FOLDER object, so such a link could not even be revoked through the API.
-	if t := httputil.PathParam(r, "object_type"); t != EntryFolder && t != EntryFile {
-		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST",
-			`a share link may be created for a folder or a file only; grant a person or a group instead`)
+	if !h.linkableType(w, r) {
 		return
 	}
 
@@ -415,6 +438,9 @@ func (h *Handler) CreateLink(w http.ResponseWriter, r *http.Request) {
 
 // ListLinks returns the live links on an object.
 func (h *Handler) ListLinks(w http.ResponseWriter, r *http.Request) {
+	if !h.linkableType(w, r) {
+		return
+	}
 	ref, _, ok := h.shareTarget(w, r, authz.CapShare)
 	if !ok {
 		return

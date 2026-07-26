@@ -186,6 +186,14 @@ func (r *Repository) CreateMailbox(ctx context.Context, workspaceID, address, di
 			// Longest match wins, so a tenant that has registered BOTH
 			// victim.test and mail.victim.test still owns its own subdomain
 			// rather than being refused by its own parent.
+			//
+			// THE LIKE PATTERN INTERPOLATES A STORED VALUE, and it is safe only
+			// because mail_domains_domain_shape forbids `%` and `_`:
+			//   CHECK (domain ~ '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$')
+			// Without it, registering the domain `%` would let one tenant claim
+			// every unregistered domain in the deployment. That constraint is
+			// now load-bearing for AUTHORIZATION rather than for data hygiene,
+			// which is not obvious from where it is written.
 			host := strings.TrimSuffix(address[at+1:], ".")
 			var owner, id string
 			err := tx.QueryRow(ctx, `

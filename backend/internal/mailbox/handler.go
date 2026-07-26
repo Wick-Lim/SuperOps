@@ -17,6 +17,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
@@ -411,8 +412,16 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// THE REPLY AND ITS ATTACHMENTS COMMIT TOGETHER.
+	//
+	// These were two commits. A refused attach therefore left the outbound row
+	// behind with sent_at NULL — which is precisely what SweepUnsent selects —
+	// so two minutes later the customer received "please find the file
+	// attached" with nothing attached, while the agent had been told the send
+	// failed and had probably retried, producing a second one.
 	var msg Message
-	err = h.pool.QueryRow(ctx, `
+	err = database.WithTx(ctx, h.pool, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
 		WITH parent AS (
 			SELECT m.message_id, m.references_ids, c.subject, c.customer_email
 			  FROM mail_conversations c
@@ -443,26 +452,25 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		  FROM parent p
 		RETURNING id::text, conversation_id::text, direction, message_id, in_reply_to,
 		          subject, body_text, body_html, author_id::text, sent_at, created_at`,
-		id, newMessageID(), req.Subject, req.BodyText, req.BodyHTML, actor,
-	).Scan(&msg.ID, &msg.ConversationID, &msg.Direction, &msg.MessageID, &msg.InReplyTo,
-		&msg.Subject, &msg.BodyText, &msg.BodyHTML, &msg.AuthorID, &msg.SentAt, &msg.CreatedAt)
+			id, newMessageID(), req.Subject, req.BodyText, req.BodyHTML, actor,
+		).Scan(&msg.ID, &msg.ConversationID, &msg.Direction, &msg.MessageID, &msg.InReplyTo,
+			&msg.Subject, &msg.BodyText, &msg.BodyHTML, &msg.AuthorID, &msg.SentAt,
+			&msg.CreatedAt); err != nil {
+			return err
+		}
+		// Attachments BEFORE the delivery is queued, so the consumer never
+		// renders a message whose attachments are still being linked — and in
+		// the same transaction, so a refusal takes the reply with it.
+		return h.repo.AttachToOutboundIn(ctx, tx, msg.ID, actor, req.AttachmentFileIDs)
+	})
 	if err != nil {
-		httputil.HandleError(w, httputil.NewInternal(err))
-		return
-	}
-
-	// Attachments BEFORE the delivery is queued, so the consumer never renders
-	// a message whose attachments are still being linked.
-	if len(req.AttachmentFileIDs) > 0 {
-		if err := h.repo.AttachToOutbound(ctx, msg.ID, actor, req.AttachmentFileIDs); err != nil {
-			if errors.Is(err, ErrNotFound) {
-				httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND",
-					"one of those files does not exist or you cannot read it")
-				return
-			}
-			httputil.HandleError(w, httputil.NewInternal(err))
+		if errors.Is(err, ErrNotFound) {
+			httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND",
+				"one of those files cannot be attached; you can read it but not share it")
 			return
 		}
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
 	}
 
 	// QUEUE THE DELIVERY. Without this the reply is stored, the agent is told

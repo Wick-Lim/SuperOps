@@ -530,7 +530,13 @@ func TestStaleProjectionSweepFindsTheNeverProjected(t *testing.T) {
 		t.Fatalf("age live document: %v", err)
 	}
 
-	stale, err := collab.FindStaleProjections(ctx, h.app.DB, 200, 30*time.Minute, 100)
+	// A HUGE LIMIT, because the queue is shared. Other tests — including the
+	// starvation test below — leave permanently-stale documents behind, and
+	// this one is about which documents the query FINDS, not about where they
+	// sort. Asking for 100 made it depend on how many zombies happened to be
+	// ahead of it, which is how it came to fail on a fresh database and pass on
+	// a dirty one.
+	stale, err := collab.FindStaleProjections(ctx, h.app.DB, 200, 30*time.Minute, 100000)
 	if err != nil {
 		t.Fatalf("find stale projections: %v", err)
 	}
@@ -610,6 +616,31 @@ func TestTheRepairSweepDoesNotAskTheSameDocumentForever(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+
+	// EVERY OTHER STALE DOCUMENT IS PUT BEHIND THESE TWO, and put back
+	// afterwards, because the queue is shared and this test is about ORDER.
+	//
+	// Leaving them ahead is what made this test fail on correct code: a run
+	// interrupted midway, or another test's leftovers, sit at the front with a
+	// NULL stamp and the sweep correctly asks for them instead. The first
+	// version's comment claimed the 19/20-year ages made it independent of
+	// residue — false, because repair_requested_at is the PRIMARY sort key.
+	if _, err := h.app.DB.Exec(ctx, `
+		UPDATE collab_documents SET repair_requested_at = NOW()
+		 WHERE id <> ALL($1::uuid[])`,
+		[]string{*zombie.CollabDocumentID, *newer.CollabDocumentID}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Put this test's own fixtures out of everybody else's way, so the next
+		// run — and the sibling test above — sees the queue it expects.
+		cctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_, _ = h.app.DB.Exec(cctx, `
+			UPDATE collab_documents SET head_seq = 0, repair_requested_at = NOW()
+			 WHERE id = ANY($1::uuid[])`,
+			[]string{*zombie.CollabDocumentID, *newer.CollabDocumentID})
+	})
 
 	// A batch of one is the same mechanism as the job's hundred, in miniature.
 	seen := map[string]int{}

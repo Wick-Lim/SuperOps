@@ -1144,6 +1144,16 @@ func repairProjections(ctx context.Context, pool *pgxpool.Pool, nc *nats.Conn, l
 		return nil
 	}
 
+	// EVERY DOCUMENT IN THE BATCH IS ASKED, even if one publish fails.
+	//
+	// FindStaleProjections CLAIMS the batch — it stamps repair_requested_at in
+	// the same statement, which is what stops an unanswerable document holding
+	// the queue. Returning on the first publish error therefore left documents
+	// k..N stamped "just asked", asked nothing, and sent to the back of the
+	// queue behind everything else, deferred by a full cycle. One NATS hiccup
+	// silently skipped up to a hundred documents, and the WARN below — the
+	// operator's only signal — was never reached on that path.
+	asked, failed := 0, 0
 	for _, s := range found {
 		// Published with no origin: this process has no hub, so there is no
 		// local delivery to suppress.
@@ -1152,8 +1162,12 @@ func repairProjections(ctx context.Context, pool *pgxpool.Pool, nc *nats.Conn, l
 			"head_seq":       s.HeadSeq,
 			"projection_seq": s.ProjectionSeq,
 		}); err != nil {
-			return fmt.Errorf("request projection for %s: %w", s.DocumentID, err)
+			failed++
+			l.Error("could not request a projection repair",
+				"document_id", s.DocumentID, "error", err)
+			continue
 		}
+		asked++
 	}
 
 	// WARN, not Debug. Every one of these is a document that is wrong in search
@@ -1161,7 +1175,13 @@ func repairProjections(ctx context.Context, pool *pgxpool.Pool, nc *nats.Conn, l
 	// rooms are empty and the requests are going nowhere — which an operator
 	// needs to be able to see without turning on debug logging.
 	l.Warn("asked rooms to repair stale projections",
-		"documents", len(found), "oldest_gap", found[0].Gap())
+		"documents", asked, "failed", failed, "oldest_gap", found[0].Gap())
+	if failed > 0 {
+		// Reported to the health registry too: a sweep that could not ask is a
+		// sweep whose claim was spent for nothing, and the next one will not
+		// revisit those documents until every other stale one has had a turn.
+		return fmt.Errorf("projection repair: %d of %d requests failed", failed, len(found))
+	}
 	return nil
 }
 
@@ -1478,7 +1498,13 @@ func publishPromoted(
 	// matched. An audit found it by scheduling a message and watching zero file
 	// events cross the wire.
 	for _, f := range msg.Files {
-		if err := nc.PublishDurable(pubCtx,
+		// ITS OWN BUDGET, not a slice of the message's. One 3-second context
+		// shared across message.created plus N attachment events means the
+		// later ones expire on a slow NATS — which is the silent non-indexing
+		// this loop exists to fix, arriving through the back door. The REST
+		// path gives every publish its own publishTimeout for the same reason.
+		fileCtx, fileCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		if err := nc.PublishDurable(fileCtx,
 			"superops."+workspaceID+".file.updated",
 			"file.updated:"+f.ID+":"+msg.ID,
 			natspkg.Event{Type: "file.updated", Data: map[string]any{
@@ -1493,6 +1519,7 @@ func publishPromoted(
 			l.Error("scheduled: publish attachment re-index",
 				"message_id", p.id, "file_id", f.ID, "error", err)
 		}
+		fileCancel()
 	}
 }
 
