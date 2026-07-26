@@ -76,6 +76,20 @@ func (h *Handler) mayAdmin(w http.ResponseWriter, r *http.Request, workspaceID s
 	return true
 }
 
+// mayRead gates every workflow read, and it requires ADMIN — the same
+// capability as writing.
+//
+// It used to require workspace CapRead, which RoleGuest holds. A workflow's step
+// configs and its runs' step outputs are returned verbatim, so the least
+// privileged role in the tenant could read the ids of private channels, the user
+// ids of notify targets, the object ids of commented objects and the literal
+// message bodies automation posts into them — every one of which is writable
+// only by an admin and readable by hand only by someone in the channel.
+//
+// Read and write match because automation is one surface, not two. A workflow
+// executes under its owner's authority without them present; describing what it
+// will do is describing an administrator's standing decision, and there is no
+// coherent reading in which that is less sensitive than the channel it posts to.
 func (h *Handler) mayRead(w http.ResponseWriter, r *http.Request, workspaceID string) bool {
 	got, err := h.authz.Capability(r.Context(), authz.UserSubject(authctx.UserID(r.Context())),
 		authz.WorkspaceObject(workspaceID))
@@ -83,7 +97,9 @@ func (h *Handler) mayRead(w http.ResponseWriter, r *http.Request, workspaceID st
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return false
 	}
-	if !got.Implies(authz.CapRead) {
+	if !got.Implies(authz.CapAdmin) {
+		// 404-shaped, as everywhere else: a 403 would confirm the workflow
+		// exists to somebody who may not know that.
 		httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND", "not found")
 		return false
 	}

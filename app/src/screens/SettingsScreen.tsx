@@ -338,7 +338,13 @@ export default function SettingsScreen({ navigation }: { navigation: any; route:
               is superops://, means not reachable at all. A screen with no way
               in is a feature that does not exist. */}
           <NavRow label="Inbox" onPress={() => navigation.navigate('Inbox')} />
-          <NavRow label="Automation" onPress={() => navigation.navigate('Workflows')} />
+          {/* Automation is an ADMIN surface on both sides. A workflow's steps
+              name private channels and carry the literal bodies it posts, and
+              the server refuses a non-admin — so offering the row to everyone
+              would be a link to a permission error. */}
+          {isWorkspaceAdmin ? (
+            <NavRow label="Automation" onPress={() => navigation.navigate('Workflows')} />
+          ) : null}
           {isWorkspaceAdmin ? (
             <NavRow label="Email setup" onPress={() => navigation.navigate('MailSetup')} />
           ) : null}

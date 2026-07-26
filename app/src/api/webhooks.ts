@@ -36,9 +36,20 @@ export const webhookApi = {
   update(webhookId: string, data: { name?: string; is_active?: boolean }) {
     return api.patch<{ message: string }>(`/webhooks/${webhookId}`, data)
   },
-  /** Issues a new token and invalidates the old one. */
+  /**
+   * Issues a new token and invalidates the old one.
+   *
+   * PUT .../token, not POST .../rotate. The server cannot register the latter:
+   * it is ambiguous against the legacy delivery route, because
+   * "/api/v1/webhooks/incoming/rotate" matches both patterns and neither is
+   * more specific, which makes ServeMux panic at registration.
+   *
+   * This client called the route that does not exist, so rotation 404'd — and
+   * rotation is the ONLY remedy for a leaked webhook token. Neither tsc nor
+   * the Go compiler can see across this seam; a test now does.
+   */
   rotate(webhookId: string) {
-    return api.post<WebhookCredential>(`/webhooks/${webhookId}/rotate`)
+    return api.put<WebhookCredential>(`/webhooks/${webhookId}/token`)
   },
   remove(webhookId: string) {
     return api.del<{ message: string }>(`/webhooks/${webhookId}`)

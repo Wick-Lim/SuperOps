@@ -720,9 +720,18 @@ func TestTheWorkflowAPIIsReachableAndAdminGated(t *testing.T) {
 		t.Fatal("the catalogue is empty, so a client has nothing to offer")
 	}
 
-	// A non-admin may READ but not create.
+	// A non-admin reaches NOTHING — not the list, not a definition, not a run.
+	//
+	// Read used to be workspace CapRead while write was admin. A workflow's
+	// step configs and its runs' step outputs come back verbatim, so that split
+	// handed every member and guest the ids of private channels, the user ids
+	// of notify targets and the literal bodies automation posts into them.
+	// Automation is one surface; describing what a workflow will do is
+	// describing an administrator's standing decision.
 	member := h.newUser(t, admin, ws, "wf-member")
-	h.req(t, http.StatusOK, http.MethodGet, "/api/v1/workspaces/"+ws+"/workflows", member.token, nil)
+	if code, _ := h.do(t, http.MethodGet, "/api/v1/workspaces/"+ws+"/workflows", member.token, nil); code != http.StatusNotFound {
+		t.Fatalf("a non-admin listing workflows = %d, want 404", code)
+	}
 	code, _ := h.do(t, http.MethodPost, "/api/v1/workspaces/"+ws+"/workflows", member.token, body)
 	if code != http.StatusForbidden {
 		t.Fatalf("a non-admin creating a workflow = %d, want 403", code)
@@ -1197,4 +1206,60 @@ func TestEditingAWorkflowMovesOwnershipToTheEditor(t *testing.T) {
 		t.Fatalf("%d messages reached a private channel the editor cannot write to",
 			poster.count())
 	}
+}
+
+// AUTOMATION IS AN ADMIN SURFACE ON BOTH SIDES.
+//
+// Reading a workflow used to need workspace CapRead, which RoleGuest holds,
+// while writing needed admin. So the least privileged role in the tenant read
+// step configs and run outputs verbatim: the ids of private channels, the user
+// ids of notify targets, and the literal message bodies automation posts into
+// them — all of it writable only by an admin and readable by hand only by
+// somebody in the channel.
+func TestAGuestCannotReadWorkflowsOrTheirRuns(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := wfRepo(t)
+	ctx := context.Background()
+
+	guest := h.newGuest(t, admin, ws, "wf-peeper")
+	member := h.newUser(t, admin, ws, "wf-member")
+	private := h.createTypedChannel(t, admin, ws, uniqueSlug("wf-secret"), "private")
+	secret := fmt.Sprintf("SECRET-BODY-%d", time.Now().UnixNano())
+
+	wf, err := repo.Save(ctx, ws, "", fmt.Sprintf("peek-%d", time.Now().UnixNano()), "",
+		[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{
+			"channel_id": private, "body": secret,
+		}}},
+		[]workflow.Trigger{{EventType: "wf.test.peek"}}, true, me)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The guest cannot read the private channel by hand...
+	h.req(t, http.StatusForbidden, http.MethodGet,
+		"/api/v1/channels/"+private+"/messages", guest.token, nil)
+
+	// ...and must not read it through the workflow either. 404-shaped, so the
+	// refusal does not confirm the workflow exists.
+	for _, path := range []string{
+		"/api/v1/workflows/" + wf.ID,
+		"/api/v1/workflows/" + wf.ID + "/runs",
+		"/api/v1/workspaces/" + ws + "/workflows",
+	} {
+		for who, tok := range map[string]string{"guest": guest.token, "member": member.token} {
+			code, body := h.do(t, http.MethodGet, path, tok, nil)
+			if code == http.StatusOK {
+				t.Errorf("%s read %s (200); step configs and run outputs are admin-only", who, path)
+			}
+			if raw, err := json.Marshal(body); err == nil && strings.Contains(string(raw), secret) {
+				t.Errorf("%s read the literal body a workflow posts into a private channel", who)
+			}
+		}
+	}
+
+	// The admin still can, or this would be a regression rather than a fix.
+	h.req(t, http.StatusOK, http.MethodGet, "/api/v1/workflows/"+wf.ID, admin, nil)
 }

@@ -59,6 +59,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/push"
 	"github.com/Wick-Lim/SuperOps/backend/internal/rtc"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
+	"github.com/Wick-Lim/SuperOps/backend/internal/sso"
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/internal/thumb"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
@@ -444,7 +445,7 @@ func run() int {
 
 	authRepo := auth.NewRepository(pool)
 	start(jobSessionCleanup, sessionCleanupInterval, sessionCleanupInterval, func(c context.Context) error {
-		return sessionCleanup(c, pool, authRepo, l)
+		return sessionCleanup(c, pool, authRepo, sso.NewRepository(pool), l)
 	})
 
 	messageRepo := message.NewRepository(pool)
@@ -1176,7 +1177,17 @@ func withSingletonLock(ctx context.Context, pool *pgxpool.Pool, key int64, fn fu
 // It calls auth.Repository.CleanExpiredSessions rather than inlining the DELETE:
 // the repository owns the sessions table, and the inline copy also discarded its
 // error, so a failing cleanup was indistinguishable from a clean one.
-func sessionCleanup(ctx context.Context, pool *pgxpool.Pool, repo *auth.Repository, l *slog.Logger) error {
+// sessionCleanup expires everything that was started and never finished.
+//
+// It carries the SSO half too, because both of those functions documented "the
+// background worker runs this on a timer" while nothing called either. The
+// tables grew without bound, holding abandoned sign-in state — including
+// pending logins — indefinitely. They share this job rather than getting their
+// own because they share its reason, its cadence and its lock; two jobs on one
+// advisory key would silently serialise, and a second key for three DELETEs
+// that always run together is bookkeeping with no benefit.
+func sessionCleanup(ctx context.Context, pool *pgxpool.Pool, repo *auth.Repository,
+	ssoRepo *sso.Repository, l *slog.Logger) error {
 	ran, err := withSingletonLock(ctx, pool, lockSessionCleanup, func(ctx context.Context) error {
 		n, err := repo.CleanExpiredSessions(ctx)
 		if err != nil {
@@ -1193,6 +1204,23 @@ func sessionCleanup(ctx context.Context, pool *pgxpool.Pool, repo *auth.Reposito
 		}
 		if tag.RowsAffected() > 0 {
 			l.Info("expired stale invitations", "count", tag.RowsAffected())
+		}
+
+		if ssoRepo != nil {
+			n, err := ssoRepo.CleanExpiredAuthRequests(ctx)
+			if err != nil {
+				return err
+			}
+			if n > 0 {
+				l.Info("cleaned expired SSO auth requests", "count", n)
+			}
+			n, err = ssoRepo.CleanExpiredPendingLogins(ctx)
+			if err != nil {
+				return err
+			}
+			if n > 0 {
+				l.Info("cleaned expired SSO pending logins", "count", n)
+			}
 		}
 		return nil
 	})
