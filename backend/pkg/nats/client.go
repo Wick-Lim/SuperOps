@@ -103,3 +103,17 @@ func (c *Client) Close() {
 		c.logger.Warn("NATS drain incomplete", "error", err)
 	}
 }
+
+// HeaderStreamSequence carries a JetStream message's stream sequence to a
+// handler.
+//
+// It exists because cmd/worker converts a jetstream.Msg into a *nats.Msg before
+// invoking a handler, and that conversion loses the metadata: nats.Msg.Metadata
+// parses the reply subject, which the converted message does not have. A
+// handler that needs a STABLE IDENTITY for a message — one that is the same on
+// every redelivery — has no other source for it.
+//
+// The stream sequence is the right identity for that job: unique within the
+// stream, assigned by the server, and unchanged by redelivery. A publisher's
+// Nats-Msg-Id would serve for durable publishes and is absent for core ones.
+const HeaderStreamSequence = "Superops-Stream-Seq"

@@ -45,6 +45,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/auth"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/channel"
+	"github.com/Wick-Lim/SuperOps/backend/internal/comment"
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive"
 	"github.com/Wick-Lim/SuperOps/backend/internal/drive/registry"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
@@ -59,6 +60,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/internal/thumb"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
+	"github.com/Wick-Lim/SuperOps/backend/internal/workflow"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/logger"
 	natspkg "github.com/Wick-Lim/SuperOps/backend/pkg/nats"
@@ -77,6 +79,8 @@ const (
 	jobAuditVerify     = "audit_verify"
 	jobDriveTrash      = "drive_trash_purge"
 	jobHuddleReconcile = "huddle_reconcile"
+	jobWorkflowStep    = "workflow_step"
+	jobWorkflowReaper  = "workflow_reaper"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -114,6 +118,19 @@ const (
 	huddleReconcileInterval   = 30 * time.Second
 	huddleReconcileStartDelay = 45 * time.Second
 	huddleReconcileGrace      = 60 * time.Second
+	// Workflows. The step loop is fast because ClaimRun is a single indexed
+	// SKIP LOCKED query that returns immediately when the queue is empty.
+	workflowStepInterval   = 2 * time.Second
+	workflowStepStartDelay = 5 * time.Second
+	workflowReaperInterval = 60 * time.Second
+	workflowReaperDelay    = 90 * time.Second
+	// A run claimed and untouched for this long belongs to a worker that died.
+	// Longer than any legitimate run: the steps are chat posts and inbox
+	// publishes, not long computations.
+	workflowRunStale = 5 * time.Minute
+	// One claim loop drains at most this many runs before yielding, so a large
+	// backlog cannot starve the other job loops on this replica.
+	workflowStepBatch = 50
 )
 
 // Advisory-lock keys. Distinct 64-bit constants; any other application taking
@@ -136,6 +153,14 @@ const (
 	// leaves a huddle live forever, and the partial unique index then blocks
 	// every future call on that channel.
 	lockHuddleReconcile int64 = 0x50_000A
+	// The workflow reaper. It is the only thing that releases a run whose
+	// worker died mid-execution; without it that run is stuck 'running'
+	// forever and nothing else would ever notice.
+	//
+	// The STEP loop deliberately takes no lock — it is FOR UPDATE SKIP LOCKED,
+	// so several workers share the queue. A lock there would serialize every
+	// workflow in the deployment behind one replica.
+	lockWorkflowReaper int64 = 0x50_000B
 )
 
 // aclDriftSamples bounds how many concrete disagreements one drift report
@@ -315,6 +340,27 @@ func run() int {
 	unreadFanout := channel.NewUnreadFanout(channel.NewRepository(pool), natsClient, l)
 	bind(durableSpec{durable: "unread-fanout", filter: "superops.*.message.*", handle: unreadFanout.HandleMessage})
 
+	// ---------------------------------------------------------------------
+	// Workflows
+	// ---------------------------------------------------------------------
+	//
+	// BOUND UNCONDITIONALLY, like the mailer and unlike anything lazy. The
+	// stream is InterestPolicy: a message is retained only while some consumer
+	// has interest in its subject, so a trigger consumer that appeared only
+	// once the first workflow was saved would miss every event published before
+	// that moment — including the ones that happened while somebody was in the
+	// middle of writing the workflow.
+	//
+	// The filter is an explicit ALLOWLIST rather than superops.>, for the same
+	// reason: a wildcard would create interest in every subject and start
+	// persisting presence and typing traffic to disk.
+	workflowRepo := workflow.NewRepository(pool)
+	bind(durableSpec{
+		durable: "workflow-trigger",
+		filters: workflow.TriggerSubjects,
+		handle:  workflow.NewTriggerConsumer(workflowRepo, l).Handle,
+	})
+
 	// Outbound mail. The API renders a message and publishes it durably; this
 	// consumer is what actually talks to a relay, so a provider outage becomes
 	// redelivery here instead of a failed HTTP request there.
@@ -454,6 +500,48 @@ func run() int {
 			return runObjectGC(c, pool, fileRepo, store, l)
 		})
 	}
+
+	// The step engine. NOT a durable consumer and NOT under a singleton lock:
+	// ClaimRun is FOR UPDATE SKIP LOCKED, so every replica drains the same
+	// queue and each takes a different row — the shape promoteScheduled uses.
+	// A lock here would serialize every workflow in the deployment behind one
+	// worker.
+	//
+	// The actions are constructed with REAL implementations. An executor built
+	// without them fails every run at its first step, which is the correct
+	// fail-closed reading: a workflow that cannot perform its steps has not
+	// succeeded, and reporting green would make the run list a wall of lies.
+	workflowExec := workflow.NewExecutor(workflowRepo, l,
+		workflow.NewMessageAction(az, message.NewWorkflowPoster(pool, natsClient, l)),
+		workflow.NewNotifyProductionAction(az, pool, workflow.NATSInbox{Client: natsClient}),
+		workflow.NewCommentAction(az, comment.NewRepository(pool, az)),
+	)
+	start(jobWorkflowStep, workflowStepStartDelay, workflowStepInterval, func(c context.Context) error {
+		return drainWorkflowRuns(c, workflowRepo, workflowExec, l)
+	})
+
+	// The reaper. A worker killed mid-run leaves its row 'running' forever;
+	// retrying is safe precisely because of the effects table, so the only
+	// thing needed is somebody to notice.
+	start(jobWorkflowReaper, workflowReaperDelay, workflowReaperInterval, func(c context.Context) error {
+		ran, err := withSingletonLock(c, pool, lockWorkflowReaper, func(c context.Context) error {
+			n, err := workflowRepo.ReleaseStaleRuns(c, workflowRunStale)
+			if err != nil {
+				return err
+			}
+			if n > 0 {
+				l.Warn("released workflow runs whose worker never finished them", "count", n)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if !ran {
+			l.Debug("workflow reaper skipped: another replica holds the lock")
+		}
+		return nil
+	})
 
 	// The huddle reconciler. It exists because at-least-once webhook delivery
 	// prevents duplicates and not LOSSES: a room_finished that never arrived
@@ -666,6 +754,16 @@ func buildPush(
 type durableSpec struct {
 	durable string
 	filter  string
+	// filters is an ALLOWLIST of subjects, for a consumer that needs several
+	// but not all of them. It exists because the stream is InterestPolicy: a
+	// consumer bound to `superops.>` creates interest in every subject, so
+	// every presence transition and typing indicator would start being
+	// persisted to disk for it. Only one consumer needs this — the workflow
+	// trigger — and giving it a wildcard would quietly turn an ephemeral
+	// firehose into a durable one.
+	//
+	// Exactly one of filter and filters is set.
+	filters []string
 	handle  func(context.Context, *nats.Msg) error
 }
 
@@ -731,7 +829,7 @@ func bindDurable(
 		return nil, fmt.Errorf("open stream %s: %w", app.EventStreamName, err)
 	}
 
-	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+	cfg := jetstream.ConsumerConfig{
 		Durable:       spec.durable,
 		FilterSubject: spec.filter,
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -740,7 +838,15 @@ func bindDurable(
 		MaxDeliver:    consumerMaxDeliver,
 		BackOff:       consumerBackOff,
 		MaxAckPending: consumerMaxPending,
-	})
+	}
+	if len(spec.filters) > 0 {
+		// FilterSubject and FilterSubjects are mutually exclusive in the
+		// JetStream API; setting both is an error rather than a union.
+		cfg.FilterSubject = ""
+		cfg.FilterSubjects = spec.filters
+	}
+
+	consumer, err := stream.CreateOrUpdateConsumer(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create consumer %s: %w", spec.durable, err)
 	}
@@ -809,10 +915,30 @@ func invokeHandler(ctx context.Context, l *slog.Logger, spec durableSpec, msg je
 		}
 	}()
 
+	// The JetStream metadata is carried across as a HEADER because the
+	// conversion to *nats.Msg drops it: nats.Msg.Metadata() parses the reply
+	// subject, and this message has none, so a handler calling it gets an
+	// error rather than the stream sequence.
+	//
+	// The workflow trigger consumer needs that sequence as its idempotency key.
+	// It is the only thing that identifies a message stably across
+	// redeliveries — a generated id would differ on every retry, and every
+	// retry would start another run of the same workflow. Losing it silently
+	// made the consumer refuse to enqueue anything at all, which is how this
+	// was found: the worker booted, replayed the stream, and logged the refusal
+	// once per event.
+	header := nats.Header(msg.Headers())
+	if header == nil {
+		header = nats.Header{}
+	}
+	if md, mdErr := msg.Metadata(); mdErr == nil && md != nil {
+		header.Set(natspkg.HeaderStreamSequence, strconv.FormatUint(md.Sequence.Stream, 10))
+	}
+
 	return spec.handle(ctx, &nats.Msg{
 		Subject: msg.Subject(),
 		Data:    msg.Data(),
-		Header:  nats.Header(msg.Headers()),
+		Header:  header,
 	})
 }
 
@@ -1748,6 +1874,34 @@ func reconcileHuddles(ctx context.Context, repo *huddle.Repository, media rtc.Pr
 	}
 	if ended > 0 || repaired > 0 {
 		l.Info("huddles reconciled", "ended", ended, "rosters_repaired", repaired, "checked", len(live))
+	}
+	return nil
+}
+
+// drainWorkflowRuns claims and executes pending runs until the queue is empty.
+//
+// Bounded per tick so a large backlog cannot starve the other job loops on this
+// replica — the next tick picks up where this one stopped, and because claiming
+// is SKIP LOCKED the other replicas are draining it at the same time.
+func drainWorkflowRuns(ctx context.Context, repo *workflow.Repository,
+	exec *workflow.Executor, l *slog.Logger) error {
+
+	for i := 0; i < workflowStepBatch; i++ {
+		run, steps, err := repo.ClaimRun(ctx)
+		if errors.Is(err, workflow.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("claim workflow run: %w", err)
+		}
+		// Executor.Run records the failure on the run and returns nil for
+		// anything that is the workflow's fault. A non-nil error here is
+		// infrastructure, and returning it puts the job loop's last_error into
+		// /health where an operator can see it.
+		if err := exec.Run(ctx, run, steps); err != nil {
+			return fmt.Errorf("execute workflow run %s: %w", run.ID, err)
+		}
+		l.Debug("workflow run executed", "run_id", run.ID, "workflow_id", run.WorkflowID)
 	}
 	return nil
 }

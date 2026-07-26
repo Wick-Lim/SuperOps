@@ -45,6 +45,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/internal/webhook"
+	"github.com/Wick-Lim/SuperOps/backend/internal/workflow"
 	"github.com/Wick-Lim/SuperOps/backend/internal/workspace"
 	"github.com/Wick-Lim/SuperOps/backend/internal/ws"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
@@ -363,6 +364,11 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	}
 	huddleHandler := huddle.NewHandler(pool, az, media, ice, hub, auditService,
 		cfg.RTC.WebhookSecret, logger)
+	// Automation. The API is the authoring surface; cmd/worker owns the trigger
+	// consumer and the step engine, so an API replica running without a worker
+	// accepts workflows and runs none — which is visible in the run history
+	// rather than silent.
+	workflowHandler := workflow.NewHandler(pool, az, auditService, logger)
 
 	driveRepo := drive.NewRepository(pool, az, driveKinds)
 	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService,
@@ -601,6 +607,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// cannot saturate the API.
 	mailboxHandler.RegisterIngestRoutes(mux, func(next http.Handler) http.Handler { return next })
 	huddleHandler.RegisterRoutes(mux, authMw)
+	workflowHandler.RegisterRoutes(mux, authMw)
 	// The webhook is authenticated by signature rather than by session, and it
 	// is rate-limited by IP: a media server that started retrying in a loop
 	// must not be able to saturate the API.

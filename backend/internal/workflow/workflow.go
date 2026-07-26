@@ -75,6 +75,7 @@ type Step struct {
 type Workflow struct {
 	ID          string     `json:"id"`
 	WorkspaceID string     `json:"workspace_id"`
+	OwnerID     string     `json:"owner_id"`
 	Name        string     `json:"name"`
 	Description string     `json:"description"`
 	Enabled     bool       `json:"enabled"`
@@ -91,8 +92,12 @@ type Trigger struct {
 }
 
 type Run struct {
-	ID          string     `json:"id"`
-	WorkflowID  string     `json:"workflow_id"`
+	ID         string `json:"id"`
+	WorkflowID string `json:"workflow_id"`
+	// OwnerID is WHO THE RUN ACTS AS, and every action authorizes against it.
+	// A run with no owner must not execute: an action with only a workspace id
+	// has no authority to check, so it would reach every object in the tenant.
+	OwnerID     string     `json:"owner_id"`
 	WorkspaceID string     `json:"workspace_id"`
 	EventType   string     `json:"event_type"`
 	TriggerKey  string     `json:"trigger_key"`
@@ -141,11 +146,12 @@ func (r *Repository) Save(ctx context.Context, workspaceID, id, name, descriptio
 	err = database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
 		if id == "" {
 			err := tx.QueryRow(ctx, `
-				INSERT INTO workflows (workspace_id, name, description, enabled, created_by)
-				VALUES ($1, $2, $3, $4, $5)
-				RETURNING id::text, workspace_id::text, name, description, enabled, created_at, archived_at`,
+				INSERT INTO workflows (workspace_id, name, description, enabled, created_by, owner_id)
+				VALUES ($1, $2, $3, $4, $5, $5)
+				RETURNING id::text, workspace_id::text, owner_id::text, name, description, enabled,
+				          created_at, archived_at`,
 				workspaceID, name, description, enabled, actorID,
-			).Scan(&wf.ID, &wf.WorkspaceID, &wf.Name, &wf.Description, &wf.Enabled,
+			).Scan(&wf.ID, &wf.WorkspaceID, &wf.OwnerID, &wf.Name, &wf.Description, &wf.Enabled,
 				&wf.CreatedAt, &wf.ArchivedAt)
 			if err != nil {
 				return fmt.Errorf("insert workflow: %w", err)
@@ -154,9 +160,10 @@ func (r *Repository) Save(ctx context.Context, workspaceID, id, name, descriptio
 			err := tx.QueryRow(ctx, `
 				UPDATE workflows SET name = $3, description = $4, enabled = $5, updated_at = NOW()
 				 WHERE id = $1 AND workspace_id = $2 AND archived_at IS NULL
-				RETURNING id::text, workspace_id::text, name, description, enabled, created_at, archived_at`,
+				RETURNING id::text, workspace_id::text, owner_id::text, name, description, enabled,
+				          created_at, archived_at`,
 				id, workspaceID, name, description, enabled,
-			).Scan(&wf.ID, &wf.WorkspaceID, &wf.Name, &wf.Description, &wf.Enabled,
+			).Scan(&wf.ID, &wf.WorkspaceID, &wf.OwnerID, &wf.Name, &wf.Description, &wf.Enabled,
 				&wf.CreatedAt, &wf.ArchivedAt)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrNotFound
@@ -209,9 +216,13 @@ func (r *Repository) Save(ctx context.Context, workspaceID, id, name, descriptio
 type Matching struct {
 	WorkflowID  string
 	WorkspaceID string
-	VersionID   string
-	Steps       []Step
-	Filter      map[string]any
+	// OwnerID is carried from the match so the run records who it acts as at
+	// the moment it is queued — not who owns the workflow when it executes,
+	// which may be somebody else by then.
+	OwnerID   string
+	VersionID string
+	Steps     []Step
+	Filter    map[string]any
 }
 
 // MatchingWorkflows finds the enabled workflows triggered by an event.
@@ -221,7 +232,7 @@ type Matching struct {
 // that existed when the run was created — not a half-saved one.
 func (r *Repository) MatchingWorkflows(ctx context.Context, workspaceID, eventType string) ([]Matching, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT w.id::text, w.workspace_id::text, v.id::text, v.steps, t.filter
+		SELECT w.id::text, w.workspace_id::text, w.owner_id::text, v.id::text, v.steps, t.filter
 		  FROM workflow_triggers t
 		  JOIN workflows w ON w.id = t.workflow_id
 		  JOIN LATERAL (
@@ -241,7 +252,8 @@ func (r *Repository) MatchingWorkflows(ctx context.Context, workspaceID, eventTy
 	for rows.Next() {
 		var m Matching
 		var stepsJSON, filterJSON []byte
-		if err := rows.Scan(&m.WorkflowID, &m.WorkspaceID, &m.VersionID, &stepsJSON, &filterJSON); err != nil {
+		if err := rows.Scan(&m.WorkflowID, &m.WorkspaceID, &m.OwnerID, &m.VersionID,
+			&stepsJSON, &filterJSON); err != nil {
 			return nil, fmt.Errorf("scan matching workflow: %w", err)
 		}
 		if err := json.Unmarshal(stepsJSON, &m.Steps); err != nil {
@@ -325,10 +337,11 @@ func (r *Repository) ClaimRun(ctx context.Context) (*Run, []Step, error) {
 			 WHERE r.id = claimed.id AND v.id = r.version_id
 			RETURNING r.id::text, r.workflow_id::text, r.workspace_id::text, r.event_type,
 			          r.trigger_key, r.status, r.error, r.payload, r.started_at, r.finished_at,
-			          r.created_at, v.steps`,
+			          r.created_at, v.steps,
+			          (SELECT w.owner_id::text FROM workflows w WHERE w.id = r.workflow_id)`,
 		).Scan(&run.ID, &run.WorkflowID, &run.WorkspaceID, &run.EventType, &run.TriggerKey,
 			&run.Status, &run.Error, &run.Payload, &run.StartedAt, &run.FinishedAt,
-			&run.CreatedAt, &stepsJSON)
+			&run.CreatedAt, &stepsJSON, &run.OwnerID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}

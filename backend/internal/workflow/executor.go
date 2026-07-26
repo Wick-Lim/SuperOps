@@ -15,8 +15,16 @@ import (
 // is REJECTED at save time rather than failing at run time.
 type Action interface {
 	Kind() string
-	// Perform runs the effect. Its error is the run's error; a nil error with
-	// a result is a success worth recording.
+	// Perform runs the effect.
+	//
+	// It MUST authorize against run.OwnerID before doing anything. The rule the
+	// whole engine rests on is "you cannot automate what you could not do by
+	// hand": a workflow is a saved intention, not a privilege escalation, and
+	// an action that skipped this would let anybody who can save a workflow
+	// post into every private channel in the tenant.
+	//
+	// Its error is the run's error; a nil error with a result is a success
+	// worth recording.
 	Perform(ctx context.Context, run *Run, config map[string]any) (any, error)
 }
 
@@ -49,6 +57,16 @@ func NewExecutor(repo *Repository, logger *slog.Logger, actions ...Action) *Exec
 // the steps that already ran, which is what makes the worker free to nak
 // whenever it is unsure.
 func (e *Executor) Run(ctx context.Context, run *Run, steps []Step) error {
+	// A RUN WITH NO OWNER MUST NOT EXECUTE. Every action authorizes against the
+	// owner, so an ownerless run is one whose steps have no authority to check
+	// and would reach every object in the tenant. Failing it is the fail-closed
+	// reading; skipping the check is the authorization bypass.
+	if run.OwnerID == "" {
+		_ = e.repo.FinishRun(ctx, run.ID, "failed",
+			"this run has no owner, so no step can be authorized")
+		return nil
+	}
+
 	payload := map[string]any{}
 	if len(run.Payload) > 0 {
 		if err := json.Unmarshal(run.Payload, &payload); err != nil {
@@ -63,13 +81,19 @@ func (e *Executor) Run(ctx context.Context, run *Run, steps []Step) error {
 	for i, step := range steps {
 		action, ok := e.actions[step.Kind]
 		if !ok {
-			// A step whose action this deployment does not have. Recorded as
-			// skipped rather than failed: the workflow is not wrong, this
-			// deployment simply cannot do it, and failing the run would hide
-			// the steps that CAN run.
-			_ = e.repo.FinishStep(ctx, run.ID, i, step.Kind, "skipped",
-				"no action registered for this step kind", nil)
-			continue
+			// A step whose action this deployment does not have. FAILS the run.
+			//
+			// It used to be recorded 'skipped' with the run still finishing
+			// 'succeeded', which is the worst available answer: an executor
+			// built with no adapters would report every run a success having
+			// done nothing at all, and the run list — the only place anybody
+			// looks — would be a wall of green. A workflow that cannot perform
+			// its steps has not succeeded.
+			_ = e.repo.FinishStep(ctx, run.ID, i, step.Kind, "failed",
+				"this deployment has no action for step kind "+step.Kind, nil)
+			_ = e.repo.FinishRun(ctx, run.ID, "failed",
+				fmt.Sprintf("step %d: no action registered for kind %q", i, step.Kind))
+			return nil
 		}
 
 		fresh, err := e.repo.ClaimEffect(ctx, run.ID, i, step.Kind)
