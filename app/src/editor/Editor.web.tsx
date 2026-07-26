@@ -6,6 +6,10 @@ import CollaborationCaret from '@tiptap/extension-collaboration-caret'
 import type * as Y from 'yjs'
 import type { Awareness } from 'y-protocols/awareness'
 import { extract, type Projection } from './projection'
+import { Mention, DriveEmbed, IssueEmbed } from './extensions/refs'
+import { RefLabels } from './extensions/refViews'
+import { RefResolver } from './refResolver'
+import { MentionSuggestion } from './extensions/mentionSuggestion'
 
 /**
  * The block editor, web only.
@@ -31,6 +35,9 @@ import { extract, type Projection } from './projection'
 export interface EditorProps {
   doc: Y.Doc
   awareness: Awareness
+  /** The Drive object, for resolving reference labels against THIS document —
+   * the resolve endpoint authorizes on the document as well as the target. */
+  fileId?: string
   editable: boolean
   user: { name: string; color: string }
   /** Called when the document settles, with the projection to publish. */
@@ -49,7 +56,12 @@ export interface EditorProps {
  */
 const PROJECT_DEBOUNCE_MS = 2000
 
-export default function Editor({ doc, awareness, editable, user, onProject, seq }: EditorProps) {
+export default function Editor({ doc, awareness, editable, user, onProject, seq, fileId }: EditorProps) {
+  // One resolver per open document. Thrown away with the editor, which is what
+  // keeps its cache scoped to the file it was authorized against — a global one
+  // would let a name learned through a document you may read leak into one you
+  // may not.
+  const resolver = useMemo(() => new RefResolver(fileId ?? ''), [fileId])
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const seqRef = useRef(seq)
   seqRef.current = seq
@@ -62,8 +74,16 @@ export default function Editor({ doc, awareness, editable, user, onProject, seq 
       }),
       Collaboration.configure({ document: doc }),
       CollaborationCaret.configure({ provider: { awareness }, user }),
+      // References. The nodes carry {refType, refId} and nothing else; the
+      // label is painted per caller as a decoration, so it never enters the
+      // document, the CRDT, the projection, or a copy-paste.
+      Mention,
+      DriveEmbed,
+      IssueEmbed,
+      RefLabels(resolver),
+      MentionSuggestion,
     ],
-    [doc, awareness, user],
+    [doc, awareness, user, resolver],
   )
 
   const editor = useEditor(

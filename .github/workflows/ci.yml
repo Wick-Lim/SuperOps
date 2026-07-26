@@ -341,9 +341,38 @@ jobs:
             || { echo "::error::the iOS bundle has no document renderer at all"; exit 1; }
           echo "editor is web-only, renderer is native-only"
 
+      # A GATE THAT CANNOT RUN IS NOT A GATE THAT PASSED.
+      #
+      # `npm audit` posts to registry.npmjs.org's `security/audits/quick`
+      # endpoint, which npm is retiring — it now answers 400 "Invalid package
+      # tree" for trees that are demonstrably fine (`npm ci` clean, no unmet
+      # peers, every lock entry resolved). Verified by running it against an
+      # older commit whose audit was green: that fails too, so it is the
+      # service, not this repository.
+      #
+      # Both outcomes are RED, and the step says which. Reporting an
+      # unreachable advisory service as a pass is how a security gate quietly
+      # stops being one; reporting it as "vulnerabilities found" sends somebody
+      # hunting for a package that is not there. The fix when this fires is an
+      # npm upgrade to a version that uses the bulk advisory endpoint, not a
+      # change here.
       - name: Audit runtime dependencies
         working-directory: app
-        run: npm audit --omit=dev --audit-level=critical
+        run: |
+          set +e
+          out=$(npm audit --omit=dev --audit-level=critical 2>&1)
+          code=$?
+          echo "$out"
+          if [ $code -eq 0 ]; then
+            echo "no critical advisories"
+            exit 0
+          fi
+          if echo "$out" | grep -q 'audit endpoint returned an error'; then
+            echo "::error::the dependency audit could NOT RUN — npm's advisory endpoint refused the request. This is not a vulnerability finding, and it is not a reason to merge: fix the tooling (npm version) or the gate is decorative."
+            exit 1
+          fi
+          echo "::error::critical advisories in runtime dependencies"
+          exit 1
 
   dependency-review:
     if: github.event_name == 'pull_request'

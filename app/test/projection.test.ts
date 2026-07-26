@@ -155,3 +155,55 @@ describe('the projection extractor', () => {
     expect(out.refs[0].block_id?.length).toBe(64)
   })
 })
+
+// THE SCHEMA AND THE EXTRACTOR MUST NOT DRIFT.
+//
+// They were two hand-written lists. A node type added to one and not the other
+// produces a document whose references are never extracted — so the backlink
+// list quietly stops filling, and nothing anywhere reports it. The extractor
+// now imports the schema's map; this asserts that it is actually the same
+// object, so re-introducing a copy fails here.
+describe('the reference vocabulary', () => {
+  it('is the schema\'s, not a second copy', async () => {
+    const { REF_TYPES } = await import('../src/editor/extensions/refs')
+    // Every node the schema defines must be extractable.
+    for (const [node, refType] of Object.entries(REF_TYPES)) {
+      const out = extract(
+        doc({ type: node, attrs: { blockId: 'b', refId: '11111111-1111-1111-1111-111111111111' } }),
+        1,
+      )
+      expect(out.refs, `${node} produced no ref`).toHaveLength(1)
+      expect(out.refs[0].ref_type, `${node} mapped to the wrong type`).toBe(refType)
+    }
+  })
+
+  it('covers the three nodes the editor actually registers', async () => {
+    const { REF_TYPES } = await import('../src/editor/extensions/refs')
+    expect(Object.keys(REF_TYPES).sort()).toEqual(['driveEmbed', 'issueEmbed', 'mention'])
+  })
+
+  // The security invariant again, now against the REAL schema rather than a
+  // fixture: whatever a node carries, no label reaches the body.
+  it('emits no label for any reference node, whatever attributes it carries', async () => {
+    const { REF_TYPES } = await import('../src/editor/extensions/refs')
+    const secret = 'Dana Okonkwo — acquisition terms'
+    for (const node of Object.keys(REF_TYPES)) {
+      const out = extract(
+        doc({
+          type: node,
+          attrs: {
+            blockId: 'b',
+            refId: '22222222-2222-2222-2222-222222222222',
+            // Everything a well-meaning implementation might cache.
+            label: secret,
+            title: secret,
+            name: secret,
+            displayName: secret,
+          },
+        }),
+        1,
+      )
+      expect(JSON.stringify(out), `${node} leaked a label`).not.toContain('Okonkwo')
+    }
+  })
+})

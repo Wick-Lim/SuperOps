@@ -25,6 +25,7 @@
     "@tiptap/pm": "^3.29.0",
     "@tiptap/react": "^3.29.0",
     "@tiptap/starter-kit": "^3.29.0",
+    "@tiptap/suggestion": "^3.29.0",
     "expo": "~55.0.8",
     "expo-clipboard": "~55.0.15",
     "expo-crypto": "~55.0.17",

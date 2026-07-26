@@ -23,6 +23,11 @@ import type { Projection } from './projection'
 export interface EditorProps {
   doc: Y.Doc
   awareness: Awareness
+  /** The Drive object, for resolving reference labels against THIS document.
+   * Unused on native — the read-only renderer shows a reference as its
+   * placeholder rather than resolving it, because resolving costs a request per
+   * open on a connection that may be a phone's. */
+  fileId?: string
   /** The server decides; a read-only surface is rendered, not failed on submit. */
   editable: boolean
   user: { name: string; color: string }

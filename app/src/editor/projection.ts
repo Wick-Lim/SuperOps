@@ -16,6 +16,8 @@
  * bare ids that the server resolves per caller.
  */
 
+import { REF_TYPES } from './extensions/refs'
+
 /** Bumped whenever a node type is added. The server refuses a projection from
  * a client older than the one that last wrote, because an old extractor
  * silently drops nodes it does not know and would write a lossy body. */
@@ -48,13 +50,15 @@ const MAX_BODY_BYTES = 1 << 20
 const MAX_OUTLINE = 500
 const MAX_REFS = 1000
 
-/** The node types that are references rather than text. */
-const EMBED_TYPES: Record<string, string> = {
-  driveEmbed: 'file',
-  docEmbed: 'file',
-  issueEmbed: 'issue',
-  mention: 'user',
-}
+/**
+ * The node types that are references rather than text.
+ *
+ * IMPORTED FROM THE SCHEMA rather than restated. A second list here would drift
+ * the moment somebody adds a node type, and the only symptom would be a
+ * backlink list that quietly stopped filling — a silent, undetectable
+ * regression in a feature nobody checks daily.
+ */
+const EMBED_TYPES: Record<string, string> = REF_TYPES
 
 /** A ProseMirror node, as JSON. Deliberately structural: the extractor walks
  * shape rather than importing the schema, so adding a mark cannot break it. */

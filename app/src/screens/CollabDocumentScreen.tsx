@@ -9,6 +9,7 @@ import { CollabProvider, type ProviderStatus } from '../lib/collab/provider'
 import { useAuthStore } from '../stores/authStore'
 import { ErrorState, LoadingState, ScreenHeader } from './internal/ui'
 import Editor from '../editor/Editor'
+import Backlinks from '../components/drive/Backlinks'
 import Grid from '../sheet/Grid'
 import Canvas from '../design/Canvas'
 import { SheetModel } from '../lib/sheet/model'
@@ -215,14 +216,22 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
               onEdit={scheduleProjection}
             />
           ) : (
-            <Editor
-              doc={doc}
-              awareness={providerRef.current!.awareness}
-              editable={status === 'synced'}
-              user={{ name: identity.name, color: identity.color }}
-              onProject={publish}
-              seq={seq}
-            />
+            <>
+              <Editor
+                doc={doc}
+                awareness={providerRef.current!.awareness}
+                editable={status === 'synced'}
+                user={{ name: identity.name, color: identity.color }}
+                onProject={publish}
+                seq={seq}
+                fileId={fileId}
+              />
+              {/* "Where is this used". Filtered by what the READER may see, so
+                  a document that mentions this one but is not shared with them
+                  does not appear — the panel must not become a way to discover
+                  documents. */}
+              {fileId ? <Backlinks refType="file" refId={fileId} navigation={navigation} /> : null}
+            </>
           )}
         </View>
       )}
