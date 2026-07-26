@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -365,19 +366,26 @@ func (r *Repository) purgeAfter() *time.Time {
 	return &t
 }
 
-func (r *Repository) TrashFolder(ctx context.Context, id, actorID string) error {
+// TrashFolder trashes a folder and its subtree, and RETURNS the files it
+// trashed so the caller can unindex them.
+//
+// Returning them is not a convenience. Only the single-file route published a
+// delete event, so a trashed folder left every document inside it fully
+// searchable — the listing lost them and the index did not.
+func (r *Repository) TrashFolder(ctx context.Context, id, actorID string) ([]FileRef, error) {
 	folder, err := r.Folder(ctx, id)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if folder == nil {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 	if folder.IsRoot {
-		return fmt.Errorf("%w: the Drive root cannot be trashed", errBadInput)
+		return nil, fmt.Errorf("%w: the Drive root cannot be trashed", errBadInput)
 	}
 
-	return database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+	var trashed []FileRef
+	err = database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
 		// The subtree is found through acl_object.path — the materialized path
 		// exists precisely so this is one prefix scan rather than a recursive
 		// walk of drive_folders.
@@ -400,16 +408,37 @@ func (r *Repository) TrashFolder(ctx context.Context, id, actorID string) error 
 			path, nullable(actorID), due); err != nil {
 			return fmt.Errorf("trash folder subtree: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
+		rows, err := tx.Query(ctx, `
 			UPDATE files SET trashed_at = NOW(), trashed_by = $2, updated_by = $2, purge_after = $3
 			 WHERE trashed_at IS NULL
 			   AND folder_id IN (SELECT object_id FROM acl_object
-			                      WHERE object_type = 'folder' AND path LIKE $1 || '%')`,
-			path, nullable(actorID), due); err != nil {
+			                      WHERE object_type = 'folder' AND path LIKE $1 || '%')
+			RETURNING id::text, file_type, workspace_id::text, trashed_at`,
+			path, nullable(actorID), due)
+		if err != nil {
 			return fmt.Errorf("trash folder contents: %w", err)
 		}
-		return nil
+		defer rows.Close()
+		trashed = trashed[:0]
+		for rows.Next() {
+			var (
+				f  FileRef
+				at time.Time
+			)
+			if err := rows.Scan(&f.ID, &f.FileType, &f.WorkspaceID, &at); err != nil {
+				return fmt.Errorf("scan trashed file: %w", err)
+			}
+			// The moment of THIS trashing, so trash → restore → trash is three
+			// distinct events rather than one the stream deduplicates.
+			f.Revision = "trash-" + strconv.FormatInt(at.UTC().UnixNano(), 10)
+			trashed = append(trashed, f)
+		}
+		return rows.Err()
 	})
+	if err != nil {
+		return nil, err
+	}
+	return trashed, nil
 }
 
 func (r *Repository) TrashFile(ctx context.Context, id, actorID string) error {

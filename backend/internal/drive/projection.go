@@ -383,7 +383,11 @@ func (h *Handler) PutProjection(w http.ResponseWriter, r *http.Request) {
 	// this avoids.
 	if applied {
 		if file, err := h.repo.File(r.Context(), fileID); err == nil {
-			h.events.PublishFile(r.Context(), ActionUpdated, file)
+			// Keyed on the projection seq, NOT on files.updated_at — this write
+			// does not touch the files row, so every projection inside the
+			// stream's two-minute duplicate window used to collapse onto the
+			// first one and vanish.
+			h.events.PublishFileProjection(r.Context(), file, status.ProjectionSeq)
 		}
 	}
 

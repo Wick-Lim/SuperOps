@@ -33,10 +33,16 @@ type projectionResult struct {
 // descriptor.
 func (h *harness) newDocument(t *testing.T, token, workspaceID, name string) driveDescriptor {
 	t.Helper()
-	root := h.driveRoot(t, token, workspaceID)
+	return h.newDocumentIn(t, token, workspaceID, h.driveRoot(t, token, workspaceID).ID, name)
+}
+
+// newDocumentIn is newDocument in a named folder, which is what any test about
+// subtree behaviour needs.
+func (h *harness) newDocumentIn(t *testing.T, token, workspaceID, folderID, name string) driveDescriptor {
+	t.Helper()
 	resp := h.req(t, http.StatusCreated, http.MethodPost,
 		"/api/v1/workspaces/"+workspaceID+"/drive/files", token,
-		map[string]string{"folder_id": root.ID, "name": name, "file_type": "document"})
+		map[string]string{"folder_id": folderID, "name": name, "file_type": "document"})
 	var d driveDescriptor
 	decodeInto(t, resp.Data, &d)
 	return d

@@ -55,7 +55,8 @@ type harness struct {
 	// through. The API never writes to the index — cmd/worker does, from the
 	// JetStream event stream — so a search test running without a worker has to
 	// index its own fixtures, exactly as the worker's indexer would. It is nil
-	// when search is disabled (which is how CI runs), and the search tests skip.
+	// only when Meilisearch is unreachable, which requireSearch treats as a
+	// failure wherever infrastructure is mandatory — CI runs a real one.
 	search *search.Service
 }
 
@@ -590,15 +591,29 @@ func uniqueSlug(prefix string) string {
 
 // --- search fixtures ---
 
-// requireSearch skips a test when search is not wired. CI deliberately runs
-// with MEILI_HOST="" (no Meilisearch service), which unregisters the route
-// entirely; asserting "the cross-tenant search returned nothing" against a
-// 404 would be a test that can never fail.
+// requireSearch fails a test when search is not wired, and skips only where
+// missing infrastructure is allowed to skip at all.
+//
+// The comment here used to say "CI deliberately runs with MEILI_HOST=”". That
+// has not been true since CI gained a real Meilisearch service
+// (.github/workflows/ci.yml), and it was the kind of stale note somebody
+// deciding whether a search path was covered would have believed. Left alone,
+// an unreachable Meilisearch would have turned every search assertion into a
+// skip — the exact failure this suite already had once, with a green job.
+//
+// requireInfra is the same switch every other dependency uses, so search is now
+// as load-bearing as Postgres: mandatory where it is mandatory, skippable only
+// on a developer machine that opted out.
 func (h *harness) requireSearch(t *testing.T) {
 	t.Helper()
-	if h.search == nil {
-		t.Skip("search disabled (MEILI_HOST unset or Meilisearch unreachable)")
+	if h.search != nil {
+		return
 	}
+	if requireInfra() {
+		t.Fatal("search is not wired: MEILI_HOST is unset or Meilisearch is unreachable. " +
+			"Skipping here would make every search assertion vacuous.")
+	}
+	t.Skip("search disabled (MEILI_HOST unset or Meilisearch unreachable)")
 }
 
 // indexMessage puts a message into the search index the way cmd/worker's

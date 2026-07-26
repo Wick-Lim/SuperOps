@@ -102,6 +102,13 @@ func (h *Handler) Restore(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	// Re-index what came back. The trash unindexed these; nothing else would
+	// ever put them back, so a restored document was permanently unsearchable.
+	for _, fid := range result.Restored {
+		if file, err := h.repo.File(ctx, fid); err == nil && file != nil {
+			h.events.PublishFile(ctx, ActionUpdated, file)
+		}
+	}
 	h.record(ctx, result.WorkspaceID, "drive."+objectType+"_restored", objectType, id,
 		map[string]interface{}{"relocated": result.Relocated})
 
@@ -141,6 +148,11 @@ func (h *Handler) EmptyTrash(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	// Unindex what was destroyed. This is the ONLY moment those ids still
+	// exist: cmd/reindex upserts from live rows and has no prune pass, so a
+	// purged document that is not unindexed here answers searches for its own
+	// title and body forever, with no operation able to remove it.
+	h.events.PublishFileDeletions(ctx, purged.Removed)
 	h.record(ctx, workspaceID, "drive.trash_emptied", "workspace", workspaceID,
 		map[string]interface{}{"files": purged.Files, "folders": purged.Folders,
 			"bytes_freed": purged.BytesFreed})
@@ -220,6 +232,13 @@ type RestoreResult struct {
 	ParentID    string
 	Relocated   bool
 	Note        string
+
+	// Restored names every file that came back, so the caller can re-index it.
+	//
+	// Restoring published nothing at all, so a restored object was fully usable
+	// and permanently unsearchable — the trash had unindexed it and no path put
+	// it back until somebody ran cmd/reindex by hand.
+	Restored []string
 }
 
 // Restore clears trashed_at on an object and its subtree.
@@ -310,6 +329,7 @@ func (r *Repository) Restore(ctx context.Context, objectType, id, actorID string
 				 WHERE id = $1`, id, target, nullable(actorID)); err != nil {
 				return fmt.Errorf("restore file: %w", err)
 			}
+			res.Restored = []string{id}
 			return authz.MaterializeTx(ctx, tx, authz.FileObject(id))
 		}
 
@@ -330,14 +350,29 @@ func (r *Repository) Restore(ctx context.Context, objectType, id, actorID string
 			path); err != nil {
 			return fmt.Errorf("restore folder subtree: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
+		rows, err := tx.Query(ctx, `
 			UPDATE files
 			   SET trashed_at = NULL, trashed_by = NULL, purge_after = NULL, updated_by = $2
 			 WHERE trashed_at IS NOT NULL
 			   AND folder_id IN (SELECT object_id FROM acl_object
-			                      WHERE object_type = 'folder' AND path LIKE $1 || '%')`,
-			path, nullable(actorID)); err != nil {
+			                      WHERE object_type = 'folder' AND path LIKE $1 || '%')
+			RETURNING id::text`,
+			path, nullable(actorID))
+		if err != nil {
 			return fmt.Errorf("restore folder contents: %w", err)
+		}
+		res.Restored = res.Restored[:0]
+		for rows.Next() {
+			var fid string
+			if err := rows.Scan(&fid); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan restored file: %w", err)
+			}
+			res.Restored = append(res.Restored, fid)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
 		}
 		// The folder itself may have to move, and its parent decides its path.
 		if _, err := tx.Exec(ctx,
@@ -390,6 +425,15 @@ type PurgeResult struct {
 	// gone, so these are leaks the bucket sweep collects — counted so a
 	// permanently unwritable bucket is visible rather than silent.
 	ObjectFailures int
+
+	// Removed names every file whose row is gone, so the caller can unindex it.
+	//
+	// THE INDEX CANNOT RECOVER FROM A PURGE ON ITS OWN. cmd/reindex only upserts
+	// from live rows — there is no prune pass — so a purged document that was
+	// never unindexed stays in Meilisearch permanently, with its title and its
+	// body, answering searches for content that has been destroyed. This list
+	// is the only moment the ids still exist.
+	Removed []FileRef
 }
 
 // Purge permanently removes trashed objects.
@@ -422,8 +466,10 @@ func Purge(ctx context.Context, repo *Repository, store storage.Backend,
 	}
 
 	type doomed struct {
-		id   string
-		keys []string
+		id          string
+		fileType    string
+		workspaceID string
+		keys        []string
 	}
 	var files []doomed
 
@@ -432,7 +478,8 @@ func Purge(ctx context.Context, repo *Repository, store storage.Backend,
 	if err := database.WithTx(ctx, repo.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT f.id::text, f.storage_key, COALESCE(f.thumbnail_key, ''),
-			       COALESCE(array_agg(v.storage_key) FILTER (WHERE v.storage_key IS NOT NULL), '{}')
+			       COALESCE(array_agg(v.storage_key) FILTER (WHERE v.storage_key IS NOT NULL), '{}'),
+			       f.file_type, f.workspace_id::text
 			  FROM files f
 			  LEFT JOIN file_versions v ON v.file_id = f.id
 			 WHERE f.trashed_at IS NOT NULL
@@ -448,10 +495,11 @@ func Purge(ctx context.Context, repo *Repository, store storage.Backend,
 
 		for rows.Next() {
 			var (
-				id, head, thumb string
-				versionKeys     []string
+				id, head, thumb       string
+				fileType, workspaceID string
+				versionKeys           []string
 			)
-			if err := rows.Scan(&id, &head, &thumb, &versionKeys); err != nil {
+			if err := rows.Scan(&id, &head, &thumb, &versionKeys, &fileType, &workspaceID); err != nil {
 				return fmt.Errorf("scan purgeable file: %w", err)
 			}
 			keys := map[string]bool{}
@@ -460,7 +508,7 @@ func Purge(ctx context.Context, repo *Repository, store storage.Backend,
 					keys[k] = true
 				}
 			}
-			d := doomed{id: id}
+			d := doomed{id: id, fileType: fileType, workspaceID: workspaceID}
 			for k := range keys {
 				d.keys = append(d.keys, k)
 			}
@@ -496,6 +544,15 @@ func Purge(ctx context.Context, repo *Repository, store storage.Backend,
 			return fmt.Errorf("purge files: %w", err)
 		}
 		res.Files = int(tag.RowsAffected())
+		res.Removed = make([]FileRef, 0, len(files))
+		for _, f := range files {
+			res.Removed = append(res.Removed, FileRef{
+				ID: f.id, FileType: f.fileType, WorkspaceID: f.workspaceID,
+				// Terminal: the row is gone, so this file can never be purged
+				// again and no later event can collide with it.
+				Revision: "purge",
+			})
+		}
 		return nil
 	}); err != nil {
 		return res, err

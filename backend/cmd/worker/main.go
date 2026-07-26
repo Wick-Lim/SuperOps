@@ -529,10 +529,19 @@ func run() int {
 		// internal/file's collector deliberately excludes trashed rows so the
 		// two cannot race for the same object.
 		driveRepo := drive.NewRepository(pool, az, registry.New())
+		// The publisher is what unindexes. A purge destroys the rows, and
+		// cmd/reindex only upserts from live ones — so anything this job
+		// removes without an event stays in the search index permanently,
+		// answering queries for content that no longer exists anywhere.
+		drivePub := drive.NewPublisher(natsClient, l)
 		start(jobDriveTrash, driveTrashStartDelay, driveTrashInterval, func(c context.Context) error {
 			ran, err := withSingletonLock(c, pool, lockDriveTrash, func(c context.Context) error {
-				_, err := drive.Purge(c, driveRepo, store, drive.PurgeOptions{Now: time.Now()}, l)
-				return err
+				purged, err := drive.Purge(c, driveRepo, store, drive.PurgeOptions{Now: time.Now()}, l)
+				if err != nil {
+					return err
+				}
+				drivePub.PublishFileDeletions(c, purged.Removed)
+				return nil
 			})
 			if err != nil {
 				return err

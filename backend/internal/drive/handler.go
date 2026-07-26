@@ -449,10 +449,14 @@ func (h *Handler) TrashFolder(w http.ResponseWriter, r *http.Request) {
 	if _, ok := h.authorize(w, r, authz.FolderObject(id), authz.CapWrite); !ok {
 		return
 	}
-	if err := h.repo.TrashFolder(r.Context(), id, authctx.UserID(r.Context())); err != nil {
+	trashed, err := h.repo.TrashFolder(r.Context(), id, authctx.UserID(r.Context()))
+	if err != nil {
 		fail(w, err)
 		return
 	}
+	// Unindex the subtree. Without this the folder disappears from the Drive
+	// listing and every document in it stays searchable, body and all.
+	h.events.PublishFileDeletions(r.Context(), trashed)
 	h.record(r.Context(), folder.WorkspaceID, "drive.folder_trashed", "folder", id, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
