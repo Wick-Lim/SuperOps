@@ -207,7 +207,10 @@ export interface AppNotification {
   title: string
   body: string
   /** JSON string: `{ channel_id, message_id }`. */
-  data: string
+  /** The deep-link payload. An OBJECT from the inbox compat layer, a JSON
+   * string from older servers — see parseChannelId, which accepts both. Typed
+   * `unknown` rather than one of them so a caller has to decide. */
+  data: unknown
   is_read: boolean
   created_at: string
 }

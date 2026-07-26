@@ -130,3 +130,74 @@ describe('the huddle api', () => {
     expect(await huddlesAvailable('c1')).toBe(true)
   })
 })
+
+// A NOTIFICATION'S DEEP LINK SURVIVES THE SHAPE IT ARRIVES IN.
+//
+// `data` used to be a JSON string — the repository's `data::text` cast — and
+// the inbox compat layer now emits a real object. The screen called JSON.parse
+// on it, which coerces an object to "[object Object]" and throws, so every
+// notification resolved to null: tapping one marked it read and navigated
+// nowhere. The server's comment claimed the client parsed it either way.
+describe('a notification deep link', () => {
+  it('reads the channel from both encodings', async () => {
+    const mod = await import('../src/screens/NotificationsScreen')
+    const parse = (mod as unknown as { __parseChannelId: (d: unknown) => string | null })
+      .__parseChannelId
+    expect(parse, 'NotificationsScreen no longer exports its parser for testing').toBeTypeOf(
+      'function',
+    )
+
+    // The shape the server sends today.
+    expect(parse({ channel_id: 'c-1' })).toBe('c-1')
+    // The shape an older server sends.
+    expect(parse(JSON.stringify({ channel_id: 'c-1' }))).toBe('c-1')
+    // And nothing usable stays null rather than throwing.
+    expect(parse(null)).toBeNull()
+    expect(parse('not json')).toBeNull()
+    expect(parse({ channel_id: '' })).toBeNull()
+    expect(parse({})).toBeNull()
+  })
+})
+
+// A SEARCH HIT IS NOT ALWAYS A MESSAGE.
+//
+// The server returns six hit types and reads an absent `type` parameter as
+// EVERY type. The client declared only the message fields and never sent one,
+// so Drive documents came back and rendered as "Message from <uploader> in
+// #other channel" with the document body as the message text — and tapping one
+// asked for a channel whose id was the empty string, dead-ending in "That
+// channel is no longer available."
+describe('search hits', () => {
+  it('tells a Drive object apart from a message', async () => {
+    const { isDriveHit } = await import('../src/api/search')
+    const base = {
+      id: 'x',
+      channel_id: '',
+      workspace_id: 'w',
+      user_id: 'u',
+      content: 'body',
+      created_at: 0,
+    }
+    expect(isDriveHit({ ...base, type: 'document' })).toBe(true)
+    expect(isDriveHit({ ...base, type: 'spreadsheet' })).toBe(true)
+    expect(isDriveHit({ ...base, type: 'design' })).toBe(true)
+    expect(isDriveHit({ ...base, type: 'file' })).toBe(true)
+    expect(isDriveHit({ ...base, type: 'message', channel_id: 'c' })).toBe(false)
+    // An older server sends no type at all; treating that as a Drive object
+    // would send every message to the file screen.
+    expect(isDriveHit(base)).toBe(false)
+    // An issue is not in Drive either — it has its own surface.
+    expect(isDriveHit({ ...base, type: 'issue' })).toBe(false)
+  })
+
+  it('narrows by type only when asked', async () => {
+    const { searchApi } = await import('../src/api/search')
+    net = mockFetch(() => ok({ hits: [], estimated_total: 0, processing_time_ms: 1 }))
+
+    await searchApi.messages('w-1', 'q')
+    expect(net.calls[0].path).not.toContain('type=')
+
+    await searchApi.messages('w-1', 'q', { types: ['message'] })
+    expect(net.calls[1].path).toContain('type=message')
+  })
+})

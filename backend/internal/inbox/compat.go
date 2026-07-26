@@ -44,9 +44,14 @@ func legacyType(kind string) string {
 
 // legacyProjection renders an item in the old notification shape.
 //
-// `data` is a map rather than the old string-encoded JSON blob: the client
-// parses it as an object either way, and the old shape was a `json.RawMessage`
-// that had been stringified by the repository's `data::text` cast.
+// `data` is a map rather than the old string-encoded JSON blob — the old shape
+// was a `json.RawMessage` stringified by the repository's `data::text` cast.
+//
+// This said "the client parses it as an object either way". It did not: the
+// shipped client called JSON.parse on it, which coerces an object to
+// "[object Object]" and throws, so every notification deep-linked nowhere. The
+// client now accepts both shapes; this comment is no longer load-bearing, and
+// the map stays because it is the honest encoding.
 func legacyProjection(it *Item) map[string]any {
 	return map[string]any{
 		"id":      it.ID,

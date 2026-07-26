@@ -1,11 +1,13 @@
 package redis
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -147,16 +149,47 @@ func TestNewClientPingsBeforeReturning(t *testing.T) {
 		}
 	})
 
-	t.Run("a wrong password is reported at construction", func(t *testing.T) {
+	// A WRONG PASSWORD IS ONLY WRONG IF THE SERVER WANTS ONE.
+	//
+	// This asserted a refusal unconditionally, and it is RED against a Redis
+	// with no requirepass — which is how CI runs Redis. It never went red
+	// because CI never ran this package at all: the workflow claimed these
+	// tests were "covered by the integration job", and that job runs
+	// ./test/integration/... alone.
+	//
+	// Both configurations are now stated, and neither is skipped. Which arm
+	// runs is decided by asking the server, not by trusting the environment.
+	t.Run("a wrong password is reported when the server requires one", func(t *testing.T) {
 		cfg := testConfig()
+		requiresAuth := serverRequiresAuth(t, cfg)
+
 		cfg.Password = "definitely-not-the-password"
 		client, err := NewClient(t.Context(), cfg, discard())
-		if err == nil {
-			_ = client.Close()
-			t.Fatal("NewClient accepted a wrong password")
+
+		if requiresAuth {
+			if err == nil {
+				_ = client.Close()
+				t.Fatal("NewClient accepted a wrong password against a server that requires one")
+			}
+			if client != nil {
+				t.Error("NewClient returned a client alongside an error")
+			}
+			return
 		}
-		if client != nil {
-			t.Error("NewClient returned a client alongside an error")
+
+		// No requirepass: the password is meaningless and the connection
+		// succeeds. The contract here is that it is not SILENT — NewClient warns
+		// that the connection is unauthenticated, because a deployment that set
+		// REDIS_PASSWORD believes otherwise.
+		var buf bytes.Buffer
+		client, err = NewClient(t.Context(), cfg,
+			slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		if err != nil {
+			t.Fatalf("NewClient failed against a server with no requirepass: %v", err)
+		}
+		_ = client.Close()
+		if !strings.Contains(buf.String(), "requires no authentication") {
+			t.Errorf("connecting unauthenticated was silent; log was %q", buf.String())
 		}
 	})
 
@@ -224,4 +257,20 @@ func TestOrInt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// serverRequiresAuth asks the server rather than the environment, so this test
+// states the same contract on a developer's password-protected Redis and on
+// CI's password-less one.
+func serverRequiresAuth(t *testing.T, cfg Config) bool {
+	t.Helper()
+	bare := cfg
+	bare.Password = ""
+	client, err := NewClient(t.Context(), bare, discard())
+	if err != nil {
+		// Refused without a password: it wants one.
+		return true
+	}
+	_ = client.Close()
+	return false
 }

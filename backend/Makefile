@@ -14,7 +14,7 @@ test:
 # Integration suite. Needs a migrated database and running infra; prefer the
 # root `make backend-test-integration`, which loads deploy/docker/.env for you.
 test-integration:
-	go test -tags=integration ./test/integration/... -race -count=1 -v
+	go test -tags=integration ./test/integration/... -race -count=1 -v -timeout 25m
 
 cover:
 	go test ./... -race -count=1 -coverprofile=coverage.out -covermode=atomic

@@ -28,9 +28,16 @@ jobs:
     # how a suite silently goes green over exactly the mechanisms it exists to
     # protect.
     #
-    # Redis/NATS/Meilisearch are deliberately absent: the packages that need
-    # them skip here and are covered by the `integration` job, which has all of
-    # them and fails rather than skipping.
+    # Redis/NATS/Meilisearch are deliberately absent here; the packages that
+    # need them skip in THIS job and are re-run with real services by the
+    # `integration` job's "Infrastructure-backed unit tests" step.
+    #
+    # That claim used to be false. The integration job ran
+    # `./test/integration/...` and nothing else, so 21 tests — all of pkg/nats,
+    # pkg/redis, internal/storage's conformance suite, internal/collab's
+    # cross-replica tests and internal/search's Meilisearch tests — ran in NO
+    # job at all, while a comment said they were covered. One of them was red
+    # the first time it was actually executed.
     services:
       postgres:
         image: postgres:16
@@ -115,7 +122,11 @@ jobs:
           go-version: '1.25'
           cache-dependency-path: backend/go.sum
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        # PINNED, for the same reason golangci-lint is: @latest silently changes
+        # the rule set between runs, so a green result stops being comparable to
+        # the previous green result and a new finding looks like a regression in
+        # this tree. Bump deliberately.
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
       - name: Scan
         working-directory: backend
         run: govulncheck ./...
@@ -254,6 +265,31 @@ jobs:
           echo "NATS JetStream never became ready on 8222" >&2
           exit 1
 
+      # UP, DOWN, UP — the replay docs/plans/README.md already promises.
+      #
+      # It says "Every up has a down, and the down is tested by replaying
+      # up -> down -> up against a real database." Nothing did: no test ran a
+      # down migration and CI ran `-direction up` alone, so the first .down.sql
+      # that failed to apply would have been discovered during a production
+      # rollback.
+      #
+      # Run against a THROWAWAY database, so a broken down cannot leave the
+      # integration suite's schema half-reverted and turn one failure into a
+      # whole red job with an unrelated cause.
+      - name: Migrations replay up -> down -> up
+        working-directory: backend
+        env:
+          DB_NAME: superops_migrate_replay
+        run: |
+          PGPASSWORD=superops psql -h localhost -U superops -d postgres \
+            -c 'DROP DATABASE IF EXISTS superops_migrate_replay' \
+            -c 'CREATE DATABASE superops_migrate_replay'
+          go run ./cmd/migrate -direction up
+          go run ./cmd/migrate -direction down -i-know-this-drops-everything
+          go run ./cmd/migrate -direction up
+          PGPASSWORD=superops psql -h localhost -U superops -d postgres \
+            -c 'DROP DATABASE superops_migrate_replay'
+
       - name: Run migrations
         working-directory: backend
         run: go run ./cmd/migrate -direction up
@@ -264,8 +300,32 @@ jobs:
         # from this suite, so without it the concurrent code is never checked.
         run: |
           set -o pipefail
-          go test -tags=integration ./test/integration/... -race -count=1 -v \
+          # -timeout: Go's default is 10 minutes for the whole PACKAGE, and this
+          # suite legitimately runs longer — it waits on real JetStream
+          # delivery. Hitting the default produces a panic with no failing
+          # assertion in it, which reads as a broken pipeline rather than a
+          # slow one.
+          go test -tags=integration ./test/integration/... -race -count=1 -v -timeout 25m \
             | tee /tmp/integration.txt
+
+      # THE PACKAGES THE BACKEND JOB CANNOT RUN.
+      #
+      # Object-storage conformance, JetStream publish/drain, Redis client
+      # construction and cross-replica NATS fan-out are verified nowhere else.
+      # SUPEROPS_REQUIRE_INFRA=1 turns "the service is missing" from a skip into
+      # a failure, which is the only way a gate like this stays honest.
+      - name: Infrastructure-backed unit tests
+        working-directory: backend
+        env:
+          SUPEROPS_REQUIRE_INFRA: "1"
+        run: |
+          set -o pipefail
+          go test ./internal/... ./pkg/... -race -count=1 -v -timeout 20m | tee /tmp/infra-units.txt
+          if grep -q -- '--- SKIP' /tmp/infra-units.txt; then
+            echo "::error::a unit test skipped with every service running; it is gated on something it should not be"
+            grep -- '--- SKIP' /tmp/infra-units.txt
+            exit 1
+          fi
 
       - name: Assert nothing skipped
         # Every skip in this suite is "the infrastructure this test needs is not
@@ -410,14 +470,24 @@ jobs:
           echo "::error::critical advisories in runtime dependencies"
           exit 1
 
-  dependency-review:
+  # ADVISORY, AND LABELLED AS SUCH.
+  #
+  # `continue-on-error` makes `fail-on-severity` inert — this job cannot fail the
+  # pipeline — and `if: pull_request` means it does not run at all when
+  # release.yml calls this workflow for a tag, while `needs: ci` is still
+  # satisfied. So nothing published by a release has ever been dependency
+  # reviewed, and the job's presence in a green run implied otherwise.
+  #
+  # Both are kept, because the action needs the dependency graph enabled on the
+  # repository and there is no diff to review on a tag push. The name now says
+  # what it is, so a green pipeline is not read as "dependencies were gated".
+  # govulncheck above is the gate that actually blocks.
+  dependency-review-advisory:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/dependency-review-action@v4
-        # Needs the dependency graph enabled on the repository; do not block the
-        # pipeline where it is unavailable.
         continue-on-error: true
         with:
           fail-on-severity: high

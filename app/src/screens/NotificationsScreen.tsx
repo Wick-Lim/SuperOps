@@ -52,14 +52,38 @@ function relativeTime(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString()
 }
 
-function parseChannelId(data: string): string | null {
-  try {
-    const parsed = JSON.parse(data)
-    return typeof parsed?.channel_id === 'string' ? parsed.channel_id : null
-  } catch {
-    return null
-  }
+/**
+ * Reads the deep-link target out of a notification's `data`.
+ *
+ * BOTH SHAPES, because the field changed under this screen. It used to be a
+ * JSON string — the repository's `data::text` cast — and the inbox compat layer
+ * now emits a real object. `JSON.parse` on an object coerces it to
+ * "[object Object]" and throws, so this returned null for every notification
+ * and tapping one marked it read and navigated nowhere. The server's own
+ * comment claimed "the client parses it as an object either way"; it did not.
+ *
+ * Accepting both is the right shape regardless: a client in the field is older
+ * than the server it talks to, and this is exactly the kind of field that gets
+ * re-encoded.
+ */
+function parseChannelId(data: unknown): string | null {
+  const obj =
+    typeof data === 'string'
+      ? (() => {
+          try {
+            return JSON.parse(data) as unknown
+          } catch {
+            return null
+          }
+        })()
+      : data
+  if (!obj || typeof obj !== 'object') return null
+  const id = (obj as Record<string, unknown>).channel_id
+  return typeof id === 'string' && id !== '' ? id : null
 }
+
+/** Exported for the test that pins both encodings; not part of the screen's API. */
+export const __parseChannelId = parseChannelId
 
 export default function NotificationsScreen({ navigation }: { navigation: any; route: any }) {
   const channels = useChannelStore((s) => s.channels)

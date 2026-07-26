@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -50,6 +51,29 @@ func NewClient(ctx context.Context, cfg Config, logger *slog.Logger) (*redis.Cli
 	if err := client.Ping(ctx).Err(); err != nil {
 		_ = client.Close()
 		return nil, fmt.Errorf("ping redis: %w", err)
+	}
+
+	// A CONFIGURED PASSWORD AGAINST A SERVER THAT WANTS NONE IS NOT AN ERROR,
+	// AND IT IS NOT NOTHING EITHER.
+	//
+	// go-redis tolerates it: the server answers AUTH with "called without any
+	// password configured", the driver treats that as a no-op, and Ping
+	// succeeds. So a deployment that believes it is authenticating connects
+	// completely unauthenticated and nothing says so — and the connection is
+	// then only as private as the network, which is exactly the assumption an
+	// operator setting REDIS_PASSWORD is trying not to make.
+	//
+	// Warned rather than refused: the cache still works, and turning a
+	// misconfiguration into a boot failure would take an otherwise healthy
+	// deployment down. One extra round trip at startup buys the operator a line
+	// they can act on.
+	if cfg.Password != "" {
+		if err := client.Do(ctx, "AUTH", cfg.Password).Err(); err != nil &&
+			strings.Contains(err.Error(), "without any password configured") {
+			logger.Warn("REDIS_PASSWORD is set but this Redis requires no authentication; "+
+				"the connection is unauthenticated and is only as private as the network",
+				"addr", cfg.Addr)
+		}
 	}
 
 	logger.Info("connected to Redis",

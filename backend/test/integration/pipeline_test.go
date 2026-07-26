@@ -89,17 +89,51 @@ func watchFileEvents(t *testing.T, workspaceID string) *fileEvents {
 	return fe
 }
 
-// countFor drains for d and returns how many events named fileID.
-func (fe *fileEvents) countFor(fileID string, d time.Duration) int {
+// countFor returns how many events named fileID, waiting up to d.
+//
+// It returns as soon as `want` have arrived plus a short settle for a duplicate,
+// rather than always draining the full window. The full-drain version added
+// about a minute of pure sleeping to the suite and pushed the package past Go's
+// ten-minute default timeout — which CI does not override, so a slow test here
+// is a red job with no failing assertion in it.
+//
+// The settle is what makes "exactly N" meaningful: an extra event that would
+// have arrived a moment later must still be counted, or the assertion is only
+// "at least N" wearing a stricter face.
+func (fe *fileEvents) countFor(fileID string, want int, d time.Duration) int {
 	n := 0
 	deadline := time.After(d)
-	for {
+	// want == 0 is "nothing may arrive", which only the full window can show.
+	if want == 0 {
+		for {
+			select {
+			case id := <-fe.msgs:
+				if id == fileID {
+					n++
+				}
+			case <-deadline:
+				return n
+			}
+		}
+	}
+	for n < want {
 		select {
 		case id := <-fe.msgs:
 			if id == fileID {
 				n++
 			}
 		case <-deadline:
+			return n
+		}
+	}
+	settle := time.After(750 * time.Millisecond)
+	for {
+		select {
+		case id := <-fe.msgs:
+			if id == fileID {
+				n++
+			}
+		case <-settle:
 			return n
 		}
 	}
@@ -126,7 +160,7 @@ func TestASecondProjectionIsNotSwallowedByTheDuplicateWindow(t *testing.T) {
 	}); code != http.StatusOK {
 		t.Fatalf("first projection: %d", code)
 	}
-	if got := watch.countFor(doc.ID, 5*time.Second); got != 1 {
+	if got := watch.countFor(doc.ID, 1, 5*time.Second); got != 1 {
 		t.Fatalf("the first projection produced %d events, want 1", got)
 	}
 
@@ -138,7 +172,7 @@ func TestASecondProjectionIsNotSwallowedByTheDuplicateWindow(t *testing.T) {
 	}); code != http.StatusOK {
 		t.Fatalf("second projection: %d", code)
 	}
-	if got := watch.countFor(doc.ID, 5*time.Second); got != 1 {
+	if got := watch.countFor(doc.ID, 1, 5*time.Second); got != 1 {
 		t.Fatalf("the second projection produced %d events, want 1 — it was swallowed by "+
 			"the stream's duplicate window, so the document stays searchable only by "+
 			"the text of its first save", got)
@@ -151,7 +185,7 @@ func TestASecondProjectionIsNotSwallowedByTheDuplicateWindow(t *testing.T) {
 	}); code != http.StatusOK {
 		t.Fatalf("replayed projection: %d", code)
 	}
-	if got := watch.countFor(doc.ID, 3*time.Second); got != 0 {
+	if got := watch.countFor(doc.ID, 0, 3*time.Second); got != 0 {
 		t.Fatalf("a replayed projection produced %d events, want 0 — dedupe is gone", got)
 	}
 }
@@ -176,13 +210,13 @@ func TestTheSecondSaveIsSearchable(t *testing.T) {
 	h.project(t, admin, doc.ID, map[string]any{
 		"seq": 1, "schema_version": 1, "body_text": "aardvark only",
 	})
-	watch.countFor(doc.ID, 5*time.Second)
+	watch.countFor(doc.ID, 1, 5*time.Second)
 
 	h.appendUpdate(t, *doc.CollabDocumentID, me, []byte{2})
 	h.project(t, admin, doc.ID, map[string]any{
 		"seq": 2, "schema_version": 1, "body_text": "aardvark and " + token,
 	})
-	if got := watch.countFor(doc.ID, 5*time.Second); got != 1 {
+	if got := watch.countFor(doc.ID, 1, 5*time.Second); got != 1 {
 		t.Fatalf("the second projection never reached the stream (%d events)", got)
 	}
 
@@ -232,7 +266,7 @@ func TestTheTrashLifecycleReachesTheIndex(t *testing.T) {
 	// 1. Trashing the FOLDER must unindex what is inside it.
 	h.req(t, http.StatusNoContent, http.MethodDelete,
 		"/api/v1/drive/folders/"+folder.ID, admin, nil)
-	if got := watch.countFor(doc.ID, 6*time.Second); got != 1 {
+	if got := watch.countFor(doc.ID, 1, 6*time.Second); got != 1 {
 		t.Fatalf("trashing the folder produced %d events for the document inside it, want 1 — "+
 			"the folder leaves the listing and its contents stay searchable", got)
 	}
@@ -240,7 +274,7 @@ func TestTheTrashLifecycleReachesTheIndex(t *testing.T) {
 	// 2. Restoring must put it back.
 	h.req(t, http.StatusOK, http.MethodPost,
 		"/api/v1/drive/folder/"+folder.ID+"/restore", admin, nil)
-	if got := watch.countFor(doc.ID, 6*time.Second); got != 1 {
+	if got := watch.countFor(doc.ID, 1, 6*time.Second); got != 1 {
 		t.Fatalf("restoring produced %d events, want 1 — a restored document is usable "+
 			"and permanently unsearchable", got)
 	}
@@ -248,10 +282,10 @@ func TestTheTrashLifecycleReachesTheIndex(t *testing.T) {
 	// 3. Purging must unindex, and this is the only moment the id exists.
 	h.req(t, http.StatusNoContent, http.MethodDelete,
 		"/api/v1/drive/folders/"+folder.ID, admin, nil)
-	watch.countFor(doc.ID, 6*time.Second)
+	watch.countFor(doc.ID, 1, 6*time.Second)
 	h.req(t, http.StatusOK, http.MethodDelete,
 		"/api/v1/workspaces/"+ws+"/drive/trash", admin, nil)
-	if got := watch.countFor(doc.ID, 8*time.Second); got < 1 {
+	if got := watch.countFor(doc.ID, 1, 8*time.Second); got < 1 {
 		t.Fatalf("emptying the trash produced %d events, want at least 1 — the purged "+
 			"document stays in the index forever with nothing able to remove it", got)
 	}
@@ -291,7 +325,7 @@ func TestAChatAttachmentIsIndexedAndScopedToItsChannel(t *testing.T) {
 	}
 
 	// 1. Uploading publishes at all — it did not before.
-	if got := watch.countFor(fileID, 6*time.Second); got != 1 {
+	if got := watch.countFor(fileID, 1, 6*time.Second); got != 1 {
 		t.Fatalf("uploading a chat attachment produced %d events, want 1 — the file is "+
 			"unsearchable until somebody runs cmd/reindex", got)
 	}
@@ -302,7 +336,7 @@ func TestAChatAttachmentIsIndexedAndScopedToItsChannel(t *testing.T) {
 	h.req(t, http.StatusCreated, http.MethodPost,
 		"/api/v1/channels/"+channel+"/messages", admin,
 		map[string]any{"content": "here it is", "file_ids": []string{fileID}})
-	if got := watch.countFor(fileID, 6*time.Second); got != 1 {
+	if got := watch.countFor(fileID, 1, 6*time.Second); got != 1 {
 		t.Fatalf("posting the attachment produced %d events, want 1 — the file stays "+
 			"searchable by its uploader alone and never matches ?channel=", got)
 	}

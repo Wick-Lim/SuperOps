@@ -46,7 +46,7 @@ backend-test:
 # database (make migrate). Individual tests skip if the infra is unreachable.
 backend-test-integration: require-env
 	@set -e; cd $(BACKEND_DIR); $(DEV_ENV) \
-		go test -tags=integration ./test/integration/... -race -count=1 -v
+		go test -tags=integration ./test/integration/... -race -count=1 -v -timeout 25m
 
 backend-cover:
 	cd $(BACKEND_DIR) && go test ./... -race -count=1 -coverprofile=coverage.out -covermode=atomic

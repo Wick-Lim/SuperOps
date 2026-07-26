@@ -11,7 +11,7 @@ import {
   Alert,
 } from 'react-native'
 import { theme, avatarColor } from '../lib/theme'
-import { searchApi, type SearchHit } from '../api/search'
+import { isDriveHit, searchApi, type SearchHit } from '../api/search'
 import { channelApi } from '../api/channels'
 import { userApi } from '../api/users'
 import { useWorkspaceStore } from '../stores/workspaceStore'
@@ -24,6 +24,24 @@ import { useResponsive } from '../lib/responsive'
 import { Button, Chip, EmptyState, ScreenHeader, contentColumn } from './internal/ui'
 
 /** The backend caps at 100; step up rather than paginate — search has no cursor. */
+/** What a Drive hit calls itself in the list. */
+function hitKindLabel(hit: SearchHit): string {
+  switch (hit.type) {
+    case 'document':
+      return 'Document'
+    case 'spreadsheet':
+      return 'Sheet'
+    case 'design':
+      return 'Design'
+    case 'issue':
+      return 'Issue'
+    case 'file':
+      return 'File'
+    default:
+      return 'Message'
+  }
+}
+
 const LIMIT_STEPS = [20, 50, 100]
 
 function hitTime(unixSeconds: number): string {
@@ -131,6 +149,14 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
    * used to dead-end in an alert; now it offers to join first.
    */
   const openHit = async (hit: SearchHit) => {
+    // A DRIVE OBJECT IS NOT A MESSAGE. The server returns six hit types and the
+    // client asked for none, so documents and files arrived here and were sent
+    // to channelApi.get with an empty channel id — a request that cannot
+    // resolve, ending in "That channel is no longer available."
+    if (isDriveHit(hit)) {
+      navigation.navigate('DriveFile', { fileId: hit.id })
+      return
+    }
     const known = channels.find((c) => c.id === hit.channel_id)
     if (known) {
       useChannelStore.getState().setActiveChannel(known)
@@ -175,8 +201,12 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
       onPress={() => openHit(item)}
       disabled={opening === item.id}
       accessibilityRole="button"
-      accessibilityLabel={`Message from ${displayName(users, item.user_id)} in ${channelName(item.channel_id)}: ${item.content}`}
-      accessibilityHint="Opens the channel"
+      accessibilityLabel={
+        isDriveHit(item)
+          ? `${hitKindLabel(item)} ${item.title || 'Untitled'}: ${item.content}`
+          : `Message from ${displayName(users, item.user_id)} in ${channelName(item.channel_id)}: ${item.content}`
+      }
+      accessibilityHint={isDriveHit(item) ? 'Opens the file' : 'Opens the channel'}
       style={{
         flexDirection: 'row',
         gap: 10,
@@ -199,16 +229,20 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
         }}
       >
         <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>
-          {displayName(users, item.user_id).slice(0, 2).toUpperCase()}
+          {isDriveHit(item)
+            ? hitKindLabel(item).slice(0, 2).toUpperCase()
+            : displayName(users, item.user_id).slice(0, 2).toUpperCase()}
         </Text>
       </View>
       <View style={{ flex: 1 }}>
         <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, marginBottom: 2 }}>
-          <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }}>
-            {displayName(users, item.user_id)}
+          <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }} numberOfLines={1}>
+            {isDriveHit(item)
+              ? item.title || 'Untitled'
+              : displayName(users, item.user_id)}
           </Text>
           <Text style={{ color: theme.textMuted, fontSize: 12, flex: 1 }} numberOfLines={1}>
-            #{channelName(item.channel_id)}
+            {isDriveHit(item) ? hitKindLabel(item) : `#${channelName(item.channel_id)}`}
           </Text>
           <Text style={{ color: theme.textMuted, fontSize: 11 }}>{hitTime(item.created_at)}</Text>
         </View>
