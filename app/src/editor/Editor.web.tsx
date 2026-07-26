@@ -5,6 +5,7 @@ import Collaboration from '@tiptap/extension-collaboration'
 import CollaborationCaret from '@tiptap/extension-collaboration-caret'
 import type * as Y from 'yjs'
 import type { Awareness } from 'y-protocols/awareness'
+import { worthPublishing } from './catchup'
 import { extract, type Projection } from './projection'
 import { Mention, DriveEmbed, IssueEmbed } from './extensions/refs'
 import { RefLabels } from './extensions/refViews'
@@ -145,14 +146,11 @@ export default function Editor({
     if (!editor || !editable || !catchUp || caughtUp.current === catchUp) return
     const timer = setTimeout(() => {
       if (caughtUp.current === catchUp) return
-      const json = editor.getJSON()
-      const projection = extract(json, seqRef.current)
-      if (projection.body_text.trim() === '' && projection.refs.length === 0) {
-        // Still empty. Either the document genuinely is, in which case there is
-        // nothing to catch up, or state has not arrived — and in both cases
-        // publishing would be a lie or a loss.
-        return
-      }
+      const projection = extract(editor.getJSON(), seqRef.current)
+      // Still empty — see worthPublishing. Either the document genuinely is, in
+      // which case there is nothing to catch up, or state has not arrived, in
+      // which case publishing would destroy the stored text.
+      if (!worthPublishing(projection)) return
       caughtUp.current = catchUp
       onProject(projection)
     }, 2500)

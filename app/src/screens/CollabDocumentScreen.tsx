@@ -13,6 +13,7 @@ import Backlinks from '../components/drive/Backlinks'
 import Grid from '../sheet/Grid'
 import Canvas from '../design/Canvas'
 import { SheetModel } from '../lib/sheet/model'
+import { worthPublishing } from '../editor/catchup'
 import { extractSheet } from '../lib/sheet/projection'
 import { DesignModel } from '../lib/design/model'
 import { extractDesign } from '../lib/design/projection'
@@ -192,10 +193,14 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
     if (status !== 'synced' || !fileId) return
     caughtUp.current = projectNonce
     const timer = setTimeout(() => {
-      if (fileType === 'spreadsheet') publish(extractSheet(sheet, seq))
-      else if (fileType === 'design') publish(extractDesign(design, seq))
-      // The block editor projects through its own settle path, which its
-      // mount already schedules; projecting from here as well would race it.
+      // The block editor projects through its own settle path, which its mount
+      // already schedules; projecting from here as well would race it.
+      if (fileType !== 'spreadsheet' && fileType !== 'design') return
+      const projection =
+        fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq)
+      // EMPTY IS NOT A REPAIR — see worthPublishing.
+      if (!worthPublishing(projection)) return
+      publish(projection)
     }, 1500)
     return () => clearTimeout(timer)
   }, [projectNonce, status, fileId, fileType, sheet, design, seq, publish])

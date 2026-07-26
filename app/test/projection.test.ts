@@ -207,3 +207,50 @@ describe('the reference vocabulary', () => {
     }
   })
 })
+
+// THE CATCH-UP RULE.
+//
+// A catch-up projection fires when the stored one is behind the log, and the
+// danger it must not create is writing an EMPTY body over a good one — which
+// happens if the CRDT has not received its state yet. The server cannot defend
+// against that: the seq is the log head either way, so its monotonic guard
+// accepts the write and the document silently loses its searchable text.
+//
+// The rule lived in two places with two different predicates before this. Both
+// looked right.
+describe('the catch-up publish rule', () => {
+  it('refuses a projection with nothing in it', async () => {
+    const { worthPublishing } = await import('../src/editor/catchup')
+    expect(worthPublishing(extract(doc(), 1))).toBe(false)
+    expect(worthPublishing(extract(doc(p('   ', 'a')), 1))).toBe(false)
+  })
+
+  it('publishes one with body text', async () => {
+    const { worthPublishing } = await import('../src/editor/catchup')
+    expect(worthPublishing(extract(doc(p('real content', 'a')), 1))).toBe(true)
+  })
+
+  // A document that is nothing but an embed has no body text at all — the
+  // extractor deliberately writes no label — but it is NOT empty, and refusing
+  // it would leave its backlinks permanently unrepairable.
+  it('publishes one that is only a reference', async () => {
+    const { worthPublishing } = await import('../src/editor/catchup')
+    const out = extract(
+      doc({
+        type: 'driveEmbed',
+        attrs: { blockId: 'e', refId: '55555555-5555-5555-5555-555555555555' },
+      }),
+      1,
+    )
+    expect(out.body_text.trim()).toBe('')
+    expect(worthPublishing(out)).toBe(true)
+  })
+
+  // A heading with no body is a real outline, and a link preview renders from
+  // it. Same reasoning as the reference case.
+  it('publishes one that is only an outline', async () => {
+    const { worthPublishing } = await import('../src/editor/catchup')
+    const out = extract(doc(h(1, 'Quarterly plan', 'x')), 1)
+    expect(worthPublishing(out)).toBe(true)
+  })
+})
