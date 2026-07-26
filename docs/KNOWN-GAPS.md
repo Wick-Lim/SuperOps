@@ -35,6 +35,28 @@ imports `mailboxApi`.
 | `search.TypeIssue` | Declared and accepted by `parseTypes`; no producer. `?type=issue` always returns nothing. Comments and mail are not indexed at all. |
 | `folder_id` in the search index | Filterable and documented as backing "search inside this folder"; no handler parameter exposes it and `hitAttributes` omits it. |
 
+### Audit log trust boundary
+
+Two gaps, referenced from `internal/audit/service.go`.
+
+**The append-only database role is not implemented.** The design calls for the
+application to connect as a role with INSERT/SELECT and no UPDATE/DELETE, with
+migrations and retention on a separate role. Without it, anything holding the
+application's credentials can rewrite history; the per-workspace hash chain and
+the off-box anchor make that *evident* rather than impossible, and only up to
+`anchored_seq`. Deferred because it needs a second connection pool and a
+deployment-time role split, and because the chain already turns silent tampering
+into detectable tampering.
+
+**Login events are unreachable through the audit API.** `user.login` and
+`user.login_failed` are written with `workspace_id = NULL` and
+`chain_seq = NULL` — correctly, since they happen before a workspace is chosen
+and the chain is per-workspace. But both `GET /admin/audit-logs` and its export
+are scoped to administered workspaces, so those rows appear in neither. The
+highest-value audit signal is retrievable only with `psql`. The `/verify`
+response does say the chain covers "workspace-scoped entries"; nothing says the
+read path does too.
+
 ### Architectural, not a patch
 
 **`ws.room.*` and every other NATS subject are unauthenticated inside the

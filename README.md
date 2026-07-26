@@ -201,7 +201,7 @@ SuperOps/
 │   │   ├── file/ search/ notification/ push/ webhook/ emoji/ block/
 │   │   ├── admin/ audit/ ratelimit/
 │   ├── pkg/                    # authctx, crypto, database, httputil, logger, nats, redis
-│   ├── migrations/             # SQL migrations (000–012)
+│   ├── migrations/             # SQL migrations (000–063)
 │   └── test/integration/       # Build-tagged suite against real infrastructure
 ├── deploy/
 │   ├── docker/                 # Compose, Dockerfiles, nginx, TLS overlay, Prometheus
@@ -212,9 +212,19 @@ SuperOps/
 
 ## API Reference
 
-94 routes, two of which (device registration) exist only when `PUSH_ENABLED=true`.
-All application endpoints are under `/api/v1`; `/health`, `/ready` and
-`/metrics` sit at the root. Response envelope:
+201 route registrations — 198 under `/api/v1`, plus `/health`, `/ready` and
+`/metrics` at the root. Two (device registration) exist only when
+`PUSH_ENABLED=true`.
+
+**The table below covers the messaging core only.** Drive and sharing,
+collaborative documents, the spreadsheet and design surfaces, comments,
+projects and issues, workflows, huddles, the shared mail inbox and SSO are all
+in the tree and none of them are listed here. `docs/plans/` describes each; the
+registered routes are the authority, and
+`test/integration/contract_test.go` is what keeps the client and the server
+agreeing about them.
+
+Response envelope:
 
 ```json
 {"data": {...}, "meta": {"cursor": "...", "has_more": true}}
@@ -267,8 +277,21 @@ frames and the client should refetch — there is no server-side replay.
 
 | Direction | Events |
 |-----------|--------|
-| Client | `ping`, `subscribe`, `unsubscribe`, `typing.start`, `typing.stop`, `presence.update` |
-| Server | `hello`, `pong`, `subscribed`, `unsubscribed`, `error`, `message.new`, `message.updated`, `message.deleted`, `reaction.added`, `reaction.removed`, `channel.created`, `channel.updated`, `member.joined`, `member.left`, `typing.indicator`, `presence.changed`, `notification.new`, `unread.update` |
+| Client | `ping`, `subscribe`, `unsubscribe`, `typing.start`, `typing.stop`, `presence.update`, `collab.join`, `collab.leave`, `collab.update`, `collab.awareness` |
+| Server | `hello`, `pong`, `subscribed`, `unsubscribed`, `error`, `message.new`, `message.updated`, `message.deleted`, `reaction.added`, `reaction.removed`, `channel.created`, `channel.updated`, `member.joined`, `member.left`, `typing.indicator`, `presence.changed`, `notification.new`, `unread.update`, `huddle.started`, `huddle.ended`, `huddle.roster`, `collab.joined`, `collab.left`, `collab.compact`, `collab.project` |
+
+Two server frames are REQUESTS, not notifications, and a client that ignores
+them degrades the product rather than merely missing an update:
+
+- `collab.compact` asks one client in a document's room for a snapshot. The
+  server cannot merge CRDT state, so nothing else stops a long-lived
+  document's log from growing forever.
+- `collab.project` asks for the document's searchable text. Same reason: the
+  server never interprets an update, so a document whose stored projection is
+  behind the log can only be repaired by a client that has it in memory.
+
+Both are addressed to ONE member per replica, chosen by connection id. A
+read-only client should ignore both; the server would refuse its write.
 
 `subscribe` is acknowledged with `subscribed`, so a client need not race the
 upgrade. `unsubscribed` carries a reason (`client` or `revoked`); on `revoked`
@@ -475,11 +498,14 @@ Things this does **not** do, so you can decide before deploying:
 
 - **Push notifications need an Expo project you own.** The pipeline is built and
   off by default (`PUSH_ENABLED=false`); see [Push notifications](#push-notifications)
-  for the credentials it cannot supply for you. There is still no email delivery.
+  for the credentials it cannot supply for you. (Email delivery IS built:
+  `internal/mail` ships log, SMTP, direct-SMTP and Resend transports with DKIM
+  signing, and the worker refuses to boot without a working one.)
 - **No outgoing webhooks.** Incoming only; the `outgoing` type is rejected.
 - **No reconnect backfill.** `seq` makes a gap *detectable*; recovery is a REST
   refetch, not a server-side replay.
-- **No SSO/OAuth/SCIM.** (OIDC SSO is in the tree behind `SSO_SECRET_KEY`; SCIM is not.)
+- **No SCIM.** OIDC SSO is implemented (`internal/sso`, migration `014`, eight
+  routes) and enabled with `SSO_SECRET_KEY`; SCIM provisioning is not.
 - **Audit is tamper-evident, not tamper-proof, and only up to `anchored_seq`.** The
   append-only database role is not implemented — see [Audit trust boundary](#audit-trust-boundary).
 - **The inbox has no watch/subscribe.** Recipients are directed: the person mentioned, the

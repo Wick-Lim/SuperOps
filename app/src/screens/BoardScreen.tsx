@@ -29,6 +29,9 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
   const [project, setProject] = useState<Project | null>(null)
   const [states, setStates] = useState<IssueState[]>([])
   const [issues, setIssues] = useState<Issue[]>([])
+  /** The cursor walk hit its page cap. Said out loud rather than silently
+   * dropping cards, which is what one unpaginated request did. */
+  const [truncated, setTruncated] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const { tier } = useResponsive()
@@ -36,15 +39,20 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
 
   const loadProject = useCallback(async (id: string) => {
     setError(null)
+    setTruncated(false)
     try {
       const [p, s, i] = await Promise.all([
         issueApi.project(id),
         issueApi.states(id),
-        issueApi.issues(id),
+        // EVERY page, not the server's first 50. The board is ordered by rank
+        // across all states, so one page could leave whole columns empty while
+        // each header printed its own length as the count.
+        issueApi.allIssues(id),
       ])
       setProject(p.data)
       setStates(s.data)
-      setIssues(i.data.issues)
+      setIssues(i.issues)
+      setTruncated(i.truncated)
     } catch (e) {
       setError(errorMessage(e))
     }
@@ -163,8 +171,15 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
         <ErrorState message={error} onRetry={() => project && void loadProject(project.id)} />
       ) : !project ? (
         <EmptyState title="No projects yet" body="Create one to start tracking work." />
-      ) : stacked ? (
-        <ScrollView>
+      ) : (
+        <>
+          {truncated ? (
+            <Text style={styles.truncated}>
+              This project has more issues than the board loads. Some cards are not shown.
+            </Text>
+          ) : null}
+          {stacked ? (
+            <ScrollView>
           {states.map((s) => (
             <Column
               key={s.id}
@@ -177,9 +192,9 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
               onMove={moveTo}
             />
           ))}
-        </ScrollView>
-      ) : (
-        <ScrollView horizontal showsHorizontalScrollIndicator>
+            </ScrollView>
+          ) : (
+            <ScrollView horizontal showsHorizontalScrollIndicator>
           {states.map((s) => (
             <Column
               key={s.id}
@@ -192,7 +207,9 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
               onMove={moveTo}
             />
           ))}
-        </ScrollView>
+            </ScrollView>
+          )}
+        </>
       )}
     </SafeAreaView>
   )
@@ -301,6 +318,12 @@ const styles = StyleSheet.create({
   columnHeader: { flexDirection: 'row', alignItems: 'center', gap: space.xs, paddingVertical: space.sm },
   dot: { width: 8, height: 8, borderRadius: 4 },
   columnTitle: { color: theme.text, fontWeight: '700', fontSize: 14, flex: 1 },
+  truncated: {
+    color: theme.textMuted,
+    fontSize: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
   columnCount: { color: theme.textFaint, fontSize: 12 },
   columnEmpty: { color: theme.textDim, fontSize: 12, paddingVertical: space.sm },
 

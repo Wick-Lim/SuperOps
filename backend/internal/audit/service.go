@@ -43,7 +43,7 @@
 //     is the only one the local administrator does not control.
 //  4. Append-only at the database role — the application connecting as a role
 //     with INSERT/SELECT and no UPDATE/DELETE, with migrations and retention on
-//     a separate role. THIS IS NOT IMPLEMENTED. See docs/DEPLOYMENT.md
+//     a separate role. THIS IS NOT IMPLEMENTED. See docs/KNOWN-GAPS.md
 //     "Audit log trust boundary" for what that costs and why it was deferred.
 package audit
 
@@ -170,7 +170,7 @@ func (s *Service) Record(ctx context.Context, e Entry) error {
 //
 // The write is detached from the caller's cancellation so that a client which
 // hangs up immediately after (say) a failed login still leaves a record. That is
-// a contract, not an implementation detail — see TestAuditSurvivesRequestCancellation.
+// a contract, not an implementation detail — see TestRecordSurvivesRequestCancellation.
 func (s *Service) Try(ctx context.Context, e Entry) {
 	if err := s.Record(context.WithoutCancel(ctx), e); err != nil {
 		s.failures.Add(1)

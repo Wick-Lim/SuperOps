@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react'
 import { View, Text, Pressable, TextInput, Alert, StyleSheet } from 'react-native'
 import { theme } from '../lib/theme'
 import { errorMessage } from '../api/client'
-import { commentApi, renderMentions } from '../api/comments'
+import { MENTION_PATTERN, commentApi, renderMentions } from '../api/comments'
 import type { Comment } from '../api/comments'
 import { useUserStore } from '../stores/userStore'
 import { space, MIN_TOUCH } from '../lib/responsive'
@@ -59,7 +59,12 @@ export default function CommentThread({
     const ids = new Set<string>()
     for (const c of comments) {
       if (c.author_id) ids.add(c.author_id)
-      for (const m of c.body.matchAll(/<@([0-9a-fA-F-]{36})>/g)) ids.add(m[1])
+      // MENTION_PATTERN, not a second regex. This was
+      // /<@([0-9a-fA-F-]{36})>/g, which accepts any 36-character run of hex and
+      // dashes — so it resolved ids the notifier never treated as mentions.
+      // comment.go's own note says two implementations of "what is a mention"
+      // is two different sets of people; there were three.
+      for (const m of c.body.matchAll(MENTION_PATTERN)) ids.add(m[1])
     }
     ensureUsers([...ids])
   }, [comments, ensureUsers])

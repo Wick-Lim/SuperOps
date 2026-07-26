@@ -759,7 +759,7 @@ Fully parallel with Part A — different tables, different package, no shared co
   assert the break is reported at the right seq.
 - `TestAuditPartitionRollover` — advance the partition job, insert with a `created_at` in
   the next month, assert it lands in the new partition.
-- `TestAuditSurvivesRequestCancellation` — cancel the request context immediately after a
+- `TestRecordSurvivesRequestCancellation` — cancel the request context immediately after a
   failed login; the row still exists. That is `Try`'s stated contract
   (`service.go:75`) and nothing asserts it today.
 - `TestAuditExportIsWorkspaceScoped` — into `tenancy_test.go`, extending

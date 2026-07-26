@@ -201,3 +201,49 @@ describe('search hits', () => {
     expect(net.calls[1].path).toContain('type=message')
   })
 })
+
+// THE BOARD LOADED ONE PAGE OF A RANK-ORDERED LIST.
+//
+// issueApi.issues() returns the server's default 50 and BoardScreen read
+// data.issues alone, so a project with more than 50 cards silently lost the
+// rest — and because the page is ordered by rank ACROSS all states, whole
+// columns came back empty while each header printed its own length as the
+// total.
+describe('the issue cursor', () => {
+  it('follows every page', async () => {
+    const { issueApi } = await import('../src/api/issues')
+    const pages = [
+      { issues: [{ id: 'i1' }, { id: 'i2' }], next: { after_rank: 'r2', after_id: 'i2' }, has_more: true },
+      { issues: [{ id: 'i3' }], next: { after_rank: 'r3', after_id: 'i3' }, has_more: false },
+    ]
+    let n = 0
+    net = mockFetch(() => ok(pages[n++]))
+
+    const res = await issueApi.allIssues('p-1')
+    expect(res.issues.map((i) => i.id)).toEqual(['i1', 'i2', 'i3'])
+    expect(res.truncated).toBe(false)
+    // The second request must carry the cursor, or it re-reads page one forever.
+    expect(net.calls[1].path).toContain('after_id=i2')
+  })
+
+  it('stops at the page cap and says so, rather than looping', async () => {
+    const { issueApi } = await import('../src/api/issues')
+    // A server that always claims more: without a cap this never returns.
+    net = mockFetch(() =>
+      ok({ issues: [{ id: 'x' }], next: { after_rank: 'r', after_id: 'x' }, has_more: true }),
+    )
+
+    const res = await issueApi.allIssues('p-1', { maxPages: 3 })
+    expect(res.issues).toHaveLength(3)
+    expect(res.truncated).toBe(true)
+  })
+
+  it('makes exactly one request when there is nothing more', async () => {
+    const { issueApi } = await import('../src/api/issues')
+    net = mockFetch(() => ok({ issues: [], next: { after_rank: '', after_id: '' }, has_more: false }))
+
+    const res = await issueApi.allIssues('p-1')
+    expect(res.issues).toHaveLength(0)
+    expect(net.calls).toHaveLength(1)
+  })
+})

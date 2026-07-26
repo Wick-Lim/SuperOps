@@ -4,7 +4,14 @@ Target: one self-hosted product covering what a company needs — chat, huddles,
 drive, documents, spreadsheets, design, email, work tracking and workflow
 automation.
 
-This is written against the code as it stands (94 routes, 12 migrations, the
+> **HISTORICAL, AS OF ITS WRITING.** The counts and the gap list below describe
+> the tree at ~94 routes and 12 migrations. It is now 201 routes and 63
+> migrations, and most of §2's gaps have since been closed — see the note under
+> each. `docs/plans/README.md` designates §1/§3/§3b/§3c of this document as
+> required reading, so the *rulings* still bind; the state descriptions do not.
+> `docs/KNOWN-GAPS.md` is the current picture.
+
+This was written against the code as it stood (94 routes, 12 migrations, the
 packages under `backend/internal/`), not against a blank page. Sizes are
 relative (S/M/L/XL), not calendar estimates — absolute time depends on headcount,
 which this document does not assume.
@@ -69,11 +76,18 @@ Genuinely solid and reusable:
 
 Known gaps that become blocking as scope grows:
 
-- **No SSO/SCIM.** Fine for a chat app, mandatory when it is the whole stack.
-- **No mail sending at all.** Invitations are copy-pasted by hand today.
-- **Permissions are workspace/channel-shaped.** Docs, files and workflows need
-  object-level ACLs. This is the single most important thing to get right.
-- **Search indexes messages only.**
+- ~~**No SSO/SCIM.**~~ CLOSED for SSO: `internal/sso` is a full OIDC
+  implementation (migration `014`, eight routes). SCIM is still absent.
+- ~~**No mail sending at all.** Invitations are copy-pasted by hand today.~~
+  CLOSED: `internal/mail` ships four transports with DKIM, the worker refuses to
+  boot without a working one, and invitations and the inbox digest are queued
+  through it.
+- ~~**Permissions are workspace/channel-shaped.**~~ CLOSED: migration `016`
+  introduced `acl_object`/`acl_grant`/`acl_key`, and Drive, docs, comments,
+  mail and workflows all authorize through it.
+- ~~**Search indexes messages only.**~~ CLOSED for Drive files and documents
+  (title and projected body, with the object's `acl_key` as the filter).
+  Comments, issues and mail are still not indexed.
 - Notifications are per-message; there is no cross-object "inbox".
 - Audit covers a handful of admin actions.
 
@@ -224,7 +238,8 @@ Nothing here is glamorous and all of it is load-bearing.
 |---|---|---|
 | **Object-level permission model** | L | Generalize `internal/authz` from (workspace, channel) to (subject, object, capability) with inheritance. Every pillar needs it and retrofitting eight is worse than designing one. |
 | **Collaboration layer (CRDT)** | L | Three editors need multiplayer. Building it once is the difference between one project and three. See below. |
-| **Mail sending** | S | Invites are copy-pasted by hand *today* and password reset does not exist. Needed regardless of which email scope comes later. **Transport is operator-chosen** — see below. |
+| **Mail sending** | S | Invites are copy-pasted by hand *today* and password reset does not exist.
+(Both stale: invitation mail is queued through `internal/mail`.) Needed regardless of which email scope comes later. **Transport is operator-chosen** — see below. |
 | **Unified search** | M | Generalize the Meili index from `MessageDoc` to typed objects with an ACL field, so one query spans messages, files and docs. |
 | **Unified inbox / notifications** | M | One "needs attention" surface. Today's notification table is close; it needs an object reference instead of a message id. |
 | **SSO (OIDC) + SCIM** | M | Becomes a procurement blocker the moment this is the company's whole stack. |

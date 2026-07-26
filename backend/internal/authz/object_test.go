@@ -68,7 +68,7 @@ const (
 )
 
 // TestKeyEncoding pins the format internal/search's validKey accepts. It is
-// duplicated there deliberately (TestAuthzKeysPassSearchValidation) — this side
+// duplicated there deliberately (TestAuthzKeysPassValidation, in internal/search) — this side
 // asserts what is produced, that side asserts what is accepted, and the two
 // packages must not be able to drift apart silently.
 func TestKeyEncoding(t *testing.T) {

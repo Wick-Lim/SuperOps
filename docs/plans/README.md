@@ -6,16 +6,16 @@ named, and explicit cuts.
 
 | Plan | Phase | Status |
 |---|---|---|
-| [00-permissions](00-permissions.md) | Phase 0 — object-level permissions | Design. **Blocks everything.** |
+| [00-permissions](00-permissions.md) | Phase 0 — object-level permissions | **Implemented** (`016`). It blocked everything and no longer does — `acl_object`/`acl_grant`/`acl_key` are applied and every downstream plan shipped on top of them. |
 | [01-phase0-remainder](01-phase0-remainder.md) | Phase 0 — unified inbox + audit | **Implemented** (`020`, `021`) |
 | [02-drive](02-drive.md) | Phase 1 — Drive + editor registry | **Implemented** (`025`–`028`) |
-| [03-work-tracking](03-work-tracking.md) | Phase 2 — issues, boards, cycles | **Implemented** (`030`, `031`) |
+| [03-work-tracking](03-work-tracking.md) | Phase 2 — issues, boards, cycles | **Partial** (`030`, `031`). Projects, issues, states and ordering work end to end. Labels, cycles, issue relations and project membership are TABLES ONLY — `labels`, `issue_labels`, `cycles` and `issue_relations` have no Go reader or writer, `internal/project` was never built, and `issue_activity` is written and unreadable. See docs/KNOWN-GAPS.md. |
 | [04-docs](04-docs.md) | Phase 3 — block editor | **Implemented** (`035`) |
 | [05-spreadsheet](05-spreadsheet.md) | Phase 4 — grid + formula engine | **Implemented** — no migration; see ruling 8 |
 | [06-design-surface](06-design-surface.md) | Phase 5 — bounded design surface | **Implemented** — no migration; see ruling 8 |
 | [07-huddle](07-huddle.md) | — huddles (order-independent) | **Implemented** (`050`). Media is a §3c capability, off by default. Client joins the call on web with `livekit-client` (audio + screen share); mobile gets the bar, the roster and start/end, which is what plan 07's cut actually removes — the mobile dev-build path, not the feature. |
 | [08-email](08-email.md) | Phase 6 — shared inbox | **Implemented** (`055`) |
-| [09-workflow](09-workflow.md) | Phase 7 — automation | **Implemented** (`060`, `062`; `061` earmarked, unspent) |
+| [09-workflow](09-workflow.md) | Phase 7 — automation | **Implemented** (`060`, `062`, `063`; `061` earmarked, unspent) |
 
 Already shipped or in flight, so not planned here: outbound mail
 (`internal/mail`), unified search, the collaboration layer (`internal/collab`)
@@ -41,13 +41,13 @@ without colliding with a phase that has not started:
 | `016`–`019` | object permissions (plan 00) — `016` taken (`acl_object`, `acl_grant`, `acl_key`, the two expected-state views and the backfill); `017`–`019` free |
 | `020`–`024` | unified inbox + audit (plan 01) — `020` taken (`inbox_events`, `inbox_items`, `notification_prefs`, `inbox_digest_state`, backfill), `021` taken (`audit_logs` → TEXT `resource_id`, monthly partitions, `dedupe_key`, chain, `audit_chain_heads`); `022`–`024` free |
 | `025`–`029` | Drive + editor registry (plan 02) — `025` taken (`drive_folders`, `files` reshape, `file_versions`, `workspace_storage`, the `collab_documents` FK, the `workspace` grant subject, both expected-state views), `026` taken (quota: `collab_bytes_at`, `idx_files_workspace`, the `file_versions` backfill and the `bytes_used` re-derivation), `027` taken (trash: `purge_after` and its indexes), `028` taken (sharing: `drive_share_links`, the `link` grant subject, `acl_key_expected` arm 5); `029` free |
-| `030`–`034` | work tracking (plan 03) — `030` taken (the product-wide `comments` table, keyed to `acl_object`), `031` taken (projects, issues, states, labels, cycles, ordering); `033`–`034` free. `032` is HELD for the `p-` project container key and should not be spent on anything else — see ruling 6. |
+| `030`–`034` | work tracking (plan 03, **partially implemented** — see the status table) — `030` taken (the product-wide `comments` table, keyed to `acl_object`), `031` taken (projects, issues, states, labels, cycles, ordering); `033`–`034` free. `032` is HELD for the `p-` project container key and should not be spent on anything else — see ruling 6. |
 | `035`–`039` | docs (plan 04) — `035` taken (`file_projections`, `file_projection_refs`, `comment_anchors`, `idx_collab_documents_updated`); `036`–`039` free. **`file_projections` is product-wide**: the spreadsheet and the design surface project into the same table and add none of their own — see ruling 8. |
 | `040`–`044` | spreadsheet (plan 05) — **DELIBERATELY UNSPENT.** The spreadsheet's whole backend is a `registry.Kind`; it needs no migration, no route and no table. `040` remains the lowest free number. |
 | `045`–`049` | design surface (plan 06) — **DELIBERATELY UNSPENT**, for the same reason. Plan 06's `preview_seq` column is not built: a preview is a thumbnail, and Drive already has one. |
 | `050`–`054` | huddle (plan 07) — `050` taken (`huddles`, `huddle_participants`, `huddle_webhook_events`); `051`–`054` free. Adds ZERO arms to `acl_object_expected` and zero to `acl_key_expected`: a huddle is not an ACL object, it is exactly as accessible as its scope. |
 | `055`–`059` | email (plan 08) — `055` taken (mail domains, mailboxes, conversations, messages, inbound events, ingest tokens; `files.mail_message_id`; the `idx_files_unowned` rebuild; one new arm in `acl_object_expected`). `acl_key_expected` is UNCHANGED — a conversation is a container and the container arm already inherits its grants. `056`–`059` free. |
-| `060`–`064` | workflow (plan 09) — `060` and `062` taken (`062` adds `workflows.owner_id`, the principal every action authorizes against). `060` taken (workflows, versions, triggers, runs, step runs, effects, trigger rejections). **`061` is EARMARKED and unspent**: it is reserved for the credential vault and schedule columns that arrive with the HTTP node, and must not be taken for anything else. `062`–`064` free. |
+| `060`–`064` | workflow (plan 09) — `060` taken (workflows, versions, triggers, runs, step runs, effects, trigger rejections), `062` taken (`workflows.owner_id`, the principal every action authorizes against), `063` taken (`workflow_runs.depth` and `root_run_id`, the loop guard). **`061` is EARMARKED and unspent**: it is reserved for the credential vault and schedule columns that arrive with the HTTP node, and must not be taken for anything else. `064` free. |
 
 Rules:
 

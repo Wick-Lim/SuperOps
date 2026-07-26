@@ -99,6 +99,41 @@ export const issueApi = {
     return api.get<IssuePage>(`/projects/${projectId}/issues${query ? `?${query}` : ''}`)
   },
 
+  /**
+   * Every issue in a project, following the cursor.
+   *
+   * THE BOARD READ ONE PAGE. `issues()` returns the server's default 50 and the
+   * caller read `data.issues` alone, so a project with more than 50 cards
+   * silently lost the rest — and because the page is ordered by rank across all
+   * states, whole columns came back empty while each header printed its own
+   * length as if it were the total.
+   *
+   * Bounded rather than unbounded: a runaway cursor is worse than a truncated
+   * board, and 20 pages is 1000 issues, well past any board a person reads. The
+   * caller is told when it stopped early.
+   */
+  async allIssues(
+    projectId: string,
+    opts: { stateId?: string; maxPages?: number } = {},
+  ): Promise<{ issues: Issue[]; truncated: boolean }> {
+    const maxPages = opts.maxPages ?? 20
+    const issues: Issue[] = []
+    let after: { after_rank: string; after_id: string } | undefined
+    for (let page = 0; page < maxPages; page++) {
+      const res = await this.issues(projectId, {
+        stateId: opts.stateId,
+        afterRank: after?.after_rank,
+        afterId: after?.after_id,
+      })
+      issues.push(...res.data.issues)
+      if (!res.data.has_more || !res.data.next?.after_id) {
+        return { issues, truncated: false }
+      }
+      after = res.data.next
+    }
+    return { issues, truncated: true }
+  },
+
   createIssue(
     projectId: string,
     body: { title: string; description?: string; state_id?: string; assignee_id?: string; priority?: number },
