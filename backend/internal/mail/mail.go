@@ -78,6 +78,25 @@ type Message struct {
 	// and a provider that honours this will not send twice. Transports that
 	// cannot express it ignore it.
 	IdempotencyKey string
+
+	// From overrides the deployment-wide sender.
+	//
+	// It exists for the shared inbox, and it is the difference between a reply
+	// that reaches the customer's thread and one that arrives from a stranger:
+	// a reply must come FROM the mailbox the customer wrote to, not from
+	// no-reply@. Empty keeps the deployment default, which is what every
+	// transactional message wants.
+	From *Address
+
+	// MessageID, InReplyTo and References are RFC 5322 threading headers.
+	//
+	// Without them a reply arrives in the customer's inbox as a NEW
+	// conversation — subject-line threading is a client-side guess that fails
+	// as soon as somebody edits the subject — and the agent's carefully
+	// threaded answer looks like an unsolicited email.
+	MessageID  string
+	InReplyTo  string
+	References []string
 }
 
 // Validate reports whether the message can be sent at all. Called before the

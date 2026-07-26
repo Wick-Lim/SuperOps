@@ -28,14 +28,23 @@ type Handler struct {
 	repo   *Repository
 	pool   *pgxpool.Pool
 	authz  *authz.Checker
+	out    *Publisher
+	dns    DNSResolver
 	logger *slog.Logger
 }
 
-func NewHandler(pool *pgxpool.Pool, az *authz.Checker, logger *slog.Logger) *Handler {
+func NewHandler(pool *pgxpool.Pool, az *authz.Checker, out *Publisher, logger *slog.Logger) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{repo: NewRepository(pool, az), pool: pool, authz: az, logger: logger}
+	return &Handler{
+		repo: NewRepository(pool, az), pool: pool, authz: az, out: out,
+		// The real resolver by default. A deployment behind a split-horizon DNS
+		// can substitute one; a test substitutes one rather than depending on a
+		// live zone.
+		dns:    netResolver{},
+		logger: logger,
+	}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -45,7 +54,12 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("GET /api/v1/conversations/{conversation_id}", authMw(http.HandlerFunc(h.GetConversation)))
 	mux.Handle("PATCH /api/v1/conversations/{conversation_id}", authMw(http.HandlerFunc(h.PatchConversation)))
 	mux.Handle("POST /api/v1/conversations/{conversation_id}/reply", authMw(http.HandlerFunc(h.Reply)))
+	h.RegisterAdminRoutes(mux, authMw)
 }
+
+// SetResolver substitutes the DNS resolver, for a test or a split-horizon
+// deployment.
+func (h *Handler) SetResolver(r DNSResolver) { h.dns = r }
 
 // RegisterIngestRoutes is separate because ingest is authenticated by a BEARER
 // TOKEN belonging to the deployment, not by a user session. The provider is a
@@ -372,6 +386,7 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		       -- undelivered backlog unqueryable, so the delivery consumer had
 		       -- no way to find what was written before it existed.
 		       NULL
+		  FROM parent p
 		RETURNING id::text, conversation_id::text, direction, message_id, in_reply_to,
 		          subject, body_text, body_html, author_id::text, sent_at, created_at`,
 		id, newMessageID(), req.Subject, req.BodyText, req.BodyHTML, actor,
@@ -381,6 +396,14 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
+
+	// QUEUE THE DELIVERY. Without this the reply is stored, the agent is told
+	// it worked, and the customer receives nothing — which is what this
+	// endpoint did until the delivery path existed.
+	//
+	// After the INSERT and best effort: the reply is committed and visible in
+	// the thread, and the sweeper picks up anything the publish drops.
+	h.out.Queue(ctx, workspaceIDOfConversation(ctx, h.pool, id), msg.ID)
 
 	// awaiting_reply goes false: the ball is with the customer now, and that is
 	// the column every "needs attention" view reads.
@@ -609,4 +632,13 @@ func newMessageID() string {
 		tok = uuid.NewString()
 	}
 	return fmt.Sprintf("<%s@superops>", tok)
+}
+
+// workspaceIDOfConversation resolves the tenant for the outbound subject. Best
+// effort: an empty result makes Queue a no-op and the sweeper delivers instead.
+func workspaceIDOfConversation(ctx context.Context, pool *pgxpool.Pool, conversationID string) string {
+	var ws string
+	_ = pool.QueryRow(ctx,
+		`SELECT workspace_id::text FROM mail_conversations WHERE id = $1`, conversationID).Scan(&ws)
+	return ws
 }

@@ -52,6 +52,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/huddle"
 	"github.com/Wick-Lim/SuperOps/backend/internal/inbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
+	"github.com/Wick-Lim/SuperOps/backend/internal/mailbox"
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/push"
@@ -81,6 +82,7 @@ const (
 	jobHuddleReconcile = "huddle_reconcile"
 	jobWorkflowStep    = "workflow_step"
 	jobWorkflowReaper  = "workflow_reaper"
+	jobMailSweep       = "mail_unsent_sweep"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -131,6 +133,11 @@ const (
 	// One claim loop drains at most this many runs before yielding, so a large
 	// backlog cannot starve the other job loops on this replica.
 	workflowStepBatch = 50
+	// Every five minutes. The queue is the normal path; this is the backstop,
+	// and its own grace period keeps it from racing a message queued moments
+	// ago.
+	mailSweepInterval   = 5 * time.Minute
+	mailSweepStartDelay = 2 * time.Minute
 )
 
 // Advisory-lock keys. Distinct 64-bit constants; any other application taking
@@ -161,6 +168,9 @@ const (
 	// so several workers share the queue. A lock there would serialize every
 	// workflow in the deployment behind one replica.
 	lockWorkflowReaper int64 = 0x50_000B
+	// The unsent-mail sweep. Locked because it SENDS: two replicas sweeping
+	// concurrently would each load the same unstamped row and deliver it twice.
+	lockMailSweep int64 = 0x50_000C
 )
 
 // aclDriftSamples bounds how many concrete disagreements one drift report
@@ -382,6 +392,20 @@ func run() int {
 	})
 	l.Info("outbound mail consumer ready", "transport", mailSender.Name())
 
+	// The SHARED INBOX's outbound consumer. A separate durable from the one
+	// above, not a widened filter: the subject has five tokens where the
+	// transactional one has four, and a NATS '*' matches exactly one token, so
+	// neither can see the other's messages. They also carry different payloads
+	// — that one queues a rendered message, this one queues a row id and
+	// renders from the database, because a reply is durable content an agent
+	// can see in the thread.
+	mailboxOut := mailbox.NewConsumer(pool, mailSender, l)
+	bind(durableSpec{
+		durable: mailbox.OutboundDurable,
+		filter:  mailbox.OutboundFilter,
+		handle:  mailboxOut.Handle,
+	})
+
 	// --- periodic jobs -------------------------------------------------------
 
 	var jobs sync.WaitGroup
@@ -518,6 +542,30 @@ func run() int {
 	)
 	start(jobWorkflowStep, workflowStepStartDelay, workflowStepInterval, func(c context.Context) error {
 		return drainWorkflowRuns(c, workflowRepo, workflowExec, l)
+	})
+
+	// The unsent-mail sweep. The publish from the reply handler is best effort
+	// by design — an agent's reply must not fail because a message bus was
+	// unreachable — so something has to notice what the queue lost. It is also
+	// what drains every reply written before the delivery path existed at all.
+	start(jobMailSweep, mailSweepStartDelay, mailSweepInterval, func(c context.Context) error {
+		ran, err := withSingletonLock(c, pool, lockMailSweep, func(c context.Context) error {
+			n, err := mailboxOut.SweepUnsent(c, 200)
+			if err != nil {
+				return err
+			}
+			if n > 0 {
+				l.Warn("delivered replies the queue had lost", "count", n)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if !ran {
+			l.Debug("mail sweep skipped: another replica holds the lock")
+		}
+		return nil
 	})
 
 	// The reaper. A worker killed mid-run leaves its row 'running' forever;

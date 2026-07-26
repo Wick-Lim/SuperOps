@@ -6,10 +6,12 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mailbox"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
 )
@@ -425,5 +427,300 @@ func TestIngestRequiresALiveToken(t *testing.T) {
 	code, _ = h.doBearer(t, http.MethodPost, "/api/v1/mail/inbound", token, body)
 	if code != http.StatusUnauthorized {
 		t.Fatalf("ingest with a revoked token = %d, want 401", code)
+	}
+}
+
+// recordingSender captures what would go on the wire.
+type recordingSender struct {
+	mu   sync.Mutex
+	sent []*mail.Message
+}
+
+func (s *recordingSender) Send(_ context.Context, m *mail.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, m)
+	return nil
+}
+
+func (s *recordingSender) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sent)
+}
+
+// AN AGENT'S REPLY WAS STORED AND NEVER SENT. The handler wrote the row,
+// flipped awaiting_reply, returned 201, and the customer received nothing.
+// This is the whole delivery path, end to end.
+func TestAReplyIsActuallyDeliveredAndThreaded(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+	n := time.Now().UnixNano()
+
+	// A VERIFIED domain, and a mailbox on it.
+	domain := fmt.Sprintf("verified-%d.test", n)
+	var domainID string
+	if err := h.app.DB.QueryRow(ctx, `
+		INSERT INTO mail_domains (workspace_id, domain, verify_token, verified_at)
+		VALUES ($1, $2, 'tok', NOW()) RETURNING id::text`, ws, domain).Scan(&domainID); err != nil {
+		t.Fatal(err)
+	}
+	mb, err := mailRepo(t).CreateMailbox(ctx, ws, fmt.Sprintf("support@%s", domain), "Support", "SUP", me)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.app.DB.Exec(ctx,
+		`UPDATE mailboxes SET domain_id = $2 WHERE id = $1`, mb.ID, domainID); err != nil {
+		t.Fatal(err)
+	}
+
+	inb := inbound(mb, fmt.Sprintf("deliver-%d", n))
+	conv, _, err := mailRepo(t).Ingest(ctx, inb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The agent replies through the real route.
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/conversations/"+conv.ID+"/reply", admin,
+		map[string]string{"body_text": "We are on it."})
+	var reply struct {
+		ID     string  `json:"id"`
+		SentAt *string `json:"sent_at"`
+	}
+	decodeInto(t, resp.Data, &reply)
+
+	// STORED AS UNSENT. A NULL sent_at is what makes the undelivered backlog
+	// queryable; stamping NOW() here claimed delivery before anything tried.
+	if reply.SentAt != nil {
+		t.Fatal("the reply claims it was sent before anything tried to send it")
+	}
+
+	// Now deliver it, through the consumer's real path.
+	sender := &recordingSender{}
+	consumer := mailbox.NewConsumer(h.app.DB, sender, nil)
+	if err := consumer.Deliver(ctx, reply.ID); err != nil {
+		t.Fatal(err)
+	}
+	if sender.count() != 1 {
+		t.Fatalf("the reply was not sent (%d messages); the customer hears nothing", sender.count())
+	}
+
+	out := sender.sent[0]
+	// FROM THE MAILBOX, not from no-reply@. A reply from a stranger is not a
+	// reply.
+	if out.From == nil || out.From.Email != mb.Address {
+		t.Fatalf("From = %+v, want the mailbox address %s", out.From, mb.Address)
+	}
+	if len(out.To) != 1 || out.To[0].Email != inb.FromAddress {
+		t.Fatalf("To = %+v, want the customer %s", out.To, inb.FromAddress)
+	}
+	// THREADED. Without In-Reply-To the customer's client shows it as a new
+	// conversation, and the agent's careful answer looks unsolicited.
+	if out.InReplyTo != inb.MessageID {
+		t.Fatalf("In-Reply-To = %q, want the customer's message id %q", out.InReplyTo, inb.MessageID)
+	}
+	if len(out.References) == 0 {
+		t.Error("no References header; a long thread will not stay together")
+	}
+	if out.MessageID == "" {
+		t.Error("no Message-ID; the customer's reply could not be threaded back")
+	}
+
+	// STAMPED, so a redelivery does nothing.
+	if err := consumer.Deliver(ctx, reply.ID); err != nil {
+		t.Fatal(err)
+	}
+	if sender.count() != 1 {
+		t.Fatalf("a redelivery sent the reply again (%d total); the customer gets duplicates",
+			sender.count())
+	}
+}
+
+// SENDING FROM AN UNVERIFIED DOMAIN IS REFUSED. Sending as a domain the
+// deployment does not control is how its IP gets burned — migration 055's
+// header says so, and until now nothing enforced it.
+func TestSendingFromAnUnverifiedDomainIsRefused(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+
+	// A mailbox with NO verified domain — which is every mailbox created
+	// before verification existed.
+	mb := newMailbox(t, ws, me)
+	conv, _, err := mailRepo(t).Ingest(ctx, inbound(mb, fmt.Sprintf("unver-%d", time.Now().UnixNano())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/conversations/"+conv.ID+"/reply", admin,
+		map[string]string{"body_text": "should not leave the building"})
+	var reply struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, resp.Data, &reply)
+
+	sender := &recordingSender{}
+	if err := mailbox.NewConsumer(h.app.DB, sender, nil).Deliver(ctx, reply.ID); err != nil {
+		t.Fatal(err)
+	}
+	if sender.count() != 0 {
+		t.Fatal("sent from an unverified domain")
+	}
+
+	// And it stays visibly undelivered rather than being marked sent, so it
+	// goes out the moment the domain is verified.
+	var sentAt *time.Time
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT sent_at FROM mail_messages WHERE id = $1`, reply.ID).Scan(&sentAt); err != nil {
+		t.Fatal(err)
+	}
+	if sentAt != nil {
+		t.Fatal("a refused message was marked sent")
+	}
+}
+
+// The sweeper is the backstop for a queue publish that never landed. Without it
+// a message-bus hiccup loses an agent's reply permanently.
+func TestTheSweeperDeliversWhatTheQueueLost(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+	n := time.Now().UnixNano()
+
+	domain := fmt.Sprintf("swept-%d.test", n)
+	var domainID string
+	if err := h.app.DB.QueryRow(ctx, `
+		INSERT INTO mail_domains (workspace_id, domain, verify_token, verified_at)
+		VALUES ($1, $2, 'tok', NOW()) RETURNING id::text`, ws, domain).Scan(&domainID); err != nil {
+		t.Fatal(err)
+	}
+	mb, err := mailRepo(t).CreateMailbox(ctx, ws, fmt.Sprintf("help@%s", domain), "Help", "HLP", me)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.app.DB.Exec(ctx, `UPDATE mailboxes SET domain_id = $2 WHERE id = $1`, mb.ID, domainID); err != nil {
+		t.Fatal(err)
+	}
+	conv, _, err := mailRepo(t).Ingest(ctx, inbound(mb, fmt.Sprintf("sweep-%d", n)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/conversations/"+conv.ID+"/reply", admin,
+		map[string]string{"body_text": "the queue dropped this"})
+	var reply struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, resp.Data, &reply)
+
+	// Age it past the sweeper's grace period, which exists so it never races
+	// the consumer for something queued a moment ago.
+	if _, err := h.app.DB.Exec(ctx,
+		`UPDATE mail_messages SET created_at = NOW() - INTERVAL '10 minutes' WHERE id = $1`,
+		reply.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	sender := &recordingSender{}
+	n2, err := mailbox.NewConsumer(h.app.DB, sender, nil).SweepUnsent(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n2 < 1 || sender.count() < 1 {
+		t.Fatal("the sweeper delivered nothing; a dropped publish loses the reply permanently")
+	}
+}
+
+// Ingest and domain administration must be reachable through the product.
+// Neither was: no route minted a token, so POST /mail/inbound was a permanent
+// 401, and no route created a domain, so nothing could ever be verified.
+func TestMailAdministrationIsReachable(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+
+	// An ingest token, returned once.
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/mail/ingest-tokens", admin, map[string]string{"name": "provider"})
+	var created struct {
+		Token struct {
+			ID    string `json:"id"`
+			Token string `json:"token"`
+		} `json:"token"`
+	}
+	decodeInto(t, resp.Data, &created)
+	if created.Token.Token == "" {
+		t.Fatal("the create response carries no plaintext token, so nobody can configure ingest")
+	}
+
+	// It works against the real ingest route.
+	mb := newMailbox(t, ws, h.whoami(t, admin))
+	body := map[string]any{
+		"event_id":  fmt.Sprintf("ev-admin-%d", time.Now().UnixNano()),
+		"recipient": mb.Address, "message_id": "<admin@customer.test>",
+		"from": "customer@customer.test", "subject": "hi", "body_text": "hello",
+	}
+	if code, r := h.doBearer(t, http.MethodPost, "/api/v1/mail/inbound", created.Token.Token, body); code != http.StatusCreated {
+		t.Fatalf("ingest with a minted token = %d (%+v)", code, r.Error)
+	}
+
+	// Listing never returns the secret again.
+	var listed []struct {
+		ID    string `json:"id"`
+		Token string `json:"token"`
+	}
+	decodeInto(t, h.req(t, http.StatusOK, http.MethodGet,
+		"/api/v1/workspaces/"+ws+"/mail/ingest-tokens", admin, nil).Data, &listed)
+	for _, x := range listed {
+		if x.Token != "" {
+			t.Fatal("the token list leaks the plaintext secret")
+		}
+	}
+
+	// Revoking stops it.
+	h.req(t, http.StatusNoContent, http.MethodDelete,
+		"/api/v1/mail/ingest-tokens/"+created.Token.ID, admin, nil)
+	body["event_id"] = fmt.Sprintf("ev-admin2-%d", time.Now().UnixNano())
+	if code, _ := h.doBearer(t, http.MethodPost, "/api/v1/mail/inbound", created.Token.Token, body); code != http.StatusUnauthorized {
+		t.Fatalf("a revoked token still works = %d", code)
+	}
+
+	// Domains: create returns the DNS instructions, and verification fails
+	// until the record exists.
+	dresp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/mail/domains", admin,
+		map[string]string{"domain": fmt.Sprintf("claim-%d.test", time.Now().UnixNano())})
+	var dom struct {
+		ID          string `json:"id"`
+		VerifyHost  string `json:"verify_host"`
+		VerifyValue string `json:"verify_value"`
+	}
+	decodeInto(t, dresp.Data, &dom)
+	if dom.VerifyHost == "" || dom.VerifyValue == "" {
+		t.Fatal("the domain response carries no DNS instructions, so it can never be verified")
+	}
+
+	var verdict struct {
+		Verified bool `json:"verified"`
+	}
+	decodeInto(t, h.req(t, http.StatusOK, http.MethodPost,
+		"/api/v1/mail/domains/"+dom.ID+"/verify", admin, nil).Data, &verdict)
+	if verdict.Verified {
+		t.Fatal("a domain with no TXT record verified; ownership is not being checked")
+	}
+
+	// A non-admin may do none of it.
+	member := h.newUser(t, admin, ws, "mail-nonadmin")
+	if code, _ := h.do(t, http.MethodPost, "/api/v1/workspaces/"+ws+"/mail/ingest-tokens",
+		member.token, map[string]string{"name": "x"}); code != http.StatusForbidden {
+		t.Fatalf("a non-admin minting an ingest token = %d, want 403", code)
 	}
 }

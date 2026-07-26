@@ -600,7 +600,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	channelHandler.RegisterRoutes(mux, authMw)
 	collabHandler.RegisterRoutes(mux, authMw)
 	driveHandler.RegisterRoutes(mux, authMw)
-	mailboxHandler := mailbox.NewHandler(pool, az, logger)
+	mailboxHandler := mailbox.NewHandler(pool, az, mailbox.NewPublisher(natsClient, logger), logger)
 	mailboxHandler.RegisterRoutes(mux, authMw)
 	// Ingest is authenticated by a deployment-owned bearer token, not by a user
 	// session, and rate-limited by IP so a provider stuck in a retry loop

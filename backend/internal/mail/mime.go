@@ -94,6 +94,16 @@ func render(from Address, msg *Message, now time.Time) (*renderedMessage, error)
 		return nil, permanent("reply-to contains a line break", nil)
 	}
 
+	// A per-message sender overrides the deployment default. Validated exactly
+	// as the default is — a header-injection guard must not have a bypass on
+	// the path that carries caller-influenced data.
+	if msg.From != nil && msg.From.Email != "" {
+		if strings.ContainsAny(msg.From.Email, "\r\n") || strings.ContainsAny(msg.From.Name, "\r\n") {
+			return nil, permanent("sender address contains a line break", nil)
+		}
+		from = *msg.From
+	}
+
 	at := strings.LastIndex(from.Email, "@")
 	domain := from.Email[at+1:]
 	if domain == "" {
@@ -103,6 +113,16 @@ func render(from Address, msg *Message, now time.Time) (*renderedMessage, error)
 	msgID, err := messageID(domain)
 	if err != nil {
 		return nil, err
+	}
+	// A caller-supplied Message-ID is used verbatim, because the shared inbox
+	// stored it BEFORE sending: the conversation's thread is keyed on it, and a
+	// reply that went out under a different id would not be recognised when the
+	// customer replies back.
+	if msg.MessageID != "" {
+		if strings.ContainsAny(msg.MessageID, "\r\n") {
+			return nil, permanent("message id contains a line break", nil)
+		}
+		msgID = msg.MessageID
 	}
 
 	bodyHeaders, body, err := buildBody(msg)
@@ -121,11 +141,36 @@ func render(from Address, msg *Message, now time.Time) (*renderedMessage, error)
 	if msg.ReplyTo != "" {
 		headers = append(headers, header{"Reply-To", msg.ReplyTo})
 	}
+	// THREADING. Without these a reply lands in the customer's inbox as a new
+	// conversation: subject-line threading is a client-side guess that fails
+	// the moment anybody edits the subject, and the agent's answer then looks
+	// like an unsolicited email.
+	if msg.InReplyTo != "" {
+		if strings.ContainsAny(msg.InReplyTo, "\r\n") {
+			return nil, permanent("in-reply-to contains a line break", nil)
+		}
+		headers = append(headers, header{"In-Reply-To", msg.InReplyTo})
+	}
+	if len(msg.References) > 0 {
+		refs := strings.Join(msg.References, " ")
+		if strings.ContainsAny(refs, "\r\n") {
+			return nil, permanent("references contains a line break", nil)
+		}
+		headers = append(headers, header{"References", refs})
+	}
 	headers = append(headers, bodyHeaders...)
-	// Everything this product sends is machine-generated. Saying so stops
+	// MOST of what this product sends is machine-generated, and saying so stops
 	// out-of-office autoresponders from replying to a no-reply address and
-	// stops some mailing lists from treating the message as human traffic.
-	headers = append(headers, header{"Auto-Submitted", "auto-generated"})
+	// stops some mailing lists from treating it as human traffic.
+	//
+	// A SHARED-INBOX REPLY IS NOT. It was typed by a person answering a
+	// customer, and labelling it auto-generated is a lie with consequences:
+	// some receivers score it as bulk, and it suppresses the out-of-office
+	// reply an agent may specifically need to see. A per-message sender is the
+	// signal — nothing but the shared inbox sets one.
+	if msg.From == nil {
+		headers = append(headers, header{"Auto-Submitted", "auto-generated"})
+	}
 
 	for _, h := range headers {
 		for _, line := range strings.Split(h.Name+": "+h.Value, crlf) {
