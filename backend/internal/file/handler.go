@@ -141,15 +141,23 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	// member can bypass by posting to /api/v1/files/upload is not enforcement.
 	// The version row belongs here because quota's invariant I1 sums
 	// file_versions — a file with no version row is silently free storage.
+	var createdAt time.Time
 	if err := database.WithTx(ctx, h.pool, func(tx pgx.Tx) error {
 		if _, err := quota.ChargeTx(ctx, tx, workspaceID, header.Size); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx,
+		// created_at comes BACK from the row rather than being taken from the
+		// clock at publish time. The index sorts on it, and cmd/reindex reads
+		// the real column — so a wall-clock value here would give a live-indexed
+		// attachment a different sort key from the same file after a rebuild.
+		// That is the live-vs-rebuild disagreement that made `?channel=` return
+		// nothing, in a smaller place.
+		if err := tx.QueryRow(ctx,
 			`INSERT INTO files (id, workspace_id, user_id, name, content_type, size_bytes, storage_key)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 RETURNING created_at`,
 			fileID, workspaceID, userID, name, contentType, header.Size, storageKey,
-		); err != nil {
+		).Scan(&createdAt); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx,
@@ -175,7 +183,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	// product: the row is the truth and the index is derived.
 	h.publish(ctx, ChatFileEvent{
 		ID: fileID, WorkspaceID: workspaceID, UserID: userID,
-		Name: name, CreatedAt: time.Now().UTC(),
+		Name: name, CreatedAt: createdAt.UTC(),
 	})
 
 	httputil.JSON(w, http.StatusCreated, map[string]interface{}{

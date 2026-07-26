@@ -109,8 +109,20 @@ func NewIndexer(service *Service, acl ACLSource, bodies BodySource, logger *slog
 	// A BodySource that can also answer the channel question answers it. One
 	// constructor rather than two, so no caller can be updated for the body and
 	// silently miss the channel.
+	//
+	// SAID OUT LOUD when it cannot. A type assertion that quietly fails leaves
+	// every chat attachment with an empty channel_id and `?channel=` matching
+	// nothing — which is the exact defect this seam was added to fix, returning
+	// through the back door. A nil bodies is a deployment choice and says so at
+	// a lower level; a NON-nil source that cannot answer is a wiring mistake.
 	if cs, ok := bodies.(ChannelSource); ok {
 		idx.channels = cs
+	} else if bodies != nil && logger != nil {
+		logger.Warn("the search body source cannot resolve a file's channel; "+
+			"chat attachments will index with no channel and `?channel=` will not match them",
+			"body_source", fmt.Sprintf("%T", bodies))
+	} else if logger != nil {
+		logger.Info("search indexing without a body source: titles only, no channel scope")
 	}
 	return idx
 }

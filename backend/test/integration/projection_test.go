@@ -570,3 +570,62 @@ func (h *harness) setHeadSeq(t *testing.T, documentID string, head int64) {
 		t.Fatalf("set head seq: %v", err)
 	}
 }
+
+// AN UNANSWERABLE DOCUMENT MUST NOT STARVE THE QUEUE.
+//
+// The sweep ordered by updated_at and took the first N with no state at all, so
+// the batch was a pure function of the table and the oldest entries never left
+// it. Only a client holding the CRDT can produce a projection, so a document
+// whose room is permanently empty can NEVER be repaired — and it sat at the
+// front of that queue forever while everything behind it starved. At the job's
+// batch of 100, a tenant with 100 abandoned documents stopped repairing
+// anything else, and the WARN line kept reporting the same count every ten
+// minutes as though the sweep were working.
+//
+// Found by an audit that wrote this scenario as a failing test against my code.
+func TestTheRepairSweepDoesNotAskTheSameDocumentForever(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	ctx := context.Background()
+
+	// Two stale documents. The zombie went stale first, so a queue ordered by
+	// age alone would return it every single time.
+	zombie := h.newDocument(t, admin, ws, fmt.Sprintf("zombie-%d", time.Now().UnixNano()))
+	newer := h.newDocument(t, admin, ws, fmt.Sprintf("newer-%d", time.Now().UnixNano()))
+	if zombie.CollabDocumentID == nil || newer.CollabDocumentID == nil {
+		t.Fatal("a document has no collaborative document")
+	}
+	// Both far behind and far older than every other row in the table, so this
+	// test does not depend on what previous tests left lying around.
+	for id, age := range map[string]string{
+		*zombie.CollabDocumentID: "20 years",
+		*newer.CollabDocumentID:  "19 years",
+	} {
+		if _, err := h.app.DB.Exec(ctx, `
+			UPDATE collab_documents
+			   SET head_seq = 5000, updated_at = NOW() - $2::interval,
+			       repair_requested_at = NULL
+			 WHERE id = $1`, id, age); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A batch of one is the same mechanism as the job's hundred, in miniature.
+	seen := map[string]int{}
+	for sweep := 0; sweep < 2; sweep++ {
+		got, err := collab.FindStaleProjections(ctx, h.app.DB, 200, 30*time.Minute, 1)
+		if err != nil {
+			t.Fatalf("sweep %d: %v", sweep, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("sweep %d returned %d rows, want 1", sweep, len(got))
+		}
+		seen[got[0].DocumentID]++
+	}
+
+	if seen[*zombie.CollabDocumentID] != 1 || seen[*newer.CollabDocumentID] != 1 {
+		t.Fatalf("two sweeps asked %v — an unanswerable document is holding the "+
+			"front of the queue and everything behind it starves", seen)
+	}
+}

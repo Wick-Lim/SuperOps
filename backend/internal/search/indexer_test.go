@@ -1,10 +1,12 @@
 package search
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/nats-io/nats.go"
@@ -214,4 +216,37 @@ func TestFilterableAttributesCoverTheAuthorizationFilter(t *testing.T) {
 	if !sameSequence(wantSearchable, []string{"title", "content"}) {
 		t.Errorf("wantSearchable = %v", wantSearchable)
 	}
+}
+
+// THE CHANNEL SEAM MUST NOT FAIL SILENTLY.
+//
+// NewIndexer picks up ChannelSource with a type assertion on the BodySource. If
+// that assertion quietly fails, every chat attachment indexes with an empty
+// channel_id and `?channel=` matches nothing — the exact defect the seam was
+// added to fix, returning through the back door.
+func TestNewIndexerSaysSoWhenItCannotResolveAChannel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	NewIndexer(nil, nil, bodyOnlySource{}, logger)
+	if !strings.Contains(buf.String(), "cannot resolve a file's channel") {
+		t.Errorf("a body source that is not a ChannelSource was accepted silently; log was %q", buf.String())
+	}
+
+	// And one that CAN answer says nothing.
+	buf.Reset()
+	NewIndexer(nil, nil, bodyAndChannelSource{}, logger)
+	if strings.Contains(buf.String(), "cannot resolve") {
+		t.Errorf("a capable body source was warned about anyway: %q", buf.String())
+	}
+}
+
+type bodyOnlySource struct{}
+
+func (bodyOnlySource) BodyForFile(context.Context, string) (string, error) { return "", nil }
+
+type bodyAndChannelSource struct{ bodyOnlySource }
+
+func (bodyAndChannelSource) ChannelForFile(context.Context, string) (string, error) {
+	return "", nil
 }

@@ -39,9 +39,21 @@ import (
 // fileEvents collects file events off the real JetStream stream for one
 // workspace. It is an ephemeral consumer starting at "new", so it sees only
 // what this test causes.
+// fileEvent is what a test needs off the wire: which file, and the payload
+// fields a publisher can get wrong.
+type fileEvent struct {
+	id        string
+	createdAt string
+}
+
 type fileEvents struct {
-	msgs chan string // file id per event
+	msgs chan fileEvent
 	stop func()
+	// last is the most recent matching event, so a test can assert on the
+	// PAYLOAD the publisher actually put on the wire rather than on a payload
+	// the test reconstructed from the database — which is what made the first
+	// version of the timestamp test vacuous.
+	last fileEvent
 }
 
 func watchFileEvents(t *testing.T, workspaceID string) *fileEvents {
@@ -65,17 +77,18 @@ func watchFileEvents(t *testing.T, workspaceID string) *fileEvents {
 		t.Fatalf("create consumer: %v", err)
 	}
 
-	fe := &fileEvents{msgs: make(chan string, 64)}
+	fe := &fileEvents{msgs: make(chan fileEvent, 64)}
 	cc, err := cons.Consume(func(m jetstream.Msg) {
 		_ = m.Ack()
 		var env struct {
 			Data struct {
-				ID string `json:"id"`
+				ID        string `json:"id"`
+				CreatedAt string `json:"created_at"`
 			} `json:"data"`
 		}
 		if json.Unmarshal(m.Data(), &env) == nil {
 			select {
-			case fe.msgs <- env.Data.ID:
+			case fe.msgs <- fileEvent{id: env.Data.ID, createdAt: env.Data.CreatedAt}:
 			default:
 			}
 		}
@@ -107,9 +120,10 @@ func (fe *fileEvents) countFor(fileID string, want int, d time.Duration) int {
 	if want == 0 {
 		for {
 			select {
-			case id := <-fe.msgs:
-				if id == fileID {
+			case ev := <-fe.msgs:
+				if ev.id == fileID {
 					n++
+					fe.last = ev
 				}
 			case <-deadline:
 				return n
@@ -118,9 +132,10 @@ func (fe *fileEvents) countFor(fileID string, want int, d time.Duration) int {
 	}
 	for n < want {
 		select {
-		case id := <-fe.msgs:
-			if id == fileID {
+		case ev := <-fe.msgs:
+			if ev.id == fileID {
 				n++
+				fe.last = ev
 			}
 		case <-deadline:
 			return n
@@ -129,9 +144,10 @@ func (fe *fileEvents) countFor(fileID string, want int, d time.Duration) int {
 	settle := time.After(750 * time.Millisecond)
 	for {
 		select {
-		case id := <-fe.msgs:
-			if id == fileID {
+		case ev := <-fe.msgs:
+			if ev.id == fileID {
 				n++
+				fe.last = ev
 			}
 		case <-settle:
 			return n
@@ -372,4 +388,49 @@ func (h *harness) searchHitsInChannel(t *testing.T, token, workspaceID, query, c
 		out = append(out, hit.ID)
 	}
 	return out
+}
+
+// THE INDEXED TIMESTAMP MUST BE THE ROW'S.
+//
+// The chat-upload event carried `time.Now()` from the moment of publish rather
+// than the row's own created_at. The index sorts on that field and cmd/reindex
+// reads the real column, so the same file had one sort key when indexed live
+// and a different one after a rebuild — the live-vs-rebuild disagreement that
+// made `?channel=` return nothing, in a smaller place.
+func TestAnUploadedAttachmentIsIndexedWithItsRowTimestamp(t *testing.T) {
+	h := getHarness(t)
+	h.requireSearch(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	ctx := context.Background()
+
+	watch := watchFileEvents(t, ws)
+	fileID := h.upload(t, admin, ws, fmt.Sprintf("stamp-%d.txt", time.Now().UnixNano()))
+	if fileID == "" {
+		t.Fatal("file storage is not wired; this test cannot verify anything")
+	}
+	if got := watch.countFor(fileID, 1, 6*time.Second); got != 1 {
+		t.Fatalf("uploading produced %d events, want 1", got)
+	}
+
+	var rowCreated time.Time
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT created_at FROM files WHERE id = $1`, fileID).Scan(&rowCreated); err != nil {
+		t.Fatal(err)
+	}
+
+	// ON THE WIRE. The first version of this test indexed through
+	// indexDriveFile, which builds its event FROM THE ROW — so it agreed by
+	// construction and passed with the publisher sending a timestamp two days
+	// in the future. The only honest check is the payload the publisher emitted.
+	published, err := time.Parse(time.RFC3339Nano, watch.last.createdAt)
+	if err != nil {
+		t.Fatalf("the published created_at is unparseable (%q): %v", watch.last.createdAt, err)
+	}
+	if !published.Equal(rowCreated) {
+		t.Fatalf("published created_at = %s, row created_at = %s — a live-indexed "+
+			"attachment sorts differently from the same file after a rebuild, "+
+			"because cmd/reindex reads the column",
+			published.UTC(), rowCreated.UTC())
+	}
 }
