@@ -330,23 +330,51 @@ jobs:
           # iOS ships Hermes bytecode; its string table still carries literals.
           ios=$(ls /tmp/bundle-ios/_expo/static/js/ios/* | head -1)
 
+          # STRINGS ONCE, INTO A FILE. Never `strings "$ios" | grep -q`.
+          #
+          # `grep -q` exits on its FIRST match, `strings` then dies of SIGPIPE
+          # (141), and `set -o pipefail` makes the whole pipeline exit 141. So
+          # every leak check was false exactly when the string WAS present —
+          # the detectors could not fire, by construction — and the two presence
+          # checks, which use `|| error`, failed on a correct bundle. This step
+          # was simultaneously blind and red.
+          #
+          # Reproduced: PIPESTATUS=141 0 on a 25 MB input with an early match.
+          # Reading the table into a file removes the pipe, and it also runs
+          # `strings` once instead of four times.
+          strings "$ios" > /tmp/ios-strings.txt
+
+          leak() {
+            if grep -q${3:-} -- "$1" /tmp/ios-strings.txt; then
+              echo "::error::$2"
+              exit 1
+            fi
+          }
+          present() {
+            grep -q -- "$1" /tmp/ios-strings.txt || { echo "::error::$2"; exit 1; }
+          }
+
           grep -q 'superops-editor' "$web" \
             || { echo "::error::the web bundle has no editor — the platform split resolved the wrong file"; exit 1; }
           grep -qi 'livekit' "$web" \
             || { echo "::error::the web bundle has no call client — the huddle platform split resolved the wrong file"; exit 1; }
 
-          if strings "$ios" | grep -q 'prosemirror'; then
-            echo "::error::prosemirror leaked into the iOS bundle; the mobile app grew ~400 KB for a feature it does not have"
+          leak 'prosemirror' 'prosemirror leaked into the iOS bundle; the mobile app grew ~400 KB for a feature it does not have'
+          leak 'livekit' 'livekit-client leaked into the iOS bundle; that is ~200 KB of WebRTC for a join path the mobile dev-build cut removes' i
+          present 'Editing documents is available on the web' 'the iOS bundle has no document renderer at all'
+          present 'Join this huddle from the web app' 'the iOS bundle has no huddle surface at all'
+
+          # SELF-CHECK. The bug above made these assertions carry no information
+          # while still printing a verdict, so the step now proves its own
+          # detector works before trusting its silence: a string that is
+          # certainly in the table must be found, and one that certainly is not
+          # must not be.
+          grep -q -- 'Editing documents is available on the web' /tmp/ios-strings.txt \
+            || { echo "::error::the leak detector cannot find a string that is present; its silence means nothing"; exit 1; }
+          if grep -q -- 'zzz-this-string-is-never-in-any-bundle-zzz' /tmp/ios-strings.txt; then
+            echo "::error::the leak detector matches a string that cannot be present"
             exit 1
           fi
-          if strings "$ios" | grep -qi 'livekit'; then
-            echo "::error::livekit-client leaked into the iOS bundle; that is ~200 KB of WebRTC for a join path the mobile dev-build cut removes"
-            exit 1
-          fi
-          strings "$ios" | grep -q 'Editing documents is available on the web' \
-            || { echo "::error::the iOS bundle has no document renderer at all"; exit 1; }
-          strings "$ios" | grep -q 'Join this huddle from the web app' \
-            || { echo "::error::the iOS bundle has no huddle surface at all"; exit 1; }
           echo "editor and call client are web-only; both native fallbacks are present"
 
       # A GATE THAT CANNOT RUN IS NOT A GATE THAT PASSED.

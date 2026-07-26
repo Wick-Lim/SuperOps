@@ -74,10 +74,10 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
         setStatus(s)
         setDetail(d ?? null)
       },
-      // The server asking for a projection it cannot produce itself. Routed
-      // through the same `behind` flag as the gap on open, so one code path
-      // answers both — and so it waits for `synced` rather than projecting an
-      // empty document that has not received its state yet.
+      // The server asking for a projection it cannot produce itself. Raises the
+      // same counter as the gap on open, so both arrive at whichever surface
+      // owns this file's content — and both wait for `synced` rather than
+      // projecting a document that has not received its state yet.
       onProjectRequest: () => setProjectNonce((n) => n + 1),
     })
     providerRef.current = provider
@@ -187,15 +187,19 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   // one, and the server's monotonic guard would not stop it — the seq is the
   // log head either way. Read-only callers do not project at all; they have no
   // capability for it and the server would refuse.
+  //
+  // THE BLOCK EDITOR IS NOT HANDLED HERE. It owns its own ProseMirror state, so
+  // it answers through the `catchUp` prop below; this effect must not consume
+  // the nonce on its behalf. It used to — the assignment sat above the type
+  // switch, so a `document` request was marked answered and nothing was
+  // published, which is precisely the swallow the counter exists to prevent.
   const caughtUp = useRef(0)
   useEffect(() => {
+    if (fileType !== 'spreadsheet' && fileType !== 'design') return
     if (projectNonce === 0 || caughtUp.current === projectNonce) return
     if (status !== 'synced' || !fileId) return
     caughtUp.current = projectNonce
     const timer = setTimeout(() => {
-      // The block editor projects through its own settle path, which its mount
-      // already schedules; projecting from here as well would race it.
-      if (fileType !== 'spreadsheet' && fileType !== 'design') return
       const projection =
         fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq)
       // EMPTY IS NOT A REPAIR — see worthPublishing.
@@ -273,6 +277,7 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
                 onProject={publish}
                 seq={seq}
                 fileId={fileId}
+                catchUp={projectNonce}
               />
               {/* "Where is this used". Filtered by what the READER may see, so
                   a document that mentions this one but is not shared with them

@@ -329,6 +329,28 @@ func (h *Handler) PatchConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The assignee must be able to reach the conversation.
+	//
+	// This used to cast straight to uuid with no check at all, so a
+	// conversation could be assigned to any user id on the deployment —
+	// somebody in another tenant entirely. Nothing reads assignee_id back
+	// today, which is the only reason it was not already a leak; the
+	// idx_mail_conversations_assignee index exists for the "assigned to me"
+	// view, and this would have been that view's cross-tenant leak on day one.
+	if req.AssigneeID != nil && *req.AssigneeID != "" {
+		got, err := h.authz.Capability(ctx, authz.UserSubject(*req.AssigneeID),
+			authz.ObjectRef{Type: "conversation", ID: id})
+		if err != nil {
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return
+		}
+		if !got.Implies(authz.CapRead) {
+			httputil.JSONError(w, http.StatusBadRequest, "INVALID_ASSIGNEE",
+				"that person cannot reach this conversation")
+			return
+		}
+	}
+
 	// COALESCE keeps an omitted field untouched, so two agents changing
 	// different fields do not overwrite each other's work.
 	if _, err := h.pool.Exec(ctx, `

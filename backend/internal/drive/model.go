@@ -138,6 +138,12 @@ type Entry struct {
 const (
 	EntryFolder = "folder"
 	EntryFile   = "file"
+
+	// Shareable but not Drive entries. They are listed here because the sharing
+	// route's object_type vocabulary lives here; nothing else in Drive uses
+	// them.
+	EntryMailbox      = "mailbox"
+	EntryConversation = "conversation"
 )
 
 // MaxFolderDepth caps nesting. It is below internal/authz's MaxPathDepth (32

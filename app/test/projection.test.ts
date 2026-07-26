@@ -254,3 +254,52 @@ describe('the catch-up publish rule', () => {
     expect(worthPublishing(out)).toBe(true)
   })
 })
+
+// THE CATCH-UP CHAIN, END TO END — not one hop short.
+//
+// The provider test above asserts that a `collab.project` frame reaches
+// `onProjectRequest`. It passed while the chain was BROKEN: the screen never
+// passed `catchUp` to <Editor>, so the request died one component later, and
+// the repair path the server re-asks for every ten minutes did nothing for the
+// primary editor. Three independent audits found it; no test did, because every
+// test stopped at the provider.
+//
+// `catchUp` is optional, so tsc could not see the missing prop either. This
+// asserts the wiring itself: the source must pass it, and the screen must not
+// consume the counter on the block editor's behalf.
+describe('the catch-up chain reaches the editor', () => {
+  it('passes catchUp from the screen to the Editor', async () => {
+    const fs = await import('node:fs/promises')
+    const src = await fs.readFile('src/screens/CollabDocumentScreen.tsx', 'utf8')
+
+    // The <Editor> element, from its tag to the self-closing bracket.
+    const el = src.match(/<Editor\b[\s\S]*?\/>/)
+    expect(el, 'CollabDocumentScreen no longer renders <Editor>').not.toBeNull()
+    expect(
+      el![0],
+      'the Editor is rendered without catchUp, so the server\'s collab.project ' +
+        'request and the head_seq/projection_seq gap are both dead for documents',
+    ).toContain('catchUp=')
+  })
+
+  // The screen's own catch-up serves the sheet and the canvas. It must bail on
+  // `document` BEFORE claiming the nonce, or it marks the request answered and
+  // publishes nothing — the exact swallow the counter exists to prevent.
+  it('does not consume the nonce on the block editor\'s behalf', async () => {
+    const fs = await import('node:fs/promises')
+    const src = await fs.readFile('src/screens/CollabDocumentScreen.tsx', 'utf8')
+
+    const claim = src.indexOf('caughtUp.current = projectNonce')
+    expect(claim, 'the screen no longer claims the nonce').toBeGreaterThan(-1)
+
+    // Walk back to the effect that contains it and check the type guard is
+    // inside that effect and above the claim.
+    const effectStart = src.lastIndexOf('useEffect(() => {', claim)
+    const guard = src.indexOf("fileType !== 'spreadsheet'", effectStart)
+    expect(
+      guard > -1 && guard < claim,
+      'the screen claims the projection nonce before checking the file type, so a ' +
+        'document request is marked answered and nothing is published',
+    ).toBe(true)
+  })
+})

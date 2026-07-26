@@ -125,17 +125,25 @@ func (c *Checker) resolve(ctx context.Context, obj ObjectRef) (*objectState, err
 		// CURRENT path — a folder that has been moved carries a different one —
 		// and computing a second opinion here would make a moved subtree
 		// authorize against where it used to be.
-		var channelID, channelType, folderPath *string
+		var channelID, channelType, folderPath, conversationPath *string
 		err := c.pool.QueryRow(ctx, `
-			SELECT f.workspace_id::text, f.user_id::text, ch.id::text, ch.type::text, fo.path
+			SELECT f.workspace_id::text, f.user_id::text, ch.id::text, ch.type::text,
+			       fo.path, co.path
 			  FROM files f
 			  LEFT JOIN acl_object fo ON fo.object_type  = 'folder'
 			                         AND fo.object_id    = f.folder_id
 			                         AND fo.workspace_id = f.workspace_id
+			  LEFT JOIN mail_messages mm ON mm.id = f.mail_message_id
+			  LEFT JOIN mail_conversations mc ON mc.id = mm.conversation_id
+			                                 AND mc.workspace_id = f.workspace_id
+			  LEFT JOIN acl_object co ON co.object_type  = 'conversation'
+			                         AND co.object_id    = mc.id
+			                         AND co.workspace_id = f.workspace_id
 			  LEFT JOIN messages m  ON m.id = f.message_id
 			  LEFT JOIN channels ch ON ch.id = m.channel_id AND ch.workspace_id = f.workspace_id
 			 WHERE f.id = $1`, obj.ID).
-			Scan(&st.workspaceID, &st.ownerID, &channelID, &channelType, &folderPath)
+			Scan(&st.workspaceID, &st.ownerID, &channelID, &channelType,
+				&folderPath, &conversationPath)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
@@ -149,13 +157,25 @@ func (c *Checker) resolve(ctx context.Context, obj ObjectRef) (*objectState, err
 			}
 		}
 		// Path precedence matches acl_object_expected exactly: folder, then the
-		// attached message's channel, then the workspace. It has to, because
-		// grantedCapability walks these path segments looking for grants and a
-		// path this function invented would look for them in the wrong place.
+		// owning mail CONVERSATION, then the attached message's channel, then
+		// the workspace. It has to, because grantedCapability walks these path
+		// segments looking for grants and a path this function invented would
+		// look for them in the wrong place.
+		//
+		// THE CONVERSATION ARM WAS MISSING HERE AND PRESENT THERE, so the two
+		// authorities disagreed about every mail attachment: acl_key said "the
+		// mailbox's grantees" and Capability said "the uploader alone". An agent
+		// saw the attachment named in the thread and in every acl_key-driven
+		// listing — search, backlinks — and got 403 on download. The direction
+		// happened to be denial; which way a disagreement falls is decided by
+		// whichever consumer is added next, so the disagreement itself is the
+		// defect.
 		wsSeg := "/" + pathSegment(WorkspaceObject(st.workspaceID)) + "/"
 		switch {
 		case folderPath != nil:
 			st.path = *folderPath + pathSegment(obj) + "/"
+		case conversationPath != nil:
+			st.path = *conversationPath + pathSegment(obj) + "/"
 		case channelID != nil:
 			st.path = wsSeg + pathSegment(ChannelObject(*channelID)) + "/" + pathSegment(obj) + "/"
 		default:

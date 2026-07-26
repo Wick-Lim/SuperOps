@@ -15,6 +15,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/Wick-Lim/SuperOps/backend/internal/quota"
 	"github.com/Wick-Lim/SuperOps/backend/internal/workflow"
 	natspkg "github.com/Wick-Lim/SuperOps/backend/pkg/nats"
 )
@@ -1262,4 +1263,48 @@ func TestAGuestCannotReadWorkflowsOrTheirRuns(t *testing.T) {
 
 	// The admin still can, or this would be a regression rather than a fix.
 	h.req(t, http.StatusOK, http.MethodGet, "/api/v1/workflows/"+wf.ID, admin, nil)
+}
+
+// STORAGE QUOTA DRIFT IS RECONCILED.
+//
+// quota.Recompute existed, documented itself as the counterpart to the
+// incremental arithmetic, had a passing unit test proving it restores the
+// invariant — and nothing ever called it. bytes_used drifted from the files
+// permanently and invisibly, and the green test is what kept it invisible.
+//
+// This asserts the reconciler is reachable and actually corrects a drift, which
+// is the half a unit test cannot cover: that something calls it.
+func TestStorageQuotaDriftIsCorrected(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	ctx := context.Background()
+
+	// Corrupt the counter, the way months of incremental arithmetic would.
+	if _, err := h.app.DB.Exec(ctx, `
+		INSERT INTO workspace_storage (workspace_id, bytes_used, updated_at)
+		VALUES ($1, 999999999, NOW())
+		    ON CONFLICT (workspace_id) DO UPDATE SET bytes_used = 999999999`, ws); err != nil {
+		t.Fatal(err)
+	}
+
+	before, after, err := quota.Recompute(ctx, h.app.DB, ws)
+	if err != nil {
+		t.Fatalf("recompute: %v", err)
+	}
+	if before != 999999999 {
+		t.Fatalf("the fixture did not take: before = %d", before)
+	}
+	if after == before {
+		t.Fatal("recompute changed nothing against a deliberately corrupt counter")
+	}
+
+	var stored int64
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT bytes_used FROM workspace_storage WHERE workspace_id = $1`, ws).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != after {
+		t.Fatalf("workspace_storage holds %d, recompute reported %d", stored, after)
+	}
 }

@@ -24,28 +24,20 @@ import type { Projection } from './projection'
  * schema addition makes documents look empty on phones.
  */
 
-export interface EditorProps {
-  doc: Y.Doc
-  awareness: Awareness
-  /** The Drive object, for resolving reference labels against THIS document.
-   * Unused on native — the read-only renderer shows a reference as its
-   * placeholder rather than resolving it, because resolving costs a request per
-   * open on a connection that may be a phone's. */
-  fileId?: string
-  /** Publish a projection once the document has loaded, because the stored one
-   * is behind the log. Raised by the descriptor's head_seq/projection_seq gap
-   * on open and by the server's `collab.project` request — the two backstops
-   * for a document whose browser was killed before its debounce fired, since
-   * the server cannot produce content on its own.
-   *
-   * A COUNTER rather than a flag: the server re-asks, and a consumed boolean
-   * would swallow every request after the first. 0 means nothing is asked. */
-  catchUp?: number
-  editable: boolean
-  user: { name: string; color: string }
-  onProject: (projection: Projection) => void
-  seq: number
-}
+// THE PROPS COME FROM THE DECLARATION, they are not restated here.
+//
+// This file, its platform twin and Editor.d.ts each declared EditorProps
+// independently. `tsc` checks CALLERS against the .d.ts and each implementation
+// against its own copy, and nothing cross-checked the three — so adding a
+// required prop here type-checked, passed every test, and crashed on mount,
+// because no caller could ever pass it. Importing the declaration makes the
+// .d.ts the single contract and turns that into a compile error.
+//
+// A type-only import is erased before Metro sees it, so this cannot re-create
+// the resolution bug the .d.ts exists to avoid.
+import type { EditorProps, EditorProps as DeclaredEditorProps } from './Editor'
+
+export type { EditorProps }
 
 interface Block {
   key: string
@@ -179,3 +171,13 @@ const styles = StyleSheet.create({
   },
   noticeText: { color: theme.textMuted, fontSize: 13, textAlign: 'center' },
 })
+
+// THE CONTRACT, ASSERTED. Importing the props type is not enough on its own:
+// an implementation can widen its OWN parameter type and callers still type-
+// check against the declaration, which is how a required `tenantId` nobody
+// could pass compiled clean and crashed on mount.
+//
+// This line fails to compile whenever this file's component cannot be called
+// with exactly the props the .d.ts promises callers they may pass.
+const _satisfiesDeclaration: (props: DeclaredEditorProps) => unknown = Editor
+void _satisfiesDeclaration

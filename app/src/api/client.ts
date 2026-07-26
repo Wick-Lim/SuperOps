@@ -88,6 +88,43 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
+/**
+ * Turns a response and its parsed envelope into a result or an error.
+ *
+ * ONE COPY, because there were two and they had to agree. `request` and
+ * `upload` each carried their own version of this ladder; a rule fixed in one
+ * would silently not hold in the other, which is the shape of every quiet
+ * regression in this codebase.
+ *
+ * 204 IS A SUCCESS WITH NOTHING TO SAY. Nine handlers write a bare 204 — trash
+ * a file or folder, unshare, revoke a link, delete a comment, archive a
+ * workflow, end a huddle, revoke an ingest token — and every one of them was
+ * reported to the user as "the server returned an unreadable response". The
+ * operation had already completed, so the user saw "Could not delete it" about
+ * a thing that was deleted, and each success path was skipped with it: the
+ * huddle bar kept showing an ended call, a deleted workflow stayed on screen,
+ * a share list never reloaded.
+ *
+ * readEnvelope's own comment said the status decides the error. It never got
+ * to; this is where the status decides.
+ */
+function settle<T>(res: Response, envelope: Envelope | undefined): ApiResponse<T> {
+  if (!res.ok) throw errorFrom(res.status, envelope)
+  if (!envelope) {
+    if (res.status === 204 || res.status === 205) {
+      return { data: undefined as T }
+    }
+    throw new ApiError(
+      res.status,
+      ApiErrorCode.InvalidResponse,
+      'The server returned an unreadable response.',
+    )
+  }
+  // A 2xx with an error body should not happen, but the envelope allows it.
+  if (envelope.error) throw errorFrom(res.status, envelope)
+  return envelope as ApiResponse<T>
+}
+
 class ApiClient {
   /**
    * The single in-flight refresh. RefreshTokens rotates by DELETING the session
@@ -143,18 +180,7 @@ class ApiClient {
       }
     }
 
-    if (!res.ok) throw errorFrom(res.status, envelope)
-    if (!envelope) {
-      throw new ApiError(
-        res.status,
-        ApiErrorCode.InvalidResponse,
-        'The server returned an unreadable response.',
-      )
-    }
-    // A 2xx with an error body should not happen, but the envelope allows it.
-    if (envelope.error) throw errorFrom(res.status, envelope)
-
-    return envelope as ApiResponse<T>
+    return settle<T>(res, envelope)
   }
 
   /** Coalesces concurrent refreshes onto one request. */
@@ -225,12 +251,7 @@ class ApiClient {
       throw new ApiError(401, ApiErrorCode.SessionExpired, 'Your session expired. Please sign in again.')
     }
 
-    if (!res.ok) throw errorFrom(res.status, envelope)
-    if (!envelope) {
-      throw new ApiError(res.status, ApiErrorCode.InvalidResponse, 'The server returned an unreadable response.')
-    }
-    if (envelope.error) throw errorFrom(res.status, envelope)
-    return envelope as ApiResponse<T>
+    return settle<T>(res, envelope)
   }
 
   get<T>(path: string) { return this.request<T>('GET', path) }

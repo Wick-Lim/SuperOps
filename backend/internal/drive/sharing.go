@@ -90,15 +90,30 @@ func (h *Handler) shareTarget(w http.ResponseWriter, r *http.Request, want authz
 		httputil.HandleError(w, err)
 		return authz.ObjectRef{}, authz.CapNone, false
 	}
+	// THE PRODUCT'S ONLY SHARING SURFACE, so it must cover every object anybody
+	// needs to share — not only the two that happen to live in Drive.
+	//
+	// A mailbox was unreachable here, and CreateMailbox writes exactly one grant
+	// (CapAdmin to its creator). So the "shared inbox" had one reader for life,
+	// and because mailboxes.created_by is ON DELETE SET NULL while the grant's
+	// subject is that user, offboarding the creator left the mailbox — and every
+	// customer conversation and attachment in it — reachable by nobody and
+	// repairable only by hand-written SQL.
+	//
+	// A conversation is here too: a thread inherits from its mailbox, so
+	// granting on one is "bring somebody into this one customer's thread"
+	// without giving them the whole inbox.
 	var ref authz.ObjectRef
 	switch objectType {
 	case EntryFolder:
 		ref = authz.FolderObject(id)
 	case EntryFile:
 		ref = authz.FileObject(id)
+	case EntryMailbox, EntryConversation:
+		ref = authz.ObjectRef{Type: objectType, ID: id}
 	default:
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST",
-			`object_type must be "folder" or "file"`)
+			`object_type must be "folder", "file", "mailbox" or "conversation"`)
 		return authz.ObjectRef{}, authz.CapNone, false
 	}
 	got, ok := h.authorize(w, r, ref, want)

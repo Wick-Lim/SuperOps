@@ -33,7 +33,15 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['test/**/*.test.ts'],
+    // BOTH EXTENSIONS. The glob was `.test.ts` alone, so a `.test.tsx` — the
+    // natural extension for a component test in a React Native app — was
+    // silently never collected. A file asserting `expect(1).toBe(2)` was
+    // dropped in and the suite still reported all green.
+    //
+    // Zero-match is safe on its own (`vitest run` exits 1 with "No test files
+    // found"), which is exactly why this was invisible: the suite was never
+    // empty, it was just missing a whole category.
+    include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
     // Pinned so `API_BASE_URL` / `WS_BASE_URL` do not depend on the host that
     // happens to be running the suite (config.ts otherwise sniffs Metro/window).
     env: {

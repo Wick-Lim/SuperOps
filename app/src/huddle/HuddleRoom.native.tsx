@@ -18,10 +18,13 @@ import type { HuddleSession } from '../api/huddles'
  * exists and what CI's bundle check verifies.
  */
 
-export interface HuddleRoomProps {
-  session: HuddleSession
-  onLeave: () => void
-}
+// THE PROPS COME FROM THE DECLARATION — see Editor.web.tsx for why three
+// independent copies of a platform-split prop type are unchecked against each
+// other, and why a type-only import cannot re-create the Metro resolution bug
+// the .d.ts exists to avoid.
+import type { HuddleRoomProps, HuddleRoomProps as DeclaredHuddleRoomProps } from './HuddleRoom'
+
+export type { HuddleRoomProps }
 
 export default function HuddleRoom({ onLeave }: HuddleRoomProps) {
   return (
@@ -52,3 +55,7 @@ const styles = StyleSheet.create({
   closeText: { color: theme.body, fontSize: 13, fontWeight: '600' },
   pressed: { opacity: 0.7 },
 })
+
+// THE CONTRACT, ASSERTED — see Editor.web.tsx.
+const _satisfiesDeclaration: (props: DeclaredHuddleRoomProps) => unknown = HuddleRoom
+void _satisfiesDeclaration

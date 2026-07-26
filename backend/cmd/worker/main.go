@@ -57,6 +57,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/message"
 	"github.com/Wick-Lim/SuperOps/backend/internal/notification"
 	"github.com/Wick-Lim/SuperOps/backend/internal/push"
+	"github.com/Wick-Lim/SuperOps/backend/internal/quota"
 	"github.com/Wick-Lim/SuperOps/backend/internal/rtc"
 	"github.com/Wick-Lim/SuperOps/backend/internal/search"
 	"github.com/Wick-Lim/SuperOps/backend/internal/sso"
@@ -87,6 +88,7 @@ const (
 	jobWorkflowReaper   = "workflow_reaper"
 	jobMailSweep        = "mail_unsent_sweep"
 	jobProjectionRepair = "projection_repair"
+	jobQuotaDrift       = "quota_drift"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -100,6 +102,11 @@ const (
 	objectGCStartDelay     = 5 * time.Minute
 	aclDriftInterval       = time.Hour
 	aclDriftStartDelay     = 3 * time.Minute
+
+	// Quota drift. Hourly like acl_drift, and offset from it so two full-table
+	// sweeps do not start together.
+	quotaDriftInterval     = time.Hour
+	quotaDriftStartDelay   = 7 * time.Minute
 	inboxDigestInterval    = 5 * time.Minute
 	inboxDigestStartDelay  = 90 * time.Second
 	inboxReconcileInterval = 15 * time.Minute
@@ -196,6 +203,9 @@ const (
 	// sweeping the same stale documents would ask each room's leader twice for
 	// the same snapshot.
 	lockProjectionRepair int64 = 0x50_000D
+	// The storage-quota reconciler. Locked because it WRITES workspace_storage;
+	// two replicas recomputing the same workspace would race on the same row.
+	lockQuotaDrift int64 = 0x50_000E
 )
 
 // aclDriftSamples bounds how many concrete disagreements one drift report
@@ -459,6 +469,28 @@ func run() int {
 
 	start(jobACLDrift, aclDriftStartDelay, aclDriftInterval, func(c context.Context) error {
 		return runACLDrift(c, pool, az, l)
+	})
+
+	// Storage-quota drift. quota.Recompute existed, was documented as "the
+	// counterpart to the incremental arithmetic … drift here is a capacity and
+	// billing bug", had a passing test proving it restores the invariant — and
+	// nothing ever called it. So bytes_used drifted from the truth permanently
+	// and invisibly, and the green test is exactly what kept that invisible.
+	//
+	// Same cadence and same posture as acl_drift: it REPORTS. A quota that
+	// disagrees with the files is a number an operator needs to see, not a
+	// reason to refuse an upload.
+	start(jobQuotaDrift, quotaDriftStartDelay, quotaDriftInterval, func(c context.Context) error {
+		ran, err := withSingletonLock(c, pool, lockQuotaDrift, func(c context.Context) error {
+			return runQuotaDrift(c, pool, l)
+		})
+		if err != nil {
+			return err
+		}
+		if !ran {
+			l.Debug("quota drift skipped: another replica holds the lock")
+		}
+		return nil
 	})
 
 	// --- unified inbox jobs ---------------------------------------------------
@@ -1130,6 +1162,54 @@ func repairProjections(ctx context.Context, pool *pgxpool.Pool, nc *nats.Conn, l
 	// needs to be able to see without turning on debug logging.
 	l.Warn("asked rooms to repair stale projections",
 		"documents", len(found), "oldest_gap", found[0].Gap())
+	return nil
+}
+
+// runQuotaDrift re-derives every workspace's storage usage and logs what moved.
+//
+// Reports rather than blocks, for the same reason runACLDrift does: a quota that
+// disagrees with the files is a capacity and billing bug, and refusing uploads
+// over it would turn an accounting error into an outage.
+func runQuotaDrift(ctx context.Context, pool *pgxpool.Pool, l *slog.Logger) error {
+	rows, err := pool.Query(ctx, `SELECT id::text FROM workspaces ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list workspaces for quota drift: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan workspace: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	drifted := 0
+	for _, id := range ids {
+		before, after, err := quota.Recompute(ctx, pool, id)
+		if err != nil {
+			return err
+		}
+		if before == after {
+			continue
+		}
+		drifted++
+		// One line per drifting workspace, capped, so a systemic problem is
+		// visible without filling a disk when a backfill has not been run.
+		if drifted <= aclDriftSamples {
+			l.Warn("storage usage drifted from the files that back it",
+				"workspace_id", id, "recorded", before, "actual", after,
+				"delta", after-before)
+		}
+	}
+	if drifted > 0 {
+		l.Warn("storage quota drift corrected", "workspaces", drifted, "of", len(ids))
+	}
 	return nil
 }
 

@@ -480,3 +480,50 @@ describe('url helpers', () => {
     expect(fileURL('f1')).toBe(`${API}/files/f1?token=tok%2F9`)
   })
 })
+
+// 204 IS A SUCCESS WITH NOTHING TO SAY.
+//
+// Nine backend handlers write a bare 204 — trash a file or folder, unshare,
+// revoke a link, delete a comment, archive a workflow, end a huddle, revoke an
+// ingest token. Every one of them threw INVALID_RESPONSE at the caller, so the
+// user was told "Could not delete it" about a thing that had just been deleted,
+// and each success path was skipped with it: the huddle bar kept showing an
+// ended call, a deleted workflow stayed on screen, a share list never reloaded.
+describe('an empty success body', () => {
+  beforeEach(() => {
+    signIn()
+  })
+
+  it('resolves rather than reporting an unreadable response', async () => {
+    net = mockFetch(() => new Response(null, { status: 204 }))
+
+    const res = await api.del<void>('/drive/files/f-1')
+    expect(res.data).toBeUndefined()
+  })
+
+  it('resolves for every verb, because 204 is a status not a route', async () => {
+    net = mockFetch(() => new Response(null, { status: 204 }))
+
+    await expect(api.post<void>('/x')).resolves.toBeTruthy()
+    await expect(api.put<void>('/x')).resolves.toBeTruthy()
+    await expect(api.patch<void>('/x')).resolves.toBeTruthy()
+    await expect(api.del<void>('/x')).resolves.toBeTruthy()
+  })
+
+  // The distinction the fix must preserve: an empty body on a status that
+  // PROMISES content is still a broken response.
+  it('still refuses an empty body on a 200', async () => {
+    net = mockFetch(() => new Response(null, { status: 200 }))
+
+    await expect(api.get<unknown>('/x')).rejects.toMatchObject({
+      code: ApiErrorCode.InvalidResponse,
+    })
+  })
+
+  // And an error status with no body stays an error, not a silent success.
+  it('still throws on a 500 with no body', async () => {
+    net = mockFetch(() => new Response(null, { status: 500 }))
+
+    await expect(api.del<void>('/x')).rejects.toBeInstanceOf(ApiError)
+  })
+})

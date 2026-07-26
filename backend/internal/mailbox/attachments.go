@@ -203,13 +203,71 @@ func (r *Repository) AttachToOutbound(ctx context.Context, messageID, actorID st
 		}
 	}
 
-	_, err := r.pool.Exec(ctx,
-		`UPDATE files SET mail_message_id = $2 WHERE id = ANY($1) AND mail_message_id IS NULL`,
-		fileIDs, messageID)
+	// SAME TENANT, checked in the statement.
+	//
+	// Capability alone is not enough: a person who belongs to two workspaces
+	// legitimately holds read on a file in one and write on a conversation in
+	// the other, so authorization passes while the link crosses tenants. The
+	// ACL side then fails closed — 055's conversation arm joins on
+	// mc.workspace_id = f.workspace_id and drops the branch — so the file's
+	// bytes stayed unreachable, but its NAME, content type and size rendered in
+	// the other tenant's thread.
+	// Counted rather than compared against len(fileIDs), and counted on the
+	// END STATE rather than on rows affected.
+	//
+	// Rows-affected is wrong twice: a duplicate id in the request updates one
+	// row and would look like a miss, and re-sending the same attach — which a
+	// client retrying a timed-out reply does — updates nothing at all because
+	// the file is already linked. Both are successes.
+	// The UNION is not stylistic. A data-modifying CTE's writes are NOT visible
+	// to the rest of the same statement — the outer query reads the snapshot
+	// from before the UPDATE — so counting the end state here returns zero on a
+	// first attach. The count has to be "what this statement linked" plus "what
+	// was already linked", and UNION deduplicates the overlap.
+	var attached int
+	err := r.pool.QueryRow(ctx, `
+		WITH linked AS (
+			UPDATE files f
+			   SET mail_message_id = $2
+			  FROM mail_messages m
+			  JOIN mail_conversations c ON c.id = m.conversation_id
+			 WHERE m.id = $2
+			   AND f.id = ANY($1)
+			   AND f.mail_message_id IS NULL
+			   AND f.workspace_id = c.workspace_id
+			RETURNING f.id
+		), already AS (
+			SELECT id FROM files WHERE id = ANY($1) AND mail_message_id = $2
+		)
+		SELECT count(*) FROM (
+			SELECT id FROM linked UNION SELECT id FROM already
+		) AS attached`, fileIDs, messageID).Scan(&attached)
 	if err != nil {
 		return fmt.Errorf("attach files to message: %w", err)
 	}
+	if attached != len(dedupeIDs(fileIDs)) {
+		// 404-shaped and all-or-nothing: a partially attached reply is one whose
+		// author believes they sent something they did not. The usual cause is
+		// a file in another tenant — authorization passes for somebody who
+		// belongs to both, and the tenancy predicate above is what refuses it.
+		return ErrNotFound
+	}
 	return nil
+}
+
+// dedupeIDs collapses a repeated id, which a client sending the same attachment
+// twice will produce and which must not read as a missing file.
+func dedupeIDs(ids []string) []string {
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 // AttachmentsFor lists a message's attachments.

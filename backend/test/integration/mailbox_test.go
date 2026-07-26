@@ -1196,3 +1196,229 @@ func TestAMailboxCannotClaimAnotherTenantsDomain(t *testing.T) {
 		t.Fatalf("an unclaimed domain was refused: %v", err)
 	}
 }
+
+// THE TWO AUTHORITIES MUST AGREE ABOUT A MAIL ATTACHMENT.
+//
+// internal/authz has a listing path (acl_key, used by search and every
+// key-driven query) and a decision path (Capability, used per request). 055
+// taught acl_object_expected that a file with mail_message_id hangs off its
+// CONVERSATION; nothing taught Capability, whose TypeFile arm joined only
+// folder_id and message_id.
+//
+// So the same object was "readable by the mailbox's grantees" to every list and
+// "readable by the uploader alone" to every decision. An agent saw the
+// attachment named in the thread and got 403 on download. The direction was
+// denial here; which way a disagreement falls is decided by whichever consumer
+// is added next, so the disagreement itself is the defect.
+func TestMailAttachmentAuthorityAgrees(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := mailRepo(t)
+	ctx := context.Background()
+
+	_ = me
+	mb := newMailbox(t, ws, me)
+	agent := h.newUser(t, admin, ws, "mail-agent")
+
+	// The agent is granted on the MAILBOX, which is how a shared inbox works.
+	if err := h.app.Authz.Grant(ctx, authz.UserSubject(me), authz.UserSubject(agent.id),
+		authz.ObjectRef{Type: "mailbox", ID: mb.ID}, authz.CapWrite); err != nil {
+		t.Fatalf("grant the agent on the mailbox: %v", err)
+	}
+
+	// Through the REAL ingest route, so the attachment is stored exactly as a
+	// provider delivery stores it.
+	var tok struct {
+		Token struct {
+			Token string `json:"token"`
+		} `json:"token"`
+	}
+	decodeInto(t, h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/mail/ingest-tokens", admin,
+		map[string]string{"name": "attachment-test"}).Data, &tok)
+	if tok.Token.Token == "" {
+		t.Fatal("no ingest token was issued")
+	}
+
+	n := time.Now().UnixNano()
+	body := map[string]any{
+		"event_id":   fmt.Sprintf("ev-attach-%d", n),
+		"recipient":  mb.Address,
+		"message_id": fmt.Sprintf("<attach-%d@customer.test>", n),
+		"from":       "customer@customer.test",
+		"to":         []string{mb.Address},
+		"subject":    "the signed contract",
+		"body_text":  "attached",
+		"attachments": []map[string]string{{
+			"filename":     "contract.txt",
+			"content_type": "text/plain",
+			"content":      base64.StdEncoding.EncodeToString([]byte("the signed contract")),
+		}},
+	}
+	// h.req already sends Authorization: Bearer, which is exactly what the
+	// ingest route authenticates against.
+	res := h.req(t, http.StatusCreated, http.MethodPost, "/api/v1/mail/inbound",
+		tok.Token.Token, body)
+	var filed struct {
+		Conversation struct {
+			ID string `json:"id"`
+		} `json:"conversation"`
+		MessageID string `json:"message_id"`
+	}
+	decodeInto(t, res.Data, &filed)
+	if filed.MessageID == "" {
+		t.Fatal("the message was not filed")
+	}
+	conv := struct{ ID string }{ID: filed.Conversation.ID}
+
+	byMessage, err := repo.AttachmentsFor(ctx, []string{filed.MessageID})
+	if err != nil || len(byMessage[filed.MessageID]) != 1 {
+		t.Fatalf("the thread lists %d attachments, want 1 (err=%v)",
+			len(byMessage[filed.MessageID]), err)
+	}
+	fileID := byMessage[filed.MessageID][0].FileID
+
+	// The agent can reach the conversation...
+	convCap, err := h.app.Authz.Capability(ctx, authz.UserSubject(agent.id),
+		authz.ObjectRef{Type: "conversation", ID: conv.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !convCap.Implies(authz.CapRead) {
+		t.Fatalf("the agent holds %q on the conversation; this test proves nothing", convCap)
+	}
+
+	// ...and the DECISION path must say the same about its attachment.
+	fileCap, err := h.app.Authz.Capability(ctx, authz.UserSubject(agent.id), authz.FileObject(fileID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fileCap.Implies(authz.CapRead) {
+		t.Fatalf("Capability(file) = %q for an agent who may read the conversation — "+
+			"the attachment is named in the thread and refused on download", fileCap)
+	}
+
+	// And the LISTING path agrees, which it always did.
+	keys, err := h.app.Authz.KeysForObject(ctx, "file", fileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "u-" + agent.id
+	found := false
+	for _, k := range keys {
+		if k == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("acl_key for the attachment = %v, missing %s", keys, want)
+	}
+
+	// A workspace member with no mailbox grant still gets nothing, or this
+	// would have widened access rather than reconciled it.
+	stranger := h.newUser(t, admin, ws, "mail-stranger")
+	strangerCap, err := h.app.Authz.Capability(ctx, authz.UserSubject(stranger.id), authz.FileObject(fileID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strangerCap.Implies(authz.CapRead) {
+		t.Fatalf("a member with no mailbox grant holds %q on a mail attachment", strangerCap)
+	}
+}
+
+// A SHARED INBOX MUST BE SHAREABLE.
+//
+// CreateMailbox writes exactly one grant — CapAdmin to its creator — and the
+// product's only sharing surface hard-coded object_type to folder/file. So the
+// shared inbox had one reader for life, and because mailboxes.created_by is
+// ON DELETE SET NULL while the grant's subject is that user, offboarding the
+// creator left the mailbox and every customer conversation in it reachable by
+// nobody, repairable only by hand-written SQL.
+func TestAMailboxCanBeSharedWithAnAgent(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+
+	mb := newMailbox(t, ws, me)
+	agent := h.newUser(t, admin, ws, "share-agent")
+
+	// Before: nothing.
+	before, err := h.app.Authz.Capability(ctx, authz.UserSubject(agent.id),
+		authz.ObjectRef{Type: "mailbox", ID: mb.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Implies(authz.CapRead) {
+		t.Fatalf("the agent already holds %q; this test proves nothing", before)
+	}
+
+	h.req(t, http.StatusOK, http.MethodPut,
+		"/api/v1/drive/mailbox/"+mb.ID+"/shares", admin,
+		map[string]any{"subject_id": agent.id, "capability": "write"})
+
+	after, err := h.app.Authz.Capability(ctx, authz.UserSubject(agent.id),
+		authz.ObjectRef{Type: "mailbox", ID: mb.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Implies(authz.CapWrite) {
+		t.Fatalf("after sharing, the agent holds %q — the shared inbox is not shareable", after)
+	}
+
+	// A conversation is shareable too: one thread without the whole inbox.
+	h.req(t, http.StatusOK, http.MethodGet, "/api/v1/drive/mailbox/"+mb.ID+"/shares", admin, nil)
+}
+
+// ATTACHING IS IDEMPOTENT AND TENANT-SCOPED.
+//
+// The tenancy predicate is the fix; these two cases are what a naive
+// rows-affected check would have broken. A client retrying a timed-out reply
+// re-sends the same attach and updates nothing, and a request naming the same
+// file twice updates one row — both are successes, and both would have read as
+// "a file you cannot see" and 404'd the reply.
+func TestAttachingIsIdempotentAndDuplicateSafe(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := mailRepo(t)
+	ctx := context.Background()
+
+	mb := newMailbox(t, ws, me)
+	in := inbound(mb, fmt.Sprintf("attachidem-%d", time.Now().UnixNano()))
+	in.WorkspaceID = ws
+	_, msg, err := repo.Ingest(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fileID := h.upload(t, admin, ws, fmt.Sprintf("reply-%d.txt", time.Now().UnixNano()))
+	if fileID == "" {
+		t.Skip("file storage is not wired")
+	}
+
+	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{fileID}); err != nil {
+		t.Fatalf("first attach: %v", err)
+	}
+	// The retry.
+	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{fileID}); err != nil {
+		t.Fatalf("re-attaching the same file failed: %v — a retried reply 404s", err)
+	}
+	// The duplicate.
+	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{fileID, fileID}); err != nil {
+		t.Fatalf("attaching the same id twice failed: %v", err)
+	}
+
+	// And a file from another tenant is still refused.
+	other := h.newTenant(t, "attach-other")
+	foreign := h.upload(t, other.token, other.workspaceID, "foreign.txt")
+	if foreign != "" {
+		if err := repo.AttachToOutbound(ctx, msg.ID, other.id, []string{foreign}); err == nil {
+			t.Fatal("a file from another tenant was attached to this conversation")
+		}
+	}
+}
