@@ -17,7 +17,16 @@
 ALTER TABLE collab_documents
     ADD COLUMN repair_requested_at TIMESTAMPTZ;
 
--- The sweep's ordering key. NULLS FIRST is the default for ASC, which is what
--- we want — never asked outranks asked-a-year-ago.
-CREATE INDEX idx_collab_documents_repair
-    ON collab_documents (repair_requested_at, updated_at);
+-- DELIBERATELY NO INDEX on repair_requested_at.
+--
+-- The obvious one — (repair_requested_at, updated_at) — was written and then
+-- removed, because EXPLAIN shows the planner never reaches for it: the sweep's
+-- WHERE filters on updated_at first (a far more selective predicate, already
+-- indexed by idx_collab_documents_updated) and the LEFT JOIN against
+-- file_projections forces a sort for the ORDER BY regardless. Even with
+-- enable_seqscan off, the plan is a bitmap scan on updated_at plus a Sort.
+--
+-- It would not have been free. collab_documents.updated_at is bumped by EVERY
+-- CRDT append, so an unused index there is write amplification on the hottest
+-- path in the collaboration layer, paid on every keystroke somebody types, to
+-- serve one query every ten minutes that would not use it.
