@@ -332,14 +332,22 @@ jobs:
 
           grep -q 'superops-editor' "$web" \
             || { echo "::error::the web bundle has no editor — the platform split resolved the wrong file"; exit 1; }
+          grep -qi 'livekit' "$web" \
+            || { echo "::error::the web bundle has no call client — the huddle platform split resolved the wrong file"; exit 1; }
 
           if strings "$ios" | grep -q 'prosemirror'; then
             echo "::error::prosemirror leaked into the iOS bundle; the mobile app grew ~400 KB for a feature it does not have"
             exit 1
           fi
+          if strings "$ios" | grep -qi 'livekit'; then
+            echo "::error::livekit-client leaked into the iOS bundle; that is ~200 KB of WebRTC for a join path the mobile dev-build cut removes"
+            exit 1
+          fi
           strings "$ios" | grep -q 'Editing documents is available on the web' \
             || { echo "::error::the iOS bundle has no document renderer at all"; exit 1; }
-          echo "editor is web-only, renderer is native-only"
+          strings "$ios" | grep -q 'Join this huddle from the web app' \
+            || { echo "::error::the iOS bundle has no huddle surface at all"; exit 1; }
+          echo "editor and call client are web-only; both native fallbacks are present"
 
       # A GATE THAT CANNOT RUN IS NOT A GATE THAT PASSED.
       #

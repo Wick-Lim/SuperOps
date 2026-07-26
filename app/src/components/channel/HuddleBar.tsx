@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react'
-import { View, Text, Pressable, StyleSheet, Alert, Linking } from 'react-native'
+import { View, Text, Pressable, StyleSheet, Alert } from 'react-native'
 import { theme } from '../../lib/theme'
 import { space, MIN_TOUCH } from '../../lib/responsive'
 import { errorMessage } from '../../api/client'
 import { huddleApi } from '../../api/huddles'
 import type { HuddleSession } from '../../api/huddles'
 import { wsManager } from '../../lib/websocket'
+import HuddleRoom from '../../huddle/HuddleRoom'
 
 /**
  * The huddle bar.
@@ -34,6 +35,9 @@ export default function HuddleBar({ channelId, canWrite }: { channelId: string; 
   const [available, setAvailable] = useState<boolean | null>(null)
   const [session, setSession] = useState<HuddleSession | null>(null)
   const [busy, setBusy] = useState(false)
+  // Joined is separate from "a call exists": somebody may be looking at a
+  // channel with a live huddle they have not joined, which is the common case.
+  const [joined, setJoined] = useState(false)
 
   const refresh = useCallback(async () => {
     try {
@@ -75,6 +79,9 @@ export default function HuddleBar({ channelId, canWrite }: { channelId: string; 
     try {
       const res = await huddleApi.start(channelId)
       setSession(res.data ?? null)
+      // Starting a call joins it. Anything else would leave the person who
+      // clicked "Start huddle" outside their own huddle.
+      setJoined(true)
     } catch (e) {
       Alert.alert('Could not start a huddle', errorMessage(e))
     } finally {
@@ -92,6 +99,7 @@ export default function HuddleBar({ channelId, canWrite }: { channelId: string; 
           try {
             await huddleApi.end(channelId)
             setSession(null)
+            setJoined(false)
           } catch (e) {
             Alert.alert('Could not end the huddle', errorMessage(e))
           }
@@ -122,6 +130,10 @@ export default function HuddleBar({ channelId, canWrite }: { channelId: string; 
   const live = session.participants.filter((p) => p.left_at === null)
   const sharing = live.some((p) => p.is_screen_sharing)
 
+  if (joined) {
+    return <HuddleRoom session={session} onLeave={() => setJoined(false)} />
+  }
+
   return (
     <View style={[styles.bar, styles.liveBar]}>
       <View style={styles.dot} />
@@ -136,12 +148,24 @@ export default function HuddleBar({ channelId, canWrite }: { channelId: string; 
 
       {session.url ? (
         <Pressable
-          onPress={() => void Linking.openURL(session.url)}
+          onPress={async () => {
+            // Re-fetch first: the token is short-lived — it IS the grant, and a
+            // revoked share does not invalidate one already issued — so the one
+            // fetched when the bar rendered may have expired while somebody
+            // read the channel.
+            try {
+              const res = await huddleApi.start(channelId)
+              setSession(res.data ?? session)
+            } catch {
+              /* join with what we have; the SFU will refuse a stale token */
+            }
+            setJoined(true)
+          }}
           style={({ pressed }) => [styles.action, pressed && styles.pressed]}
           accessibilityRole="button"
-          accessibilityLabel="Open the huddle"
+          accessibilityLabel="Join the huddle"
         >
-          <Text style={styles.actionText}>Open</Text>
+          <Text style={styles.actionText}>Join</Text>
         </Pressable>
       ) : null}
 

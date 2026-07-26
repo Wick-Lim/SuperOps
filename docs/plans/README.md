@@ -13,7 +13,7 @@ named, and explicit cuts.
 | [04-docs](04-docs.md) | Phase 3 — block editor | **Implemented** (`035`) |
 | [05-spreadsheet](05-spreadsheet.md) | Phase 4 — grid + formula engine | **Implemented** — no migration; see ruling 8 |
 | [06-design-surface](06-design-surface.md) | Phase 5 — bounded design surface | **Implemented** — no migration; see ruling 8 |
-| [07-huddle](07-huddle.md) | — huddles (order-independent) | **Implemented** (`050`). Media is a §3c capability, off by default. Client shows the call, its roster and start/end; joining the media itself is deferred with `livekit-client` — see the cut in the plan. |
+| [07-huddle](07-huddle.md) | — huddles (order-independent) | **Implemented** (`050`). Media is a §3c capability, off by default. Client joins the call on web with `livekit-client` (audio + screen share); mobile gets the bar, the roster and start/end, which is what plan 07's cut actually removes — the mobile dev-build path, not the feature. |
 | [08-email](08-email.md) | Phase 6 — shared inbox | **Implemented** (`055`) |
 | [09-workflow](09-workflow.md) | Phase 7 — automation | **Implemented** (`060`, `062`; `061` earmarked, unspent) |
 
