@@ -36,6 +36,7 @@ type driveDescriptor struct {
 	ContentURL       *string `json:"content_url"`
 	ThumbnailURL     *string `json:"thumbnail_url"`
 	FolderID         *string `json:"folder_id"`
+	SizeBytes        int64   `json:"size_bytes"`
 }
 
 type driveEntry struct {

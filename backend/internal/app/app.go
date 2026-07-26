@@ -368,7 +368,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	if len(cfg.RTC.ICEURLs) > 0 {
 		ice = rtc.StaticICE{URLs: cfg.RTC.ICEURLs, Secret: cfg.RTC.ICESecret, TTL: cfg.RTC.ICETTL}
 	}
-	mailboxHandler := mailbox.NewHandler(pool, az, mailbox.NewPublisher(natsClient, logger), logger)
+	mailboxHandler := mailbox.NewHandler(pool, az, mailbox.NewPublisher(natsClient, logger), fileStorage, logger)
 	huddleHandler := huddle.NewHandler(pool, az, media, ice, hub, auditService,
 		cfg.RTC.WebhookSecret, logger)
 	// Automation. The API is the authoring surface; cmd/worker owns the trigger

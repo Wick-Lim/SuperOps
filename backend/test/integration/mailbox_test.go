@@ -4,13 +4,16 @@ package integration
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mailbox"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
@@ -897,5 +900,182 @@ func TestTheSweepSkipsPermanentlyUnsendableMessages(t *testing.T) {
 	// whose domain is simply not verified.
 	if sent != 1 {
 		t.Fatalf("SweepUnsent reported %d delivered, want 1", sent)
+	}
+}
+
+// AN ATTACHMENT IS A DRIVE FILE, and until now nothing wrote the column that
+// makes it one. `files.mail_message_id`, the GC exclusion that spares it and
+// the acl_object arm that gives it a path were all protecting a relation
+// nothing established.
+func TestInboundAttachmentsBecomeDriveFilesAnAgentCanOpen(t *testing.T) {
+	h := getHarness(t)
+	h.storage(t) // skips when no object storage is configured
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+	n := time.Now().UnixNano()
+
+	mb := newMailbox(t, ws, me)
+
+	// Mint a token and post through the REAL ingest route, because the
+	// attachment path only exists there.
+	tresp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/mail/ingest-tokens", admin, map[string]string{"name": "att"})
+	var minted struct {
+		Token struct {
+			Token string `json:"token"`
+		} `json:"token"`
+	}
+	decodeInto(t, tresp.Data, &minted)
+
+	body := []byte("the quarterly numbers")
+	code, resp := h.doBearer(t, http.MethodPost, "/api/v1/mail/inbound", minted.Token.Token,
+		map[string]any{
+			"event_id": fmt.Sprintf("ev-att-%d", n), "recipient": mb.Address,
+			"message_id": fmt.Sprintf("<att-%d@customer.test>", n),
+			"from":       "customer@customer.test", "subject": "numbers", "body_text": "see attached",
+			"attachments": []map[string]any{{
+				"filename":     "q3.txt",
+				"content_type": "text/plain",
+				"content":      base64.StdEncoding.EncodeToString(body),
+			}},
+		})
+	if code != http.StatusCreated {
+		t.Fatalf("ingest = %d (%+v)", code, resp.Error)
+	}
+	var filed struct {
+		Conversation struct {
+			ID string `json:"id"`
+		} `json:"conversation"`
+	}
+	decodeInto(t, resp.Data, &filed)
+
+	// The thread carries it.
+	var thread struct {
+		Messages []struct {
+			ID          string `json:"id"`
+			Attachments []struct {
+				FileID string `json:"file_id"`
+				Name   string `json:"name"`
+			} `json:"attachments"`
+		} `json:"messages"`
+	}
+	decodeInto(t, h.req(t, http.StatusOK, http.MethodGet,
+		"/api/v1/conversations/"+filed.Conversation.ID, admin, nil).Data, &thread)
+
+	var fileID string
+	for _, m := range thread.Messages {
+		for _, a := range m.Attachments {
+			if a.Name == "q3.txt" {
+				fileID = a.FileID
+			}
+		}
+	}
+	if fileID == "" {
+		t.Fatal("the inbound attachment is not on the message; files.mail_message_id was never written")
+	}
+
+	// IT IS A REAL DRIVE OBJECT: openable through the Drive descriptor, with an
+	// acl_object row giving it a path.
+	var desc driveDescriptor
+	decodeInto(t, h.req(t, http.StatusOK, http.MethodGet, "/api/v1/drive/files/"+fileID, admin, nil).Data, &desc)
+	if desc.SizeBytes != int64(len(body)) {
+		t.Fatalf("size = %d, want %d", desc.SizeBytes, len(body))
+	}
+
+	// AND THE COLLECTOR SPARES IT. Without the mail_message_id clause in
+	// ListOrphans every attachment is deleted an hour after it arrives.
+	repo := file.NewRepository(h.app.DB)
+	orphans, err := repo.ListOrphans(ctx, time.Now().Add(time.Hour), 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range orphans {
+		if o.ID == fileID {
+			t.Fatal("the attachment is an orphan; the collector would delete it within the hour")
+		}
+	}
+
+	// A filename that would break a header or escape a directory is neutered.
+	code, _ = h.doBearer(t, http.MethodPost, "/api/v1/mail/inbound", minted.Token.Token,
+		map[string]any{
+			"event_id": fmt.Sprintf("ev-evil-%d", n), "recipient": mb.Address,
+			"message_id": fmt.Sprintf("<evil-%d@customer.test>", n),
+			"from":       "customer@customer.test", "subject": "x", "body_text": "y",
+			"attachments": []map[string]any{{
+				"filename": "../../etc/passwd\r\nX-Injected: yes",
+				"content":  base64.StdEncoding.EncodeToString([]byte("z")),
+			}},
+		})
+	if code != http.StatusCreated {
+		t.Fatalf("ingest with a hostile filename = %d", code)
+	}
+	// What actually matters is that the stored name cannot traverse a path or
+	// split a header. Dots that survive once the separators are gone are
+	// harmless — "....etcpasswd" is an ugly filename, not an exploit — and
+	// asserting on them would be asserting on cosmetics.
+	var stored string
+	if err := h.app.DB.QueryRow(ctx, `
+		SELECT f.name
+		  FROM files f
+		  JOIN mail_messages m ON m.id = f.mail_message_id
+		 WHERE m.message_id = $1`, fmt.Sprintf("<evil-%d@customer.test>", n)).Scan(&stored); err != nil {
+		t.Fatalf("the hostile-filename attachment was not stored at all: %v", err)
+	}
+	if strings.ContainsAny(stored, "/\\\r\n") {
+		t.Fatalf("stored filename %q carries a path separator or a line break; it reaches a "+
+			"Content-Disposition header and a download path", stored)
+	}
+	for _, r := range stored {
+		if r < 0x20 {
+			t.Fatalf("stored filename %q carries a control character", stored)
+		}
+	}
+	if strings.HasPrefix(stored, "..") && !strings.Contains(stored, "etc") {
+		t.Fatalf("stored filename %q looks like a traversal attempt", stored)
+	}
+}
+
+// An agent cannot attach a file they cannot read. A reply is authored by a
+// person, and it must not be a way to exfiltrate an object through an email.
+func TestAnAgentCannotAttachAFileTheyCannotRead(t *testing.T) {
+	h := getHarness(t)
+	h.storage(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+
+	// A file only the owner can read: a private-channel attachment, the one
+	// in-workspace object a fellow member cannot open.
+	owner := h.newTenant(t, "att-owner")
+	secretID := h.requireFiles(t, owner.token, owner.workspaceID)
+	priv := h.createTypedChannel(t, owner.token, owner.workspaceID, uniqueSlug("attpriv"), "private")
+	h.req(t, http.StatusCreated, http.MethodPost, "/api/v1/channels/"+priv+"/messages", owner.token,
+		map[string]any{"content": "secret", "file_ids": []string{secretID}})
+
+	mb := newMailbox(t, ws, me)
+	conv, _, err := mailRepo(t).Ingest(ctx, inbound(mb, fmt.Sprintf("exfil-%d", time.Now().UnixNano())))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	code, _ := h.do(t, http.MethodPost, "/api/v1/conversations/"+conv.ID+"/reply", admin,
+		map[string]any{"body_text": "here you go", "attachment_file_ids": []string{secretID}})
+	if code == http.StatusCreated {
+		t.Fatal("attached a file the author cannot read; a reply is an exfiltration path")
+	}
+	if code != http.StatusNotFound {
+		t.Fatalf("= %d, want 404 — naming the file would confirm one exists at that id", code)
+	}
+
+	var attached int
+	if err := h.app.DB.QueryRow(ctx,
+		`SELECT count(*) FROM files WHERE id = $1 AND mail_message_id IS NOT NULL`, secretID).Scan(&attached); err != nil {
+		t.Fatal(err)
+	}
+	if attached != 0 {
+		t.Fatal("the file was attached despite the refusal")
 	}
 }

@@ -89,6 +89,10 @@ type Message struct {
 	AuthorID       *string    `json:"author_id"`
 	SentAt         *time.Time `json:"sent_at"`
 	CreatedAt      time.Time  `json:"created_at"`
+	// Attachments are Drive files owned by this message. Non-nil even when
+	// empty: a client that did `.map()` on a null would throw on every message
+	// without one, which is most of them.
+	Attachments []Attachment `json:"attachments"`
 }
 
 // Inbound is one parsed email, ready to be filed.

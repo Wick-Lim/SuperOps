@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
+	"github.com/Wick-Lim/SuperOps/backend/internal/storage"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
@@ -25,15 +26,17 @@ import (
 const maxInboundBody = 2 << 20
 
 type Handler struct {
-	repo   *Repository
-	pool   *pgxpool.Pool
-	authz  *authz.Checker
-	out    *Publisher
-	dns    DNSResolver
-	logger *slog.Logger
+	repo    *Repository
+	pool    *pgxpool.Pool
+	authz   *authz.Checker
+	out     *Publisher
+	dns     DNSResolver
+	storage storage.Backend
+	logger  *slog.Logger
 }
 
-func NewHandler(pool *pgxpool.Pool, az *authz.Checker, out *Publisher, logger *slog.Logger) *Handler {
+func NewHandler(pool *pgxpool.Pool, az *authz.Checker, out *Publisher, store storage.Backend,
+	logger *slog.Logger) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -42,8 +45,13 @@ func NewHandler(pool *pgxpool.Pool, az *authz.Checker, out *Publisher, logger *s
 		// The real resolver by default. A deployment behind a split-horizon DNS
 		// can substitute one; a test substitutes one rather than depending on a
 		// live zone.
-		dns:    netResolver{},
-		logger: logger,
+		dns: netResolver{},
+		// nil when this deployment has no object storage. Attachments are then
+		// dropped with a warning rather than failing the message: an email
+		// whose body arrived is worth more than one refused for its
+		// attachment, and the raw original is archived either way.
+		storage: store,
+		logger:  logger,
 	}
 }
 
@@ -264,6 +272,22 @@ func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
+	// Attachments, in ONE query for the whole thread rather than one per
+	// message — a conversation with forty messages would otherwise make forty
+	// round trips to render.
+	ids := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		ids = append(ids, m.ID)
+	}
+	attachments, err := h.repo.AttachmentsFor(ctx, ids)
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	for i := range msgs {
+		msgs[i].Attachments = attachments[msgs[i].ID]
+	}
+
 	httputil.JSON(w, http.StatusOK, map[string]any{"conversation": conv, "messages": msgs})
 }
 
@@ -347,6 +371,10 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		BodyText string `json:"body_text"`
 		BodyHTML string `json:"body_html"`
 		Subject  string `json:"subject"`
+		// Existing Drive files, by id. Not bytes: the agent has already
+		// uploaded them, or is forwarding one that arrived, and re-uploading
+		// would make a second copy that counts against the quota twice.
+		AttachmentFileIDs []string `json:"attachment_file_ids"`
 	}
 	if err := httputil.DecodeJSONLimit(r, &req, maxInboundBody); err != nil {
 		httputil.HandleError(w, err)
@@ -395,6 +423,20 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
+	}
+
+	// Attachments BEFORE the delivery is queued, so the consumer never renders
+	// a message whose attachments are still being linked.
+	if len(req.AttachmentFileIDs) > 0 {
+		if err := h.repo.AttachToOutbound(ctx, msg.ID, actor, req.AttachmentFileIDs); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND",
+					"one of those files does not exist or you cannot read it")
+				return
+			}
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return
+		}
 	}
 
 	// QUEUE THE DELIVERY. Without this the reply is stored, the agent is told
@@ -451,6 +493,9 @@ func (h *Handler) Inbound(w http.ResponseWriter, r *http.Request) {
 		BodyHTML   string   `json:"body_html"`
 		RawKey     string   `json:"raw_key"`
 		ReceivedAt string   `json:"received_at"`
+		// Decoded parts, as every inbound provider hands them over. See
+		// attachments.go for why the MIME parsing is theirs and not ours.
+		Attachments []InboundAttachment `json:"attachments"`
 	}
 	if err := httputil.DecodeJSONLimit(r, &req, maxInboundBody); err != nil {
 		httputil.JSONError(w, http.StatusBadRequest, "INVALID_BODY", err.Error())
@@ -496,6 +541,18 @@ func (h *Handler) Inbound(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("ingest inbound mail", "event_id", req.EventID, "error", err)
 		httputil.JSONError(w, http.StatusInternalServerError, "INTERNAL", "could not file the message")
 		return
+	}
+
+	// Attachments, after the message exists to own them. Best effort and
+	// logged: an email whose body arrived is worth more than one rejected for
+	// an attachment we could not store, and the raw original is archived under
+	// raw_key regardless.
+	if len(req.Attachments) > 0 {
+		if n, err := h.repo.storeAttachments(ctx, h.storage, conv.WorkspaceID, msg.ID,
+			"", req.Attachments); err != nil {
+			h.logger.Warn("could not store every attachment on an inbound message",
+				"mail_message_id", msg.ID, "stored", n, "error", err)
+		}
 	}
 
 	// The token's workspace must own the mailbox. A token for tenant A that

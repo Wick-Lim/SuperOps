@@ -6,6 +6,7 @@ import { theme } from '../lib/theme'
 import { space, MIN_TOUCH } from '../lib/responsive'
 import { errorMessage } from '../api/client'
 import { mailboxApi } from '../api/mailboxes'
+import { formatBytes } from '../api/drive'
 import type { Conversation, ConversationState, Mailbox, MailMessage } from '../api/mailboxes'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { ContentColumn, ErrorState, LoadingState, ScreenHeader } from './internal/ui'
@@ -280,6 +281,23 @@ export function ConversationScreen({ navigation, route }: { navigation: any; rou
                   message means written and not yet sent — most often because the
                   sending domain is not verified — and it looks identical to a
                   delivered one unless the thread says otherwise. */}
+              {/* Attachments are Drive objects, so opening one goes through
+                  the Drive descriptor and its normal permission check rather
+                  than a mail-specific download path. */}
+              {(m.attachments ?? []).map((a) => (
+                <Pressable
+                  key={a.file_id}
+                  onPress={() => navigation.navigate('DriveFile', { fileId: a.file_id })}
+                  style={({ pressed }) => [styles.attachment, pressed && styles.pressed]}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Open ${a.name}`}
+                >
+                  <Text style={styles.attachmentName} numberOfLines={1}>
+                    {a.name}
+                  </Text>
+                  <Text style={styles.attachmentSize}>{formatBytes(a.size_bytes)}</Text>
+                </Pressable>
+              ))}
               {m.direction === 'outbound' && m.sent_at === null && (
                 <Text style={styles.undelivered}>
                   Not delivered yet — the sending domain may not be verified.
@@ -354,6 +372,18 @@ const styles = StyleSheet.create({
   bubbleFrom: { color: theme.textMuted, fontSize: 12, marginBottom: 4 },
   bubbleBody: { color: theme.body, fontSize: 14, lineHeight: 20 },
   undelivered: { color: theme.danger, fontSize: 12, marginTop: 6 },
+  attachment: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.sm,
+    marginTop: 6,
+    paddingHorizontal: space.sm,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: theme.bg,
+  },
+  attachmentName: { color: theme.accent, fontSize: 13, flex: 1 },
+  attachmentSize: { color: theme.textFaint, fontSize: 12 },
 
   composer: {
     flexDirection: 'row',

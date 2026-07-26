@@ -65,6 +65,17 @@ export interface MailMessage {
    */
   sent_at: string | null
   created_at: string
+  /** Drive files owned by this message. Always an array — the server sends []
+   * rather than null, because a client doing `.map()` on a null would throw on
+   * every message without an attachment, which is most of them. */
+  attachments: MailAttachment[]
+}
+
+export interface MailAttachment {
+  file_id: string
+  name: string
+  content_type: string
+  size_bytes: number
 }
 
 export interface MailDomain {
@@ -117,10 +128,14 @@ export const mailboxApi = {
     return api.patch<Conversation>(`/conversations/${conversationId}`, changes)
   },
 
-  reply(conversationId: string, bodyText: string, subject?: string) {
+  reply(conversationId: string, bodyText: string, subject?: string, attachmentFileIds?: string[]) {
     return api.post<MailMessage>(`/conversations/${conversationId}/reply`, {
       body_text: bodyText,
       subject,
+      // File IDS, not bytes: an agent attaching something has already uploaded
+      // it, and re-uploading would make a second copy counting against the
+      // quota twice.
+      attachment_file_ids: attachmentFileIds,
     })
   },
 
