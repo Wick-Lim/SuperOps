@@ -204,6 +204,20 @@ function rnFilePart(file: PickedFile) {
   } as unknown as Blob
 }
 
+/**
+ * What the server's sharing surface accepts — NOT the same set as Drive's own
+ * entries.
+ *
+ * `shares` covers a mailbox and a conversation as well, deliberately: a mailbox
+ * is created with exactly one grant (admin, to its creator), so without a way to
+ * grant on it a shared inbox whose creator is offboarded is reachable by nobody.
+ * Share LINKS are narrower — a link points at a folder or a file — and the
+ * server answers 400 for the rest, so the two are separate types rather than one
+ * loose string.
+ */
+export type ShareObjectType = 'folder' | 'file' | 'mailbox' | 'conversation'
+export type LinkObjectType = 'folder' | 'file'
+
 export const driveApi = {
   /** What editors this DEPLOYMENT has. Fetched once and cached by the store; a
    * client that hardcoded the list would offer "New Spreadsheet" on a server
@@ -345,22 +359,22 @@ export const driveApi = {
     return api.put<DriveUsage>(`/workspaces/${workspaceId}/drive/quota`, { quota_bytes: quotaBytes })
   },
 
-  shares(objectType: 'folder' | 'file', objectId: string) {
+  shares(objectType: ShareObjectType, objectId: string) {
     return api.get<Share[]>(`/drive/${objectType}/${objectId}/shares`)
   },
 
-  share(objectType: 'folder' | 'file', objectId: string, subjectId: string, capability: string) {
+  share(objectType: ShareObjectType, objectId: string, subjectId: string, capability: string) {
     return api.put<Share>(`/drive/${objectType}/${objectId}/shares`, {
       subject_id: subjectId,
       capability,
     })
   },
 
-  unshare(objectType: 'folder' | 'file', objectId: string, subjectId: string) {
+  unshare(objectType: ShareObjectType, objectId: string, subjectId: string) {
     return api.del<void>(`/drive/${objectType}/${objectId}/shares/user/${subjectId}`)
   },
 
-  links(objectType: 'folder' | 'file', objectId: string) {
+  links(objectType: LinkObjectType, objectId: string) {
     return api.get<ShareLink[]>(`/drive/${objectType}/${objectId}/links`)
   },
 
@@ -370,7 +384,7 @@ export const driveApi = {
    * immediately and must not assume it can fetch it again.
    */
   createLink(
-    objectType: 'folder' | 'file',
+    objectType: LinkObjectType,
     objectId: string,
     opts: { capability?: string; password?: string; expires_at?: string; max_uses?: number } = {},
   ) {

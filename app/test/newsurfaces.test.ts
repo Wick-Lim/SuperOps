@@ -320,3 +320,89 @@ describe('a null page', () => {
     expect(out.items).toEqual([])
   })
 })
+
+// A MAILBOX'S GRANTS ARE NOT HIDDEN BY ITS LACK OF LINKS.
+//
+// DriveShareScreen awaited shares and links in one Promise.all. Share links are
+// for a folder or a file — the server answers 400 for anything else and says to
+// grant a person or a group instead — so on a mailbox or a conversation the
+// links call always rejected and took the whole screen with it, grants and all.
+//
+// That matters because this screen is the app's ONLY sharing surface, and the
+// server deliberately covers mailboxes: CreateMailbox writes a single grant to
+// its creator, so a shared inbox whose creator is offboarded is reachable by
+// nobody. The route is reachable with any object type through the deep link
+// `drive/:objectType/:objectId/share`, where TypeScript's union is erased.
+describe('the share screen', () => {
+  it('does not couple the grants list to the links list', async () => {
+    const fs = await import('node:fs/promises')
+    const src = await fs.readFile('src/screens/DriveShareScreen.tsx', 'utf8')
+
+    for (const all of src.match(/Promise\.all\(\[[\s\S]*?\]\)/g) ?? []) {
+      const both = all.includes('driveApi.shares') && all.includes('driveApi.links')
+      expect(
+        both,
+        'shares and links are awaited together again, so a mailbox or conversation ' +
+          'shows an error instead of the people who can already open it',
+      ).toBe(false)
+    }
+  })
+
+  // A FAILED LINKS REQUEST IS NOT AN EMPTY ONE.
+  //
+  // The first version of the split swallowed the links error and called
+  // setLinks([]), so a 500 or a dropped connection rendered "No links yet." —
+  // an affirmative statement that nobody holds link access, shown to someone
+  // auditing exactly that. The branch is reached only for a folder or a file,
+  // where the request is supposed to work, so a failure there is information.
+  it('surfaces a failed links request instead of rendering it as empty', async () => {
+    const fs = await import('node:fs/promises')
+    const src = await fs.readFile('src/screens/DriveShareScreen.tsx', 'utf8')
+
+    // The catch around the links request must record the failure.
+    const linksCall = src.indexOf('await driveApi.links(')
+    expect(linksCall, 'the screen no longer requests links').toBeGreaterThan(-1)
+    const tail = src.slice(linksCall)
+    const katch = tail.indexOf('} catch')
+    expect(katch, 'the links request has no catch').toBeGreaterThan(-1)
+    const block = tail.slice(katch, tail.indexOf('}', tail.indexOf('{', katch + 8)) + 1)
+    expect(
+      block,
+      'the links catch does not record the error, so a failure renders as "No links yet."',
+    ).toContain('setLinksError(')
+
+    // And the Links section must render that error ABOVE its empty state, or
+    // recording it changes nothing.
+    const section = src.indexOf('<Section title="Links">')
+    const errBranch = src.indexOf('linksError ?', section)
+    const emptyBranch = src.indexOf('links.length === 0', section)
+    expect(errBranch, 'the Links section never renders linksError').toBeGreaterThan(-1)
+    expect(
+      errBranch < emptyBranch,
+      'the empty state is checked before the error state, so a failed request still ' +
+        'reads as "No links yet."',
+    ).toBe(true)
+  })
+
+  it('offers links only where the server has them', async () => {
+    const fs = await import('node:fs/promises')
+    const src = await fs.readFile('src/screens/DriveShareScreen.tsx', 'utf8')
+
+    expect(
+      src,
+      'the screen no longer distinguishes linkable object types',
+    ).toMatch(/function isLinkable\(t: ShareObjectType\): t is LinkObjectType/)
+
+    // The create button must be behind that guard, or the screen offers an
+    // action whose only outcome is a 400.
+    const button = src.indexOf('Create a read-only link')
+    expect(button, 'the create-link button is gone').toBeGreaterThan(-1)
+    const guard = src.lastIndexOf('{linkable && (', button)
+    const section = src.lastIndexOf('<Section title="Links">', button)
+    expect(
+      guard > section,
+      'the create-link button is not behind the linkable guard, so it is offered ' +
+        'on objects the server refuses to make links for',
+    ).toBe(true)
+  })
+})

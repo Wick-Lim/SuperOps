@@ -3,10 +3,17 @@ import { SafeAreaView, View, Text, Pressable, ScrollView, Alert, StyleSheet } fr
 import { theme } from '../lib/theme'
 import { errorMessage } from '../api/client'
 import { driveApi } from '../api/drive'
-import type { Share, ShareLink } from '../api/drive'
+import type { Share, ShareLink, ShareObjectType, LinkObjectType } from '../api/drive'
 import { useUserStore } from '../stores/userStore'
 import { space, MIN_TOUCH } from '../lib/responsive'
 import { ContentColumn, ErrorState, LoadingState, ScreenHeader, Section } from './internal/ui'
+
+/** Share links point at a folder or a file; the server answers 400 for the
+ * rest. A type predicate rather than a plain boolean so a link call on a mailbox
+ * is a compile error instead of a 400 found at runtime. */
+function isLinkable(t: ShareObjectType): t is LinkObjectType {
+  return t === 'folder' || t === 'file'
+}
 
 /**
  * Sharing.
@@ -22,7 +29,12 @@ import { ContentColumn, ErrorState, LoadingState, ScreenHeader, Section } from '
  *   exists rather than assuming it can be fetched again.
  */
 export default function DriveShareScreen({ navigation, route }: { navigation: any; route: any }) {
-  const objectType: 'folder' | 'file' = route.params?.objectType ?? 'file'
+  // NOT NARROWED TO folder|file: this screen is also reached by the deep link
+  // `drive/:objectType/:objectId/share`, where the value is whatever is in the
+  // URL. The server's sharing surface deliberately covers mailboxes and
+  // conversations too — a mailbox with no grants is reachable by nobody — and
+  // this screen is the only place in the app that can grant on one.
+  const objectType: ShareObjectType = route.params?.objectType ?? 'file'
   const objectId: string = route.params?.objectId
   const name: string = route.params?.name ?? 'this item'
   // The user store already resolves ids to names and caches them across
@@ -35,20 +47,58 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [freshToken, setFreshToken] = useState<string | null>(null)
+  const [linksError, setLinksError] = useState<string | null>(null)
+
+  // Share links exist for a folder or a file only; the server answers 400 for
+  // anything else, and tells you to grant a person or a group instead.
+  //
+  // `load` calls isLinkable(objectType) again rather than reading this. An
+  // earlier comment claimed that was required for the narrowing to reach the
+  // request — it is not: TypeScript has narrowed through a const boolean
+  // holding a type-predicate result since 4.4, and this repo is on 5.9. Calling
+  // the predicate is still what the callback does, because `linkable` is then
+  // not a dependency of it.
+  const linkable = isLinkable(objectType)
 
   const load = useCallback(async () => {
     setError(null)
     try {
-      const [s, l] = await Promise.all([
-        driveApi.shares(objectType, objectId),
-        driveApi.links(objectType, objectId),
-      ])
+      // TWO INDEPENDENT REQUESTS, NOT ONE Promise.all.
+      //
+      // They were awaited together, so the links call failing took the whole
+      // screen down with it — and it ALWAYS fails for a mailbox or a
+      // conversation. The grants had loaded; the user saw an error instead of
+      // them, and the only surface for granting on a shared inbox was
+      // unreachable. Whether an object has links is not a reason to hide who
+      // can already open it.
+      const s = await driveApi.shares(objectType, objectId)
       setShares(s.data)
-      setLinks(l.data)
     } catch (e) {
       setError(errorMessage(e))
-    } finally {
       setLoading(false)
+      // Nothing below can be shown next to a failed grants list, and asking for
+      // links after the first request already failed is a wasted round trip.
+      return
+    }
+    setLoading(false)
+
+    if (!isLinkable(objectType)) {
+      setLinks([])
+      setLinksError(null)
+      return
+    }
+    try {
+      const l = await driveApi.links(objectType, objectId)
+      setLinks(l.data)
+      setLinksError(null)
+    } catch (e) {
+      // NOT SILENT. This branch is reached only for a folder or a file — the
+      // case where links are supposed to work — so a failure here is
+      // information. Swallowing it rendered "No links yet.", an affirmative
+      // statement that nobody has link access, out of a 500 or a dropped
+      // connection. Someone auditing who can reach a file would believe it.
+      setLinks([])
+      setLinksError(errorMessage(e))
     }
   }, [objectType, objectId])
 
@@ -64,6 +114,10 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
   }, [shares, ensureUsers])
 
   const createLink = useCallback(async () => {
+    // Unreachable through the UI — the button is behind `linkable` — but the
+    // narrowing has to be here for the call to type-check, and a guard is the
+    // honest way to get it rather than a cast.
+    if (!isLinkable(objectType)) return
     try {
       const res = await driveApi.createLink(objectType, objectId, { capability: 'read' })
       // Shown immediately, and kept on screen until the user copies it. There is
@@ -177,7 +231,13 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
           </Section>
 
           <Section title="Links">
-            {links.length === 0 ? (
+            {!linkable ? (
+              <Text style={styles.empty}>
+                Links are for a folder or a file. Grant a person or a group above instead.
+              </Text>
+            ) : linksError ? (
+              <ErrorState message={linksError} onRetry={load} />
+            ) : links.length === 0 ? (
               <Text style={styles.empty}>No links yet.</Text>
             ) : (
               links.map((l) => (
@@ -198,9 +258,11 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
                 </View>
               ))
             )}
-            <Pressable style={styles.button} onPress={createLink} accessibilityRole="button">
-              <Text style={styles.buttonText}>Create a read-only link</Text>
-            </Pressable>
+            {linkable && (
+              <Pressable style={styles.button} onPress={createLink} accessibilityRole="button">
+                <Text style={styles.buttonText}>Create a read-only link</Text>
+              </Pressable>
+            )}
           </Section>
         </ContentColumn>
       </ScrollView>

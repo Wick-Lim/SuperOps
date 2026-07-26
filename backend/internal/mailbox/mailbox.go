@@ -30,11 +30,16 @@ import (
 )
 
 var (
-	ErrNotFound     = errors.New("mailbox: not found")
-	ErrNoMailbox    = errors.New("mailbox: no mailbox serves that address")
-	ErrDuplicate    = errors.New("mailbox: already processed")
-	ErrNotVerified  = errors.New("mailbox: the sending domain is not verified")
-	ErrAddressTaken = errors.New("mailbox: that address already exists")
+	ErrNotFound = errors.New("mailbox: not found")
+	// ErrTooManyAttachments is the caller sending more file ids than a message
+	// may carry. It was a plain fmt.Errorf, and the reply route maps everything
+	// that is not ErrNotFound to 500 — so 21 attachment ids answered "internal
+	// server error" for a request that is simply over a documented limit.
+	ErrTooManyAttachments = errors.New("mailbox: too many attachments")
+	ErrNoMailbox          = errors.New("mailbox: no mailbox serves that address")
+	ErrDuplicate          = errors.New("mailbox: already processed")
+	ErrNotVerified        = errors.New("mailbox: the sending domain is not verified")
+	ErrAddressTaken       = errors.New("mailbox: that address already exists")
 	// ErrDomainNotYours is returned when the address's domain is registered to
 	// a different workspace. Deliberately distinct from ErrAddressTaken: the
 	// address is free, and the operator needs to be told that the DOMAIN is

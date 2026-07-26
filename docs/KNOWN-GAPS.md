@@ -90,6 +90,52 @@ The unambiguous half IS fixed: Drive's breadcrumbs carried no
 folder names as static text with no indication they could be activated — and on
 a phone they are the only way out of a deep folder.
 
+### Mail domain ownership: two holes that need a product decision
+
+Both were demonstrated end to end by an audit. Neither has a fix that is only
+code.
+
+**Squatting an address before the domain is registered.** `CreateMailbox`
+deliberately permits an address on an unregistered domain — a shared demo
+deployment depends on it. So an attacker takes `billing@victim.test` first; the
+victim then registers *and verifies* the domain with a real DNS record and is
+told everything is fine, while the address stays with the attacker.
+`VerifyDomain`'s adoption UPDATE is keyed on the same workspace, so it neither
+reclaims the foreign mailbox nor mentions it, and no API path can evict it.
+
+The correct rule is that DNS proof beats first-come: verification should be able
+to reclaim the address. Reclaiming means doing something with another tenant's
+mailbox and the customer conversations inside it — archive it, rename it,
+transfer it — and that is a decision about somebody's data, not a patch.
+Refusing verification while a foreign mailbox exists is the other option and
+hands the squatter a denial-of-service lever instead.
+
+**Public suffixes.** Registration now requires at least two labels, which stops
+`com` from being claimed as the parent of every `.com`. It does not stop
+`co.uk`, `github.io` or `herokuapp.com` — telling a public suffix from an
+ordinary domain needs a suffix list this deployment does not carry, and
+embedding a stale copy of one is its own problem.
+
+**Blast radius, corrected.** An earlier commit message said hijacked mail
+"landed in the attacker's mailbox". That is not reachable: `Ingest` scopes the
+mailbox lookup to the token's workspace, so the victim's real delivery arrives
+on the victim's token, finds nothing, and is accepted-and-dropped with a 202 —
+the provider never retries and the sender gets no bounce. The damage is silent,
+unbounceable loss of the victim's customer email plus permanent denial of the
+address. Worse in some ways than interception, and not the same thing.
+
+**No backfill.** The ownership check runs at registration; nothing scans what is
+already stored. A deployment that ran the vulnerable code keeps every overlapping
+pair, and longest-match still resolves the subdomain to whoever took it. This
+query finds them:
+
+```sql
+SELECT a.domain AS child, a.workspace_id AS child_owner,
+       b.domain AS parent, b.workspace_id AS parent_owner
+  FROM mail_domains a JOIN mail_domains b
+    ON a.domain LIKE '%.' || b.domain AND a.workspace_id <> b.workspace_id;
+```
+
 ### Drive share links are minted, validated, and grant nothing
 
 The whole chain exists except its last link, so this looks finished from every
@@ -164,6 +210,45 @@ radius is currently nil by accident rather than by design: `EnsureRoot` grants
 `subject_type=workspace`, so every Drive object is workspace-readable regardless
 and a per-user revoke cannot narrow read access. Message ACLs are resolved
 query-side and are immune. Worth revisiting if either of those two facts changes.
+
+**The integration harness's config is a hand-written literal, and only three of
+its fields are now pinned to production's.** `buildConfig` in
+`test/integration/harness_test.go` does not go through `app.LoadConfig`, so a
+default added there reaches every deployment and no test. This has already bitten
+twice: `SEARCH_ENABLED`/`FILES_ENABLED` (the file and search routes were silently
+unregistered for every run) and the three database timeouts — `lock_timeout`,
+`statement_timeout` and `idle_in_transaction_session_timeout` were never
+assigned, so they were zero, which `pkg/database` reads as "do not set it". The
+suite ran with all three production guards OFF, which inverts what a lock bug
+looks like: a route that returns 503 in production hung the suite instead, and a
+hang is a CI job killed by the runner with no failing test named.
+
+`TestTheHarnessInheritsProductionDatabaseGuards` now compares those three against
+`LoadConfig`'s own output, so they cannot drift again. One consequence is worth
+knowing before blaming a change: with `lock_timeout` now at 5s, a test that waits
+on a row lock FAILS instead of eventually succeeding.
+`TestIssuesAreNotReachableFromAnotherTenant` did exactly that once, at exactly
+5.00s, while other test processes were running against the same database. It has
+not reproduced: a clean full run sampling `pg_stat_activity` every second found
+zero lock waits anywhere except the deliberate 5s one in
+`TestAnOperationalFailureIsNotReportedAsInvalid`. Recorded as an observation, not
+a diagnosis — running two suites against one database is not a supported
+configuration, and the single failure is consistent with that. **The class is not fixed** —
+the fourth field to be added will have the same problem. The real repair is for
+the harness to call `LoadConfig` and override only what a test genuinely needs
+(`Server.Port = 0`, the log level), which was not attempted here because
+`validate()` requires `ADMIN_EMAIL`/`ADMIN_PASSWORD` and the harness's env
+fallbacks differ from production's, so the change needs CI's env checked
+alongside it.
+
+**Share links have no reachable path for a third object type, and `RevokeLink`
+carries a branch for one anyway.** `drive_share_links.object_type` has carried
+`CHECK (object_type IN ('file','folder'))` since migration 028, and `CreateLink`
+is the only INSERT, so `RevokeLink`'s `default` branch cannot be reached. It is
+kept deliberately — widening the constraint would otherwise route a new type into
+`folder:<thatUUID>`, an `acl_object` row that does not exist, hence `CapNone`,
+hence a 404 nobody can explain. Noted because an unreachable branch that is not
+documented as such invites deletion.
 
 **`rbac.RequireWorkspaceRole` is still unwired**, and its own comment says so.
 Every workspace-scoped route continues to do its role check handler-locally. The

@@ -498,8 +498,21 @@ func (h *Handler) RevokeLink(w http.ResponseWriter, r *http.Request) {
 	// EXPLICIT, not "file or else folder". The fallback silently authorized a
 	// link on any other object type against folder:<thatUUID> — an acl_object
 	// row that does not exist, so CapNone, so a 404 the holder could never
-	// resolve. CreateLink now refuses those types outright; this refuses a row
-	// that predates that or arrived some other way, rather than guessing.
+	// resolve.
+	//
+	// The default branch is UNREACHABLE today, and deliberately kept.
+	//
+	// drive_share_links.object_type has carried CHECK (object_type IN ('file',
+	// 'folder')) since migration 028 created the table, so no row can reach it —
+	// an earlier version of this comment said it caught rows predating
+	// CreateLink's guard, and no such row has ever been possible.
+	//
+	// It stays because the thing it guards against is that constraint being
+	// widened. Links for a third object type would be a one-line migration and a
+	// case in CreateLink; without this, they would arrive here and be authorized
+	// against folder:<thatUUID> — an acl_object row that does not exist, hence
+	// CapNone, hence a 404 nobody can explain. Refusing is the right answer to a
+	// case that should be impossible; guessing is not.
 	var ref authz.ObjectRef
 	switch objectType {
 	case EntryFolder:

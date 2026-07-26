@@ -97,6 +97,21 @@ func envInt(k string, def int) int {
 	return n
 }
 
+// envDuration is env for a timeout. An unparseable value falls back to the
+// default rather than becoming 0 — and for these settings 0 does not mean
+// "instant", it means DISABLED, so a typo would silently remove the guard.
+func envDuration(k string, def time.Duration) time.Duration {
+	raw, ok := os.LookupEnv(k)
+	if !ok || raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
+
 // requireInfra reports whether unreachable infrastructure must fail the suite
 // instead of skipping it. Every CI provider sets CI=true;
 // SUPEROPS_REQUIRE_INFRA forces the same behaviour (or opts out of it) anywhere.
@@ -146,6 +161,24 @@ func buildConfig() *app.Config {
 	cfg.DB.SSLMode = env("DB_SSLMODE", "disable")
 	cfg.DB.MaxConns = 10
 	cfg.DB.MinConns = 2
+	// THE THREE DATABASE TIMEOUTS ARE PRODUCTION SAFETY NETS AND THE SUITE RAN
+	// WITHOUT THEM.
+	//
+	// This literal never goes through LoadConfig — the comment below says so
+	// for SEARCH_ENABLED/FILES_ENABLED — and these three fields were simply
+	// never assigned, so they were the zero value. setTimeoutParam skips a
+	// non-positive duration, so every connection the suite opened had
+	// lock_timeout, statement_timeout and idle_in_transaction_session_timeout
+	// ALL DISABLED, while production sets 5s/30s/60s.
+	//
+	// That inverts what a lock bug looks like. A route that waits forever on a
+	// row lock returns 503 in production and HANGS in the suite: a test I wrote
+	// to assert the lock-timeout error mapping sat for ten minutes with no
+	// output instead of failing. A suite that hangs is a suite whose CI job is
+	// killed by the runner's timeout with no failing test named.
+	cfg.DB.StatementTimeout = envDuration("DB_STATEMENT_TIMEOUT", 30*time.Second)
+	cfg.DB.LockTimeout = envDuration("DB_LOCK_TIMEOUT", 5*time.Second)
+	cfg.DB.IdleInTransactionTimeout = envDuration("DB_IDLE_IN_TX_TIMEOUT", 60*time.Second)
 	cfg.Redis.Addr = env("REDIS_ADDR", "localhost:6379")
 	cfg.Redis.Password = env("REDIS_PASSWORD", "changeme_redis_password")
 	cfg.Redis.DB = envInt("REDIS_DB", 0)
@@ -241,6 +274,19 @@ type apiResp struct {
 	} `json:"error"`
 }
 
+// httpClient is what every request in this suite goes through.
+//
+// It exists because http.DefaultClient has NO TIMEOUT, so any request the
+// server never answers hangs the suite until `go test -timeout` kills the whole
+// package — a failure with no test named and no assertion message. That is not
+// theoretical: reverting Patch's in-transaction read wedged the connection pool
+// and turned a test that should have said "24 concurrent PATCHes took too long"
+// into a silent 300-second package timeout.
+//
+// 60s is far above any honest request here and far below the package timeout,
+// so a wedge fails as a named test with a message.
+var httpClient = &http.Client{Timeout: 60 * time.Second}
+
 func (h *harness) do(t *testing.T, method, path, token string, body any) (int, apiResp) {
 	t.Helper()
 	var rdr io.Reader
@@ -258,7 +304,7 @@ func (h *harness) do(t *testing.T, method, path, token string, body any) (int, a
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
@@ -903,4 +949,61 @@ func (h *harness) resolveLink(t *testing.T, token, password string) (int, apiRes
 func (h *harness) doBearer(t *testing.T, method, path, token string, body any) (int, apiResp) {
 	t.Helper()
 	return h.do(t, method, path, token, body)
+}
+
+// THE SUITE MUST RUN WITH THE SAME DATABASE GUARDS AS PRODUCTION.
+//
+// buildConfig is a literal that never goes through LoadConfig, so nothing makes
+// a field added there appear here. Three timeout fields were missing entirely
+// and were therefore zero, which pkg/database reads as "do not set the
+// parameter" — the suite ran with lock, statement and idle-in-transaction
+// timeouts all disabled. Bugs whose production symptom is a 503 became an
+// indefinite hang under test.
+//
+// Comparing against LoadConfig's own output rather than against numbers copied
+// into this test is what makes it durable: change a default in config.go and
+// this either follows it or fails.
+func TestTheHarnessInheritsProductionDatabaseGuards(t *testing.T) {
+	// THE ENVIRONMENT IS CLEARED FIRST, for both sides.
+	//
+	// buildConfig() used to be called before these, so it read the ambient
+	// environment while LoadConfig read a cleared one. Anyone who shortened
+	// DB_LOCK_TIMEOUT to make a lock test fast got a red suite claiming the
+	// harness and production disagree, when both would have resolved the same
+	// value from the same variable.
+	t.Setenv("JWT_SECRET", strings.Repeat("x", 64))
+	t.Setenv("ADMIN_EMAIL", "a@example.com")
+	t.Setenv("ADMIN_PASSWORD", "x")
+	for _, k := range []string{"DB_LOCK_TIMEOUT", "DB_STATEMENT_TIMEOUT", "DB_IDLE_IN_TX_TIMEOUT"} {
+		t.Setenv(k, "")
+	}
+
+	cfg := buildConfig()
+
+	for _, c := range []struct {
+		name string
+		got  time.Duration
+	}{
+		{"LockTimeout", cfg.DB.LockTimeout},
+		{"StatementTimeout", cfg.DB.StatementTimeout},
+		{"IdleInTransactionTimeout", cfg.DB.IdleInTransactionTimeout},
+	} {
+		if c.got <= 0 {
+			t.Errorf("cfg.DB.%s = %s: a non-positive duration disables the parameter, "+
+				"so the suite cannot observe any bug this guard exists to bound", c.name, c.got)
+		}
+	}
+
+	// And the values are production's, not this file's opinion of them.
+	prod, err := app.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.DB.LockTimeout != prod.DB.LockTimeout ||
+		cfg.DB.StatementTimeout != prod.DB.StatementTimeout ||
+		cfg.DB.IdleInTransactionTimeout != prod.DB.IdleInTransactionTimeout {
+		t.Errorf("the harness and production disagree:\n harness: lock=%s stmt=%s idle=%s\n prod:    lock=%s stmt=%s idle=%s",
+			cfg.DB.LockTimeout, cfg.DB.StatementTimeout, cfg.DB.IdleInTransactionTimeout,
+			prod.DB.LockTimeout, prod.DB.StatementTimeout, prod.DB.IdleInTransactionTimeout)
+	}
 }

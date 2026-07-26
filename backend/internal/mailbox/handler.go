@@ -412,6 +412,44 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AUTHORIZED BEFORE THE TRANSACTION OPENS.
+	//
+	// The capability lookups query the POOL, so running them inside the reply's
+	// transaction meant a connection holding a second one — and that deadlocks
+	// a bounded pool the moment every connection is inside a transaction at
+	// once.
+	//
+	// OBSERVED, not theoretical. I first tried 6 concurrent replies against a
+	// pool of 4 and wrote here that it was unreproducible. The ratio is not
+	// what matters, the absolute count is: below saturation the pre-transaction
+	// capability check keeps acquiring and releasing, which staggers arrivals
+	// and reopens the window. At 24 against a pool of 10 it closes every time —
+	// 24 of 24 replies in 77 ms with the check hoisted out, not one in 100
+	// seconds with it inside. A reply with NO attachment is unaffected, which
+	// is what isolates the cause.
+	//
+	// In production DB_MAX_CONNS is 25 and idle_in_transaction_session_timeout
+	// is 60s, so the shape is a repeating one-minute outage of the WHOLE API
+	// under sustained load rather than a permanent wedge — every route, because
+	// the pool is shared.
+	authorized, err := h.repo.AuthorizeAttachments(ctx, actor, req.AttachmentFileIDs)
+	if err != nil {
+		if errors.Is(err, ErrTooManyAttachments) {
+			httputil.JSONError(w, http.StatusBadRequest, "TOO_MANY_ATTACHMENTS", err.Error())
+			return
+		}
+		if errors.Is(err, ErrNotFound) {
+			// The ONLY reason this call refuses: the actor's capability on some
+			// file does not imply share. 404-shaped rather than 403 because
+			// naming the file would confirm one exists at that id.
+			httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND",
+				"one of those files cannot be attached; sharing it is not yours to do")
+			return
+		}
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+
 	// THE REPLY AND ITS ATTACHMENTS COMMIT TOGETHER.
 	//
 	// These were two commits. A refused attach therefore left the outbound row
@@ -461,12 +499,20 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		// Attachments BEFORE the delivery is queued, so the consumer never
 		// renders a message whose attachments are still being linked — and in
 		// the same transaction, so a refusal takes the reply with it.
-		return h.repo.AttachToOutboundIn(ctx, tx, msg.ID, actor, req.AttachmentFileIDs)
+		return h.repo.LinkAttachmentsIn(ctx, tx, authorized, msg.ID)
 	})
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
+			// A DIFFERENT REFUSAL FROM THE ONE ABOVE, and it used to share its
+			// wording. Capability was already granted by this point, so "you can
+			// read it but not share it" was simply false here. What linked fewer
+			// rows than asked is the statement's own predicates: the file
+			// belongs to another tenant (authorization can pass for somebody who
+			// belongs to both), or it is already attached to a message — a file
+			// belongs to exactly one.
 			httputil.JSONError(w, http.StatusNotFound, "NOT_FOUND",
-				"one of those files cannot be attached; you can read it but not share it")
+				"one of those files cannot be attached; it belongs to another "+
+					"workspace, or it is already attached to a message")
 			return
 		}
 		httputil.HandleError(w, httputil.NewInternal(err))

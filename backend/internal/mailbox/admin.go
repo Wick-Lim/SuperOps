@@ -3,8 +3,10 @@ package mailbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
@@ -123,6 +126,30 @@ func (h *Handler) CreateDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
 
+	// VALIDATED BEFORE IT IS USED, and this is not tidiness.
+	//
+	// The ownership check interpolates this value into a LIKE pattern
+	// (`domain LIKE '%.' || $1`). The shape CHECK on the column guards the
+	// STORED side; it does not guard the request, which until now reached the
+	// pattern raw and only met the CHECK at the INSERT — i.e. after the check
+	// had already answered. A caller probing "%" got 409 and one probing
+	// "%wrongtld" got 400, which is a character-by-character oracle over
+	// domains registered by tenants they have no relationship with.
+	//
+	// AT LEAST TWO LABELS. The CHECK accepts a single one, and the descendant
+	// clause reads a single label as the parent of everything beneath it — so
+	// registering `com`, with no DNS proof of anything, locked every other
+	// tenant out of every `.com` and let the squatter open mailboxes at any
+	// address under it. Two labels does not solve the general problem: `co.uk`
+	// and `github.io` are public suffixes that look like ordinary domains, and
+	// telling them apart needs a suffix list this deployment does not carry.
+	// See docs/KNOWN-GAPS.md.
+	if !domainShape.MatchString(domain) || strings.Count(domain, ".") < 1 {
+		httputil.JSONError(w, http.StatusBadRequest, "INVALID_DOMAIN",
+			"a domain is lowercase letters, digits, dots and hyphens, and has at least two labels")
+		return
+	}
+
 	// A random token, never derived from the domain: a derived one could be
 	// computed by anybody for a domain they do not own, which would make the
 	// whole check theatre.
@@ -146,33 +173,57 @@ func (h *Handler) CreateDomain(w http.ResponseWriter, r *http.Request) {
 	//
 	// Both directions: you may not register under somebody else's name, and you
 	// may not register a name that would swallow theirs.
-	var owner, clash string
-	err = h.pool.QueryRow(r.Context(), `
-		SELECT workspace_id::text, domain
-		  FROM mail_domains
-		 WHERE workspace_id <> $2
-		   AND (domain = $1 OR $1 LIKE '%.' || domain OR domain LIKE '%.' || $1)
-		 ORDER BY length(domain) DESC
-		 LIMIT 1`, domain, workspaceID).Scan(&owner, &clash)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		// Nothing in the tree belongs to anybody else.
-	case err != nil:
-		httputil.HandleError(w, httputil.NewInternal(err))
-		return
-	default:
+	// CHECKED AND INSERTED UNDER ONE LOCK.
+	//
+	// The check and the insert were two statements on the pool, which is a
+	// check-then-insert race: two tenants registering `victim.test` and
+	// `mail.victim.test` at the same instant both pass their own check and both
+	// commit, splitting one domain tree across two owners. Reproduced 15 times
+	// out of 15 — it is not a narrow window, it is the common case whenever two
+	// requests overlap at all.
+	//
+	// An advisory lock rather than a constraint because the conflict is a
+	// PREFIX relation, which no unique index can express. It is keyed on the
+	// registrable name space rather than taken globally, so two tenants
+	// registering unrelated domains do not queue behind each other; a
+	// transaction-scoped lock is released by COMMIT or ROLLBACK with no cleanup
+	// path to forget.
+	var d Domain
+	err = database.WithTx(r.Context(), h.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(r.Context(),
+			`SELECT pg_advisory_xact_lock(hashtext($1))`, registrableKey(domain)); err != nil {
+			return fmt.Errorf("lock domain namespace: %w", err)
+		}
+
+		var owner, clash string
+		err := tx.QueryRow(r.Context(), `
+			SELECT workspace_id::text, domain
+			  FROM mail_domains
+			 WHERE workspace_id <> $2
+			   AND (domain = $1 OR $1 LIKE '%.' || domain OR domain LIKE '%.' || $1)
+			 ORDER BY length(domain) DESC
+			 LIMIT 1`, domain, workspaceID).Scan(&owner, &clash)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// Nothing in the tree belongs to anybody else.
+		case err != nil:
+			return fmt.Errorf("resolve domain tree: %w", err)
+		default:
+			return errDomainTaken
+		}
+
+		return tx.QueryRow(r.Context(), `
+			INSERT INTO mail_domains (workspace_id, domain, verify_token)
+			VALUES ($1, $2, $3)
+			RETURNING id::text, domain, verified_at, created_at, verify_token`,
+			workspaceID, domain, token,
+		).Scan(&d.ID, &d.Domain, &d.VerifiedAt, &d.CreatedAt, &d.VerifyValue)
+	})
+	if errors.Is(err, errDomainTaken) {
 		httputil.JSONError(w, http.StatusConflict, "DOMAIN_TAKEN",
 			"that domain is already registered, or sits under one that is")
 		return
 	}
-
-	var d Domain
-	err = h.pool.QueryRow(r.Context(), `
-		INSERT INTO mail_domains (workspace_id, domain, verify_token)
-		VALUES ($1, $2, $3)
-		RETURNING id::text, domain, verified_at, created_at, verify_token`,
-		workspaceID, domain, token,
-	).Scan(&d.ID, &d.Domain, &d.VerifiedAt, &d.CreatedAt, &d.VerifyValue)
 	if err != nil {
 		if strings.Contains(err.Error(), "mail_domains_domain_key") {
 			// Globally unique. Two tenants claiming one domain is an
@@ -305,6 +356,36 @@ func (h *Handler) DeleteDomain(w http.ResponseWriter, r *http.Request) {
 	if !h.requireWorkspaceAdmin(w, r, workspaceID) {
 		return
 	}
+	// A DOMAIN WITH LIVE MAILBOXES IS NOT DELETABLE.
+	//
+	// mailboxes.domain_id is ON DELETE SET NULL, so deleting the row left every
+	// mailbox on that domain alive, still resolvable by Ingest, and no longer
+	// connected to the registration that justified it. An audit used that to
+	// erase the evidence of a squat: take the address while the domain is
+	// unregistered, register the domain to hold it, then delete the
+	// registration — the victim's own domain list then looks completely normal
+	// while a foreign tenant keeps their address, with the only surviving trace
+	// in a table no API exposes.
+	//
+	// It also made a lockout deniable and repeatable: squat the parent to block
+	// somebody, release on demand.
+	//
+	// The mailboxes must go first, which is a decision their owner has to make
+	// — they hold customer conversations — so this reports rather than
+	// cascading.
+	var attached int
+	if err := h.pool.QueryRow(r.Context(),
+		`SELECT count(*) FROM mailboxes WHERE domain_id = $1 AND archived_at IS NULL`,
+		id).Scan(&attached); err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+	if attached > 0 {
+		httputil.JSONError(w, http.StatusConflict, "DOMAIN_IN_USE",
+			fmt.Sprintf("%d mailbox(es) still use this domain; archive them first", attached))
+		return
+	}
+
 	if _, err := h.pool.Exec(r.Context(), `DELETE FROM mail_domains WHERE id = $1`, id); err != nil {
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
@@ -426,3 +507,31 @@ func (h *Handler) RevokeIngestToken(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// errDomainTaken carries the conflict out of the registration transaction.
+var errDomainTaken = errors.New("mailbox: domain registered in this tree")
+
+// registrableKey is the lock key for a domain's name space.
+//
+// The LAST TWO LABELS, so `victim.test` and `mail.victim.test` — the pair whose
+// race this serialises — hash to the same key, while an unrelated domain does
+// not queue behind them. It is deliberately not the public-suffix registrable
+// domain: that needs a suffix list this deployment does not carry, and being
+// slightly too coarse costs a little contention while being too fine would let
+// the race back in.
+func registrableKey(domain string) string {
+	labels := strings.Split(domain, ".")
+	if len(labels) <= 2 {
+		return domain
+	}
+	return strings.Join(labels[len(labels)-2:], ".")
+}
+
+// domainShape mirrors mail_domains_domain_shape, applied to the REQUEST before
+// the value is interpolated into an ownership LIKE pattern.
+//
+// Duplicating the constraint here is deliberate: the database's copy protects
+// what is stored, and this one protects what is compared. A single regex shared
+// between them is not possible — one lives in SQL — so the pairing is stated in
+// both places and asserted by a test.
+var domainShape = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$`)

@@ -1444,3 +1444,398 @@ func TestConcurrentWorkflowPatchesDoNotRevertEachOther(t *testing.T) {
 		}
 	}
 }
+
+// SAVE AND PATCH MUST AGREE ABOUT WHAT A VALID WORKFLOW IS.
+//
+// Save's body was split into saveTx so Patch could run it inside a transaction
+// it already holds. A split like that loses a guard silently: the validation
+// stayed in one half and the other half kept calling the wrapper, and nothing
+// would have said so. This drives all three checks through BOTH entry points.
+func TestCreateAndPatchValidateIdentically(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := wfRepo(t)
+	ctx := context.Background()
+
+	many := make([]workflow.Step, 21)
+	for i := range many {
+		many[i] = workflow.Step{Kind: workflow.StepPostMessage, Config: map[string]any{}}
+	}
+	cases := []struct {
+		name     string
+		steps    []workflow.Step
+		triggers []workflow.Trigger
+	}{
+		{"too many steps", many, nil},
+		{"unknown step kind", []workflow.Step{{Kind: "not_a_kind"}}, nil},
+		{"invalid event type", nil, []workflow.Trigger{{EventType: "NOT VALID!!"}}},
+	}
+
+	for _, c := range cases {
+		_, createErr := repo.Save(ctx, ws, "", fmt.Sprintf("val-%d", time.Now().UnixNano()), "",
+			c.steps, c.triggers, true, me)
+
+		good, err := repo.Save(ctx, ws, "", fmt.Sprintf("good-%d", time.Now().UnixNano()), "",
+			[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{}}},
+			[]workflow.Trigger{{EventType: "message.created"}}, true, me)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := map[string]any{}
+		if c.steps != nil {
+			body["steps"] = c.steps
+		}
+		if c.triggers != nil {
+			body["triggers"] = c.triggers
+		}
+		patchCode, _ := h.do(t, http.MethodPatch, "/api/v1/workflows/"+good.ID, admin, body)
+
+		if createErr == nil {
+			t.Errorf("%s: create ACCEPTED it", c.name)
+		}
+		if patchCode < 400 {
+			t.Errorf("%s: patch accepted it (%d) while create refused — the two entry "+
+				"points disagree about what a valid workflow is", c.name, patchCode)
+		}
+	}
+}
+
+// A LOCK TIMEOUT IS NOT AN INVALID WORKFLOW.
+//
+// Moving the read inside Patch's transaction meant every failure it could
+// produce reached saveFailed, whose default branch emitted `err.Error()`
+// verbatim as 400 INVALID_WORKFLOW. So two admins editing one workflow gave the
+// second "400 INVALID_WORKFLOW: lock workflow: ERROR: canceling statement due
+// to lock timeout (SQLSTATE 55P03)" — a client will not retry a 400, the user is
+// told their workflow is invalid when it is not, and a Postgres error string is
+// on the wire.
+func TestAnOperationalFailureIsNotReportedAsInvalid(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := wfRepo(t)
+	ctx := context.Background()
+
+	wf, err := repo.Save(ctx, ws, "", fmt.Sprintf("errmap-%d", time.Now().UnixNano()), "",
+		[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{}}},
+		[]workflow.Trigger{{EventType: "message.created"}}, true, me)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A CALLER error stays a 400 and says what is wrong.
+	code, body := h.do(t, http.MethodPatch, "/api/v1/workflows/"+wf.ID, admin,
+		map[string]any{"steps": []map[string]any{{"kind": "not_a_kind"}}})
+	if code != http.StatusBadRequest {
+		t.Errorf("an unknown step kind = %d, want 400", code)
+	}
+	if raw, err := json.Marshal(body); err == nil && !strings.Contains(string(raw), "not_a_kind") {
+		t.Errorf("the 400 does not name the offending step: %s", raw)
+	}
+
+	// AN OPERATIONAL failure is a 500 with nothing internal on the wire. Held by
+	// taking the row lock from another session and letting the handler's
+	// lock_timeout expire.
+	conn, err := h.app.DB.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT id FROM workflows WHERE id = $1 FOR NO KEY UPDATE`, wf.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body = h.do(t, http.MethodPatch, "/api/v1/workflows/"+wf.ID, admin,
+		map[string]any{"name": "blocked"})
+	raw, _ := json.Marshal(body)
+	// 409, not 400 (not the caller's fault) and not 500 (nothing is broken):
+	// the row is busy and the answer is to try again.
+	if code != http.StatusConflict {
+		t.Errorf("a lock timeout = %d, want 409: %s", code, raw)
+	}
+	if strings.Contains(string(raw), "SQLSTATE") || strings.Contains(string(raw), "lock timeout") {
+		t.Errorf("a Postgres error string reached the client: %s", raw)
+	}
+}
+
+// CONCURRENT PATCHES MUST NOT EXHAUST THE CONNECTION POOL.
+//
+// Patch runs its read INSIDE the transaction, through loadTx, for a reason that
+// no test covered: swapping loadTx for the pool-based load compiles cleanly and
+// leaves every other workflow test green, because they are sequential. What it
+// breaks is a transaction holding one connection while its body asks the same
+// pool for a second — past the pool size, every in-flight request is holding a
+// connection and waiting for one, and none can finish.
+//
+// This is not hypothetical for this route: the identical shape was measured on
+// the reply route at 24 concurrent requests against a pool of 10 — 100 seconds
+// with the second acquire inside the transaction, 77 ms with it hoisted out.
+//
+// So: more concurrent PATCHes than the pool has connections, and a deadline far
+// below what a wedged pool would take.
+func TestConcurrentPatchesDoNotExhaustThePool(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := wfRepo(t)
+
+	const concurrency = 24 // the harness pool is 10
+	wfs := make([]string, concurrency)
+	for i := range wfs {
+		wf, err := repo.Save(context.Background(), ws, "",
+			fmt.Sprintf("pool-%d-%d", time.Now().UnixNano(), i), "",
+			[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{}}},
+			[]workflow.Trigger{{EventType: "message.created"}}, true, me)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wfs[i] = wf.ID
+	}
+
+	// Distinct workflows: the point is pool capacity, not row contention. Two
+	// PATCHes of ONE row would serialise on the lock and prove nothing.
+	codes := make([]int, concurrency)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i, id := range wfs {
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			code, _ := h.do(t, http.MethodPatch, "/api/v1/workflows/"+id, admin,
+				map[string]any{"description": fmt.Sprintf("concurrent %d", i)})
+			codes[i] = code
+		}(i, id)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("patch %d = %d, want 200", i, c)
+		}
+	}
+	// Generous: a healthy run is well under a second. A pool deadlock does not
+	// come in slightly over — it takes as long as the client timeout.
+	if elapsed > 20*time.Second {
+		t.Errorf("%d concurrent PATCHes took %s against a pool of 10: the transaction "+
+			"is acquiring a second connection from the pool it is already holding one from",
+			concurrency, elapsed)
+	}
+	t.Logf("%d concurrent PATCHes in %s", concurrency, elapsed)
+}
+
+// THE DATABASE'S CHECK CONSTRAINTS ARE NOT AN API.
+//
+// Two of them on this path are reachable by a caller: the name is 1..200
+// CHARACTERS, and the encoded steps are at most 64 KiB. Neither was checked in
+// Go, so the answer to either was whatever Postgres says about a violated
+// constraint, forwarded verbatim — and once operational failures stopped being
+// reported as 400s, both would have become 500s instead: "this service is
+// broken" for a request that is simply too big.
+func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	create := "/api/v1/workspaces/" + ws + "/workflows"
+
+	step := map[string]any{"kind": "post_message", "config": map[string]any{}}
+	trigger := map[string]any{"event_type": "message.created"}
+
+	cases := []struct {
+		name string
+		body map[string]any
+		want string // a fragment the message must contain
+	}{
+		{
+			name: "an empty name",
+			body: map[string]any{"name": "   ", "steps": []any{step}, "triggers": []any{trigger}},
+			want: "1 to 200 characters",
+		},
+		{
+			name: "a name of 201 characters",
+			body: map[string]any{"name": strings.Repeat("a", 201), "steps": []any{step},
+				"triggers": []any{trigger}},
+			want: "1 to 200 characters",
+		},
+		{
+			// char_length counts characters, len() counts bytes. 200 Korean
+			// characters are 600 bytes, and a byte check would refuse a name the
+			// database accepts.
+			name: "200 characters that are 600 bytes",
+			body: map[string]any{"name": strings.Repeat("가", 200), "steps": []any{step},
+				"triggers": []any{trigger}},
+			want: "",
+		},
+		{
+			// U+0000 IS LEGAL JSON AND UNSTORABLE. Go's decoder turns the
+			// escape into a real NUL, which survives TrimSpace and a rune
+			// count, and then no Postgres text or jsonb column can hold it —
+			// 22021 for text, 22P05 for jsonb. Written as a Go escape so this
+			// file contains no NUL of its own.
+			name: "a name containing NUL",
+			body: map[string]any{"name": "my\x00flow", "steps": []any{step},
+				"triggers": []any{trigger}},
+			want: "NUL",
+		},
+		{
+			name: "a step config containing NUL",
+			body: map[string]any{
+				"name": fmt.Sprintf("nul-step-%d", time.Now().UnixNano()),
+				"steps": []any{map[string]any{"kind": "post_message",
+					"config": map[string]any{"body": "a\x00b"}}},
+				"triggers": []any{trigger},
+			},
+			want: "NUL",
+		},
+		{
+			name: "a trigger filter containing NUL",
+			body: map[string]any{
+				"name":  fmt.Sprintf("nul-filter-%d", time.Now().UnixNano()),
+				"steps": []any{step},
+				"triggers": []any{map[string]any{"event_type": "message.created",
+					"filter": map[string]any{"k": "a\x00b"}}},
+			},
+			want: "NUL",
+		},
+		{
+			// MANY SMALL KEYS, not one long string. jsonb carries a 4-byte
+			// JEntry per key/value pair, so this is 62,822 bytes of JSON text
+			// and 103,956 of jsonb — the exact shape a Go byte guard waves
+			// through and the constraint rejects. A single 70,000-byte string
+			// was the earlier payload here and is the one case where jsonb and
+			// text agree, so it could not have caught this.
+			name: "steps larger than the column allows",
+			body: map[string]any{
+				"name":     fmt.Sprintf("big-%d", time.Now().UnixNano()),
+				"steps":    []any{map[string]any{"kind": "post_message", "config": manyKeys(5000)}},
+				"triggers": []any{trigger},
+			},
+			want: "too large",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, body := h.do(t, http.MethodPost, create, admin, c.body)
+			raw, _ := json.Marshal(body)
+
+			if c.want == "" {
+				if code != http.StatusCreated && code != http.StatusOK {
+					t.Fatalf("= %d, want it accepted: %s", code, raw)
+				}
+				return
+			}
+			if code != http.StatusBadRequest {
+				t.Fatalf("= %d, want 400: %s", code, raw)
+			}
+			if !strings.Contains(string(raw), c.want) {
+				t.Errorf("the refusal does not say %q: %s", c.want, raw)
+			}
+			if strings.Contains(string(raw), "SQLSTATE") ||
+				strings.Contains(string(raw), "violates check constraint") {
+				t.Errorf("a Postgres constraint error reached the client: %s", raw)
+			}
+		})
+	}
+}
+
+// TRIMMING THE NAME CHANGES WHAT IS STORED, so it has to be the trimmed value
+// that reaches the row — not a local that validation looked at and discarded.
+//
+// And a name of nothing but spaces must be REFUSED rather than quietly ignored:
+// on PATCH the alternative is that the workflow keeps its old name while the
+// caller is told the rename succeeded.
+func TestAWorkflowNameIsStoredTrimmed(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	create := "/api/v1/workspaces/" + ws + "/workflows"
+
+	want := fmt.Sprintf("padded-%d", time.Now().UnixNano())
+	res := h.req(t, http.StatusCreated, http.MethodPost, create, admin, map[string]any{
+		"name":     "  " + want + "  ",
+		"steps":    []any{map[string]any{"kind": "post_message", "config": map[string]any{}}},
+		"triggers": []any{map[string]any{"event_type": "message.created"}},
+	})
+	var wf struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	decodeInto(t, res.Data, &wf)
+	if wf.Name != want {
+		t.Errorf("stored name = %q, want %q: validation trimmed a copy and the row kept the padding",
+			wf.Name, want)
+	}
+
+	// Read it back, because the create response could be echoing the request.
+	res = h.req(t, http.StatusOK, http.MethodGet, "/api/v1/workflows/"+wf.ID, admin, nil)
+	decodeInto(t, res.Data, &wf)
+	if wf.Name != want {
+		t.Errorf("name read back = %q, want %q", wf.Name, want)
+	}
+
+	// A PATCH THAT DOES NOT SEND A NAME MUST NOT REWRITE ONE.
+	//
+	// Trimming inside the repository also trimmed the value Patch MERGES IN for
+	// a caller who sent no name — so toggling `enabled` renamed the workflow,
+	// against PatchFields' promise that a nil field must not change. Seeded
+	// through the repository so the stored value keeps its padding, exactly as a
+	// row written before the check existed would.
+	padded := "  " + want + "-untouched  "
+	seeded, err := wfRepo(t).Save(context.Background(), ws, "", padded, "",
+		[]workflow.Step{{Kind: workflow.StepPostMessage, Config: map[string]any{}}},
+		[]workflow.Trigger{{EventType: "message.created"}}, true, h.whoami(t, admin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seeded.Name != padded {
+		t.Fatalf("the repository trimmed on the way in (%q); this case can no longer "+
+			"reproduce what a pre-existing row looks like", seeded.Name)
+	}
+	code, body := h.do(t, http.MethodPatch, "/api/v1/workflows/"+seeded.ID, admin,
+		map[string]any{"enabled": false})
+	if code != http.StatusOK {
+		raw, _ := json.Marshal(body)
+		t.Fatalf("patching only `enabled` = %d, want 200: %s", code, raw)
+	}
+	res = h.req(t, http.StatusOK, http.MethodGet, "/api/v1/workflows/"+seeded.ID, admin, nil)
+	var after struct {
+		Name string `json:"name"`
+	}
+	decodeInto(t, res.Data, &after)
+	if after.Name != padded {
+		t.Errorf("a PATCH of `enabled` changed the name from %q to %q", padded, after.Name)
+	}
+
+	// A rename to whitespace is a refusal, not a no-op.
+	code, body = h.do(t, http.MethodPatch, "/api/v1/workflows/"+wf.ID, admin,
+		map[string]any{"name": "   "})
+	if code != http.StatusBadRequest {
+		raw, _ := json.Marshal(body)
+		t.Errorf("renaming to whitespace = %d, want 400: %s", code, raw)
+	}
+	res = h.req(t, http.StatusOK, http.MethodGet, "/api/v1/workflows/"+wf.ID, admin, nil)
+	decodeInto(t, res.Data, &wf)
+	if wf.Name != want {
+		t.Errorf("after the refused rename the name is %q, want %q", wf.Name, want)
+	}
+}
+
+// manyKeys builds a config whose JSONB is far larger than its JSON text.
+func manyKeys(n int) map[string]any {
+	m := make(map[string]any, n)
+	for i := 0; i < n; i++ {
+		m[fmt.Sprintf("k%d", i)] = i
+	}
+	return m
+}

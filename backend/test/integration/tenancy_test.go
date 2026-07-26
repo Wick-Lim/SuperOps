@@ -544,7 +544,7 @@ func (h *harness) exportAuditNDJSON(t *testing.T, token, query string) []exporte
 		t.Fatalf("new export request: %v", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatalf("audit export: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,7 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/audit"
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/authctx"
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/httputil"
 )
 
@@ -142,6 +144,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// TRIMMED HERE, not in the repository: this is the caller's own value, so
+	// normalising it is normalising input. Doing it further down also caught the
+	// name Patch merges in for a caller who sent none — see saveTx.
+	req.Name = strings.TrimSpace(req.Name)
+
 	actor := authctx.UserID(r.Context())
 	wf, err := h.repo.Save(r.Context(), workspaceID, "", req.Name, req.Description,
 		req.Steps, req.Triggers, req.Enabled, actor)
@@ -185,6 +192,14 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	// APPENDS a version the reverted content becomes the version that runs.
 	// Reproduced in 5 of 40 paired concurrent requests before Patch took the
 	// row lock.
+	// Only when the caller actually sent one. A nil Name means "leave it alone",
+	// and rewriting the stored value on their behalf is exactly what PatchFields
+	// promises not to do.
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		req.Name = &trimmed
+	}
+
 	current, wf, err := h.repo.Patch(r.Context(), workspaceID, id, req,
 		authctx.UserID(r.Context()), h.loadTx)
 	if err != nil {
@@ -224,6 +239,16 @@ func (h *Handler) Archive(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.pool.Exec(r.Context(),
 		`UPDATE workflows SET archived_at = NOW(), enabled = FALSE, updated_at = NOW()
 		  WHERE id = $1 AND archived_at IS NULL`, id); err != nil {
+		// THE SAME LOCK, THE SAME ANSWER. This UPDATE conflicts with the
+		// FOR NO KEY UPDATE that Patch holds, so one admin editing while another
+		// archives is the same collision the PATCH route reports as 409 — and
+		// this route was reporting it as 500. Same cause, same row, and only one
+		// of the two told the client it was worth retrying.
+		if database.IsLockTimeout(err) {
+			httputil.JSONError(w, http.StatusConflict, "WORKFLOW_BUSY",
+				"someone else is saving this workflow right now; try again")
+			return
+		}
 		httputil.HandleError(w, httputil.NewInternal(err))
 		return
 	}
@@ -599,11 +624,45 @@ func (h *Handler) saveFailed(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrTooMany):
 		httputil.JSONError(w, http.StatusBadRequest, "TOO_MANY_STEPS",
 			"a workflow may have at most 20 steps")
-	default:
+	case database.IsLockTimeout(err):
+		// SOMEBODY ELSE IS SAVING THIS WORKFLOW. Transient, nobody's mistake,
+		// and fixed by trying again — so it must not read as either "your
+		// request was wrong" (400) or "this service is broken" (500).
+		//
+		// 409 rather than 503 because the cause is another USER, not a failing
+		// dependency: 503 is what this codebase returns when storage, mail or
+		// the audit sink is unavailable, and a spike there means something is
+		// down. Conflating the two would make that signal useless.
+		httputil.JSONError(w, http.StatusConflict, "WORKFLOW_BUSY",
+			"someone else is saving this workflow right now; try again")
+	case errors.Is(err, ErrInvalid):
 		// A validation failure names the step or trigger that is wrong, which
 		// is the whole reason validation happens in Go rather than at the
 		// database's CHECK constraints.
 		httputil.JSONError(w, http.StatusBadRequest, "INVALID_WORKFLOW", err.Error())
+	case database.IsCallerData(err):
+		// A CONSTRAINT GO CANNOT PREDICT, and every value on this path comes
+		// from the request body, so the caller is who sent it.
+		//
+		// The one that matters is `workflow_versions_steps_size CHECK
+		// (pg_column_size(steps) <= 65536)`, which measures the stored JSONB. A
+		// byte count of the JSON text cannot stand in for it: 5000 one-character
+		// keys are 62,822 bytes of text and 103,956 of jsonb. A Go guard was
+		// tried and passed exactly the payloads the constraint rejects, so the
+		// database keeps the limit and this translates the refusal.
+		//
+		// The error text is NOT forwarded — it carries the constraint name, the
+		// column list and the failing row.
+		httputil.JSONError(w, http.StatusBadRequest, "INVALID_WORKFLOW",
+			"the database refused this workflow: a step config or trigger filter "+
+				"is too large, or contains a character it cannot store")
+	default:
+		// ANYTHING ELSE IS OURS, not the caller's. This branch used to be the
+		// 400 above, so every operational failure the save could produce —
+		// including the lock timeout two admins editing one workflow now
+		// reach — was reported as "your workflow is invalid" with a Postgres
+		// error string attached. A client does not retry a 400.
+		httputil.HandleError(w, httputil.NewInternal(err))
 	}
 }
 

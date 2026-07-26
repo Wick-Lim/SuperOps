@@ -16,12 +16,15 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -136,9 +139,22 @@ func NewRepository(pool *pgxpool.Pool) *Repository { return &Repository{pool: po
 // the reverted content becomes the version that runs. Reproduced in 5 of 40
 // paired concurrent requests.
 //
-// SELECT ... FOR UPDATE is what serialises them. The second request blocks
-// until the first commits and then reads what the first wrote, so a rename
-// lands on top of new steps instead of underneath them.
+// FOR NO KEY UPDATE is what serialises them. The second request blocks until
+// the first commits and then reads what the first wrote, so a rename lands on
+// top of new steps instead of underneath them.
+//
+// NO KEY, not plain FOR UPDATE. Both self-conflict, so the mutual exclusion
+// between two Patches is identical — but FOR UPDATE also conflicts with
+// FOR KEY SHARE, which is exactly the lock a foreign-key check takes. Four
+// tables reference workflows(id), so for the life of a PATCH every event that
+// would start a run of that workflow stalled on its FK check. Demonstrated:
+// with FOR UPDATE held, `SELECT … FROM ONLY workflows WHERE id = $1 FOR KEY
+// SHARE` times out; with FOR NO KEY UPDATE it passes immediately.
+//
+// The step engine returns that error so JetStream redelivers, which is only
+// delay — but RecordRejection discards its error, so a trigger rejection
+// landing in that window vanished, and that table is the only thing telling an
+// author why nothing fired.
 func (r *Repository) Patch(ctx context.Context, workspaceID, id string, p PatchFields,
 	actorID string, load func(context.Context, pgx.Tx, string) (*Workflow, error),
 ) (*Workflow, *Workflow, error) {
@@ -149,7 +165,7 @@ func (r *Repository) Patch(ctx context.Context, workspaceID, id string, p PatchF
 		err := tx.QueryRow(ctx,
 			`SELECT id::text FROM workflows
 			  WHERE id = $1 AND workspace_id = $2 AND archived_at IS NULL
-			  FOR UPDATE`, id, workspaceID).Scan(&locked)
+			  FOR NO KEY UPDATE`, id, workspaceID).Scan(&locked)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -235,23 +251,71 @@ func (r *Repository) Save(ctx context.Context, workspaceID, id, name, descriptio
 func (r *Repository) saveTx(ctx context.Context, tx pgx.Tx, workspaceID, id, name, description string,
 	steps []Step, triggers []Trigger, enabled bool, actorID string) (*Workflow, error) {
 
+	// THE NAME IS CHECKED HERE BECAUSE THE DATABASE'S CHECK IS NOT AN API.
+	//
+	// `workflows_name_bounded CHECK (char_length(name) BETWEEN 1 AND 200)` is
+	// caller-reachable — an empty name, or a pasted paragraph — and nothing in
+	// Go looked at it, so the refusal was whatever Postgres says about a
+	// violated constraint, verbatim on the wire. char_length counts CHARACTERS
+	// and len() counts BYTES, so this uses runes: a 200-character Korean name is
+	// 600 bytes and was refused by a byte check that agreed with nothing.
+	//
+	// IT DOES NOT TRIM. Trimming here also trimmed the name Patch MERGED IN for
+	// a caller who sent no name at all — so a PATCH of `enabled` quietly renamed
+	// "  Nightly digest  " to "Nightly digest", against PatchFields' own promise
+	// that a nil field must not change. Worse, a row written before this check
+	// existed can hold "   ", which char_length accepts as 3: trimming made it 0
+	// and refused every future PATCH of that workflow, naming a field the caller
+	// had not sent. Normalising an INPUT belongs where the input is, so the
+	// handler trims what the caller actually supplied.
+	if n := utf8.RuneCountInString(name); n < 1 || n > 200 {
+		return nil, invalidf("a workflow name is 1 to 200 characters (got %d)", n)
+	}
+	// Postgres text cannot hold U+0000 at all: `\u0000` is legal JSON, Go's
+	// decoder turns it into a real NUL, and the INSERT then fails with 22021 (or
+	// 22P05 for the jsonb columns). Caught here so the answer names the cause.
+	if strings.ContainsRune(name, 0) || strings.ContainsRune(description, 0) {
+		return nil, invalidf("a workflow name or description cannot contain a NUL character")
+	}
+	for i, st := range steps {
+		if hasEncodedNUL(st.Config) {
+			return nil, invalidf("the config of step %d cannot contain a NUL character", i)
+		}
+	}
+	for i, t := range triggers {
+		if hasEncodedNUL(t.Filter) {
+			return nil, invalidf("the filter of trigger %d cannot contain a NUL character", i)
+		}
+	}
+
 	if len(steps) > 20 {
 		return nil, ErrTooMany
 	}
 	for i, st := range steps {
 		if !validStepKind(st.Kind) {
-			return nil, fmt.Errorf("workflow: step %d has unknown kind %q", i, st.Kind)
+			return nil, invalidf("workflow: step %d has unknown kind %q", i, st.Kind)
 		}
 	}
 	for i, t := range triggers {
 		if !eventShape.MatchString(t.EventType) {
-			return nil, fmt.Errorf("workflow: trigger %d has invalid event type %q", i, t.EventType)
+			return nil, invalidf("workflow: trigger %d has invalid event type %q", i, t.EventType)
 		}
 	}
 	stepsJSON, err := json.Marshal(nonNilSteps(steps))
 	if err != nil {
 		return nil, fmt.Errorf("encode steps: %w", err)
 	}
+	// NO GO-SIDE SIZE CHECK. `workflow_versions_steps_size CHECK
+	// (pg_column_size(steps) <= 65536)` measures the stored JSONB, and a byte
+	// count of the JSON TEXT cannot predict it: jsonb carries a 4-byte JEntry
+	// per array element and per object key/value pair, so a config of many small
+	// keys inflates. Measured on this database — 5000 one-character keys are
+	// 62,822 bytes of text and 103,956 bytes of jsonb. A guard written here
+	// passed exactly the payloads the constraint rejects, which is worse than no
+	// guard: it reads as protection.
+	//
+	// The constraint is the authority on its own limit, so its violation is
+	// translated at the boundary instead — see saveFailed.
 
 	var wf Workflow
 	if err := func(tx pgx.Tx) error {
@@ -668,4 +732,39 @@ func nonNilAny(v any) any {
 
 // eventShape mirrors the column's CHECK. Refusing here rather than at the
 // database means the caller is told which trigger is wrong.
+// hasEncodedNUL reports whether an arbitrary decoded JSON value contains U+0000
+// anywhere inside it.
+//
+// It searches the ENCODED form for the escape rather than the decoded form for
+// the byte, because encoding/json writes U+0000 as `\u0000` — a first attempt
+// looked for a raw NUL in the marshalled bytes, found none, and let every one of
+// these through to the database. The strings the map holds are ordinary Go
+// strings that really do contain the byte; it is only the JSON rendering that
+// escapes it.
+func hasEncodedNUL(v any) bool {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// Unencodable is a different failure, reported by the real Marshal.
+		return false
+	}
+	return bytes.Contains(b, []byte(`\u0000`))
+}
+
 var eventShape = regexp.MustCompile(`^[a-z][a-z0-9_.]{0,63}$`)
+
+// ErrInvalid marks a failure the CALLER caused and can fix by sending something
+// else — an unknown step kind, a malformed trigger.
+//
+// It exists because the route's error mapping had no way to tell those from an
+// infrastructure failure, so everything that came out of a save became
+// `400 INVALID_WORKFLOW` with the raw error text. Once the read moved inside
+// the transaction that included operational failures: two admins editing the
+// same workflow gave the second `400 INVALID_WORKFLOW: "lock workflow: ERROR:
+// canceling statement due to lock timeout (SQLSTATE 55P03)"` — a client will
+// not retry a 400, the user is told their workflow is invalid when it is not,
+// and a Postgres error string is on the wire.
+var ErrInvalid = errors.New("workflow: invalid")
+
+func invalidf(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, args...))
+}

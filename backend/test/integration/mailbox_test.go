@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,8 +17,12 @@ import (
 	"github.com/Wick-Lim/SuperOps/backend/internal/authz"
 	"github.com/Wick-Lim/SuperOps/backend/internal/file"
 	"github.com/Wick-Lim/SuperOps/backend/internal/mail"
+
+	"github.com/jackc/pgx/v5"
+
 	"github.com/Wick-Lim/SuperOps/backend/internal/mailbox"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
 
 func mailRepo(t *testing.T) *mailbox.Repository {
@@ -1454,15 +1459,15 @@ func TestAttachingIsIdempotentAndDuplicateSafe(t *testing.T) {
 		t.Fatal("file storage is not wired; this authorization test cannot verify anything")
 	}
 
-	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{fileID}); err != nil {
+	if err := attachToOutbound(t, repo, ctx, msg.ID, me, []string{fileID}); err != nil {
 		t.Fatalf("first attach: %v", err)
 	}
 	// The retry.
-	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{fileID}); err != nil {
+	if err := attachToOutbound(t, repo, ctx, msg.ID, me, []string{fileID}); err != nil {
 		t.Fatalf("re-attaching the same file failed: %v — a retried reply 404s", err)
 	}
 	// The duplicate.
-	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{fileID, fileID}); err != nil {
+	if err := attachToOutbound(t, repo, ctx, msg.ID, me, []string{fileID, fileID}); err != nil {
 		t.Fatalf("attaching the same id twice failed: %v", err)
 	}
 
@@ -1470,7 +1475,7 @@ func TestAttachingIsIdempotentAndDuplicateSafe(t *testing.T) {
 	other := h.newTenant(t, "attach-other")
 	foreign := h.upload(t, other.token, other.workspaceID, "foreign.txt")
 	if foreign != "" {
-		if err := repo.AttachToOutbound(ctx, msg.ID, other.id, []string{foreign}); err == nil {
+		if err := attachToOutbound(t, repo, ctx, msg.ID, other.id, []string{foreign}); err == nil {
 			t.Fatal("a file from another tenant was attached to this conversation")
 		}
 	}
@@ -1533,7 +1538,7 @@ func TestAttachingARepliesFileRequiresShareAndIsAllOrNothing(t *testing.T) {
 	}
 
 	// 1. Read alone must not be enough to attach.
-	if err := repo.AttachToOutbound(ctx, msg.ID, agent.id, []string{readable}); err == nil {
+	if err := attachToOutbound(t, repo, ctx, msg.ID, agent.id, []string{readable}); err == nil {
 		t.Fatal("a caller with read but not share attached a file, which hands every " +
 			"mailbox grantee the ability to download it")
 	}
@@ -1558,11 +1563,11 @@ func TestAttachingARepliesFileRequiresShareAndIsAllOrNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.AttachToOutbound(ctx, msg2.ID, me, []string{spent}); err != nil {
+	if err := attachToOutbound(t, repo, ctx, msg2.ID, me, []string{spent}); err != nil {
 		t.Fatalf("seeding the spent attachment: %v", err)
 	}
 
-	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{owned, spent}); err == nil {
+	if err := attachToOutbound(t, repo, ctx, msg.ID, me, []string{owned, spent}); err == nil {
 		t.Fatal("a batch containing an already-attached file succeeded")
 	}
 	var linked *string
@@ -1578,7 +1583,7 @@ func TestAttachingARepliesFileRequiresShareAndIsAllOrNothing(t *testing.T) {
 
 	// 3. And a successful attach materializes in the same commit, so the two
 	//    authorities do not disagree until the hourly drift job runs.
-	if err := repo.AttachToOutbound(ctx, msg.ID, me, []string{owned}); err != nil {
+	if err := attachToOutbound(t, repo, ctx, msg.ID, me, []string{owned}); err != nil {
 		t.Fatalf("the owner attaching their own file: %v", err)
 	}
 	var storedPath string
@@ -1644,6 +1649,110 @@ func TestARefusedReplyLeavesNothingToDeliver(t *testing.T) {
 		t.Fatalf("a refused reply left %d undelivered outbound message(s) where there were %d — "+
 			"the sweeper will send it in two minutes, with no attachment, saying "+
 			"'please find the file attached'", after, before)
+	}
+}
+
+// THE ATOMICITY PROOF, AFTER THE AUTHORIZATION MOVED OUT OF THE TRANSACTION.
+//
+// The test above refuses on CAPABILITY, and that check now runs BEFORE the
+// transaction is opened — it had to, because a transaction whose body acquires
+// a second pool connection deadlocks the pool. So it short-circuits before any
+// INSERT and no longer exercises the rollback at all: splitting the reply route
+// back into two commits, the exact bug the "THE REPLY AND ITS ATTACHMENTS COMMIT
+// TOGETHER" comment exists to prevent, leaves every attachment test green.
+//
+// This one refuses INSIDE the transaction instead. A file belongs to exactly one
+// message, so re-attaching one that is already attached passes authorization —
+// the actor really can share it — and then links fewer rows than asked, which
+// attachToOutboundTx turns into a refusal with the outbound row already
+// INSERTed. If that does not roll back, the sweeper sends it two minutes later
+// with nothing attached.
+func TestAReplyRefusedInsideItsTransactionRollsBackTheMessage(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	repo := mailRepo(t)
+	ctx := context.Background()
+
+	mb := newMailbox(t, ws, me)
+	in := inbound(mb, fmt.Sprintf("intx-%d", time.Now().UnixNano()))
+	in.WorkspaceID = ws
+	conv, _, err := repo.Ingest(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spent := h.upload(t, admin, ws, fmt.Sprintf("spent-%d.txt", time.Now().UnixNano()))
+	if spent == "" {
+		t.Fatal("file storage is not wired; this atomicity test cannot verify anything")
+	}
+
+	// Spend it on a first reply, which must succeed.
+	code, body := h.do(t, http.MethodPost, "/api/v1/conversations/"+conv.ID+"/reply", admin,
+		map[string]any{"body_text": "first", "attachment_file_ids": []string{spent}})
+	if code != http.StatusCreated {
+		raw, _ := json.Marshal(body)
+		t.Fatalf("the first reply = %d, want 201: %s", code, raw)
+	}
+
+	before := h.undeliveredCount(t, conv.ID)
+
+	// The same file again. Authorization passes; the link statement does not.
+	code, body = h.do(t, http.MethodPost, "/api/v1/conversations/"+conv.ID+"/reply", admin,
+		map[string]any{"body_text": "please find the file attached",
+			"attachment_file_ids": []string{spent}})
+	if code == http.StatusCreated {
+		t.Fatal("a file already attached to another message was attached a second time")
+	}
+	raw, _ := json.Marshal(body)
+	if !strings.Contains(string(raw), "already attached") {
+		t.Errorf("the refusal does not say what happened: %s", raw)
+	}
+
+	if after := h.undeliveredCount(t, conv.ID); after != before {
+		t.Fatalf("a reply refused INSIDE its transaction left %d undelivered outbound "+
+			"message(s) where there were %d — the message and its attachments are not "+
+			"committing together, so the sweeper sends 'please find the file attached' "+
+			"with nothing attached", after, before)
+	}
+}
+
+// A DOCUMENTED LIMIT IS NOT AN INTERNAL ERROR.
+//
+// authorizeAttachments returned a plain fmt.Errorf past 20 file ids, and the
+// reply route maps everything that is not ErrNotFound to 500 — so a caller who
+// attached 21 files was told the server was broken.
+func TestTooManyAttachmentsIsABadRequest(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	ctx := context.Background()
+
+	mb := newMailbox(t, ws, me)
+	in := inbound(mb, fmt.Sprintf("toomany-%d", time.Now().UnixNano()))
+	in.WorkspaceID = ws
+	conv, _, err := mailRepo(t).Ingest(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Ids that need not exist: the count is checked before any of them is
+	// looked up, which is the point — the refusal costs no queries.
+	ids := make([]string, 21)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
+	}
+
+	code, body := h.do(t, http.MethodPost, "/api/v1/conversations/"+conv.ID+"/reply", admin,
+		map[string]any{"body_text": "lots", "attachment_file_ids": ids})
+	raw, _ := json.Marshal(body)
+	if code != http.StatusBadRequest {
+		t.Fatalf("21 attachments = %d, want 400: %s", code, raw)
+	}
+	if !strings.Contains(string(raw), "20") {
+		t.Errorf("the refusal does not name the limit: %s", raw)
 	}
 }
 
@@ -1741,4 +1850,133 @@ func TestRegisteringADomainUnderAnothersIsRefused(t *testing.T) {
 		map[string]string{"domain": "not" + base})
 
 	_ = ctx
+}
+
+// TWO TENANTS CANNOT SPLIT ONE DOMAIN TREE BY REGISTERING AT THE SAME INSTANT.
+//
+// The ancestor check and the INSERT were two statements on the pool — a
+// check-then-insert race. Both requests pass their own check, both commit, and
+// `victim.test` and `mail.victim.test` end up owned by different tenants. From
+// there `ORDER BY length(domain) DESC` hands mail for billing@mail.victim.test
+// to whoever holds the longer name.
+//
+// Reproduced 15 times out of 15 before the lock. That is not a narrow window;
+// it is what happens whenever two registrations overlap at all.
+func TestConcurrentDomainRegistrationsCannotSplitATree(t *testing.T) {
+	h := getHarness(t)
+	a := h.newTenant(t, "domrace-a")
+	b := h.newTenant(t, "domrace-b")
+	ctx := context.Background()
+
+	for i := 0; i < 10; i++ {
+		base := fmt.Sprintf("dr%d-%d.test", time.Now().UnixNano(), i)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			h.do(t, http.MethodPost, "/api/v1/workspaces/"+a.workspaceID+"/mail/domains",
+				a.token, map[string]string{"domain": base})
+		}()
+		go func() {
+			defer wg.Done()
+			h.do(t, http.MethodPost, "/api/v1/workspaces/"+b.workspaceID+"/mail/domains",
+				b.token, map[string]string{"domain": "mail." + base})
+		}()
+		wg.Wait()
+
+		var owners int
+		if err := h.app.DB.QueryRow(ctx, `
+			SELECT count(DISTINCT workspace_id) FROM mail_domains
+			 WHERE domain = $1 OR domain = $2`, base, "mail."+base).Scan(&owners); err != nil {
+			t.Fatal(err)
+		}
+		if owners > 1 {
+			t.Fatalf("iteration %d: %s and mail.%s are owned by DIFFERENT tenants — "+
+				"whoever holds the longer name now receives the other's mail", i, base, base)
+		}
+	}
+}
+
+// THREE WAYS AN AUDIT BROKE THE DOMAIN OWNERSHIP CHECK.
+//
+// Each was demonstrated end to end against the previous fix; each is one
+// assertion here.
+func TestDomainRegistrationRefusesTheAuditsThreeAttacks(t *testing.T) {
+	h := getHarness(t)
+	victim := h.newTenant(t, "att-victim")
+	attacker := h.newTenant(t, "att-attacker")
+	ctx := context.Background()
+
+	// 1. A SINGLE LABEL IS AN ENTIRE TLD. The column's shape CHECK accepts one,
+	//    and the descendant clause reads it as the parent of everything beneath
+	//    — so registering `com`, with no DNS proof of anything, locked every
+	//    other tenant out of every .com and let the squatter open mailboxes
+	//    anywhere under it.
+	for _, single := range []string{"com", "test", "localhost"} {
+		code, _ := h.do(t, http.MethodPost,
+			"/api/v1/workspaces/"+attacker.workspaceID+"/mail/domains", attacker.token,
+			map[string]string{"domain": single})
+		if code != http.StatusBadRequest {
+			t.Errorf("registering the single label %q = %d, want 400 — that is a whole TLD",
+				single, code)
+		}
+	}
+
+	// 2. THE REQUEST DOMAIN REACHED A LIKE PATTERN UNVALIDATED, so a caller
+	//    could probe for domains registered by tenants they have no
+	//    relationship with: a matching pattern answered 409, a non-matching one
+	//    400. Both must now be 400 — the same answer — so nothing is learned.
+	base := fmt.Sprintf("oracle%d.test", time.Now().UnixNano())
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+victim.workspaceID+"/mail/domains", victim.token,
+		map[string]string{"domain": base})
+	for _, probe := range []string{"%", "%." + base, "%racle" + base[6:], "_" + base[1:]} {
+		code, _ := h.do(t, http.MethodPost,
+			"/api/v1/workspaces/"+attacker.workspaceID+"/mail/domains", attacker.token,
+			map[string]string{"domain": probe})
+		if code != http.StatusBadRequest {
+			t.Errorf("probing %q = %d, want 400 — a 409 here distinguishes a match from "+
+				"a miss and enumerates other tenants' domains", probe, code)
+		}
+	}
+
+	// 3. DELETING A DOMAIN ORPHANED ITS MAILBOXES. domain_id is ON DELETE SET
+	//    NULL, so the mailbox survived — same address, still resolvable — while
+	//    the registration that justified it disappeared. An audit used that to
+	//    erase the evidence of a squat.
+	var d struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+victim.workspaceID+"/mail/domains", victim.token,
+		map[string]string{"domain": "sub." + base}).Data, &d)
+	if _, err := mailRepo(t).CreateMailbox(ctx, victim.workspaceID,
+		"support@sub."+base, "Support", "SUP", victim.id); err != nil {
+		t.Fatalf("create a mailbox on the domain: %v", err)
+	}
+	code, _ := h.do(t, http.MethodDelete, "/api/v1/mail/domains/"+d.ID, victim.token, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("deleting a domain with a live mailbox = %d, want 409 — the mailbox "+
+			"survives, still receives, and no longer points at any registration", code)
+	}
+}
+
+// attachToOutbound is the reply route's attach path, called the way the route
+// calls it: authorize against the pool, then link inside a transaction.
+//
+// It replaces a Repository.AttachToOutbound that did both — and that NO handler
+// reached. These assertions are the whole authorization story for attachments
+// (a reply must not attach a file its author cannot read, or one from another
+// tenant), and they were being made against a function production did not run,
+// so the real pair could have lost the check with every one of them still green.
+func attachToOutbound(t *testing.T, repo *mailbox.Repository, ctx context.Context,
+	messageID, actorID string, fileIDs []string) error {
+	t.Helper()
+	ok, err := repo.AuthorizeAttachments(ctx, actorID, fileIDs)
+	if err != nil {
+		return err
+	}
+	return database.WithTx(ctx, getHarness(t).app.DB, func(tx pgx.Tx) error {
+		return repo.LinkAttachmentsIn(ctx, tx, ok, messageID)
+	})
 }

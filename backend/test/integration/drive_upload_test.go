@@ -136,7 +136,7 @@ func (h *harness) multipart(t *testing.T, token, method, path string,
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, path, err)
 	}
@@ -176,9 +176,12 @@ func (h *harness) followRedirect(t *testing.T, token, path string) ([]byte, stri
 
 	// No automatic redirect: the Authorization header must not be replayed to
 	// the bucket, and the presigned URL carries its own credentials.
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
+	client := &http.Client{
+		Timeout: httpClient.Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	res, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)

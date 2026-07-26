@@ -119,3 +119,36 @@ func TestAdvisoryLockKeysAreDistinct(t *testing.T) {
 		seen[key] = name
 	}
 }
+
+// A BROKEN SWEEP MUST NOT LOOK LIKE A CLEAN ONE.
+//
+// The repair sweep's WARN is the only signal an operator has that documents are
+// wrong in search, and its headline number was `asked` — how many publishes
+// succeeded. With NATS unreachable every publish fails, so a sweep that found a
+// hundred stale documents logged "documents=0", which is exactly what a sweep
+// that found nothing would log. Any alert or eyeball built on that number reads
+// the worst case as the best one.
+func TestTheRepairSummaryReportsStaleNotAsked(t *testing.T) {
+	// The outage: 100 stale, none asked, all failed.
+	kv := repairSummary(100, 0, 100, 42)
+
+	got := map[string]any{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		got[kv[i].(string)] = kv[i+1]
+	}
+
+	if got["documents"] != 100 {
+		t.Errorf(`documents = %v, want 100: with NATS down this line is the only `+
+			`evidence anything is wrong, and reporting the asked count makes it read `+
+			`as a healthy sweep`, got["documents"])
+	}
+	if got["asked"] != 0 || got["failed"] != 100 {
+		t.Errorf("asked/failed = %v/%v, want 0/100", got["asked"], got["failed"])
+	}
+
+	// And the healthy case still says what it did.
+	kv = repairSummary(7, 7, 0, 3)
+	if kv[1] != 7 || kv[3] != 7 || kv[5] != 0 {
+		t.Errorf("a clean sweep reports %v", kv)
+	}
+}

@@ -177,37 +177,47 @@ func safeFilename(name string) string {
 	return name
 }
 
-// AttachToOutbound links existing Drive files to a reply.
+// LinkAttachmentsIn links already-authorized Drive files to a reply, inside the
+// caller's transaction, so the message and its attachments commit or fail
+// together.
 //
 // It takes file IDS rather than bytes: an agent attaching something has already
 // uploaded it, or is forwarding one that arrived, and re-uploading would make a
-// second copy that counts against the quota twice. Authorization is the
-// caller's capability on each file, checked here rather than assumed — a reply
-// must not be able to attach a file its author cannot read.
-func (r *Repository) AttachToOutbound(ctx context.Context, messageID, actorID string, fileIDs []string) error {
-	if err := r.authorizeAttachments(ctx, actorID, fileIDs); err != nil {
-		return err
-	}
-	return database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
-		return r.attachToOutboundTx(ctx, tx, messageID, fileIDs)
-	})
-}
-
-// AttachToOutboundIn is AttachToOutbound for a caller that already holds a
-// transaction, so the message and its attachments commit or fail together.
+// second copy that counts against the quota twice. Authorization is the actor's
+// capability on each file — see AttachmentsAuthorized, which is the only way to
+// get in here.
 //
-// The reply route is that caller. It INSERTed the outbound row and then
+// The reply route is the caller. It INSERTed the outbound row and then
 // attached, in two separate commits — so a refused attach left a committed
 // reply with sent_at NULL, which is exactly what SweepUnsent looks for. Two
 // minutes later the customer received "please find the file attached" with
 // nothing attached, while the agent had been told the send failed and had
 // probably retried. Making the attach internally atomic did not help: the
 // message was never inside it.
-func (r *Repository) AttachToOutboundIn(ctx context.Context, tx pgx.Tx, messageID, actorID string, fileIDs []string) error {
+func (r *Repository) LinkAttachmentsIn(ctx context.Context, tx pgx.Tx, ok AttachmentsAuthorized, messageID string) error {
+	return r.attachToOutboundTx(ctx, tx, messageID, ok.fileIDs)
+}
+
+// AttachmentsAuthorized is proof that AuthorizeAttachments said yes, and it
+// carries the very ids that were checked.
+//
+// A TYPE RATHER THAN A CONVENTION. LinkAttachmentsIn took an id list and no
+// actor, so nothing but discipline stopped a future caller from linking files
+// nobody had authorized — and that is the whole ballgame on this route, since
+// attaching re-parents a file into a mailbox every grantee can read. Its
+// unexported field means only this package can mint one, and taking the ids
+// FROM it means a caller cannot authorize one set and link another.
+type AttachmentsAuthorized struct{ fileIDs []string }
+
+// AuthorizeAttachments is the capability half, exported because the reply route
+// runs it BEFORE opening its transaction — the lookups query the pool, and a
+// transaction whose body acquires a second connection is how a bounded pool
+// deadlocks.
+func (r *Repository) AuthorizeAttachments(ctx context.Context, actorID string, fileIDs []string) (AttachmentsAuthorized, error) {
 	if err := r.authorizeAttachments(ctx, actorID, fileIDs); err != nil {
-		return err
+		return AttachmentsAuthorized{}, err
 	}
-	return r.attachToOutboundTx(ctx, tx, messageID, fileIDs)
+	return AttachmentsAuthorized{fileIDs: fileIDs}, nil
 }
 
 // authorizeAttachments is the capability half, which needs no transaction.
@@ -230,7 +240,8 @@ func (r *Repository) authorizeAttachments(ctx context.Context, actorID string, f
 		return nil
 	}
 	if len(fileIDs) > maxAttachmentsPerMessage {
-		return fmt.Errorf("mailbox: at most %d attachments per message", maxAttachmentsPerMessage)
+		return fmt.Errorf("%w: at most %d per message",
+			ErrTooManyAttachments, maxAttachmentsPerMessage)
 	}
 	for _, id := range fileIDs {
 		got, err := r.authz.Capability(ctx, authz.UserSubject(actorID), authz.FileObject(id))

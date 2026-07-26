@@ -1128,6 +1128,22 @@ func runLoop(
 	}
 }
 
+// repairSummary is the sweep's operator-facing line, as a function so the one
+// thing about it that has already been wrong can be tested.
+//
+// "documents" is the STALE count. It used to be the asked count, which reads
+// correctly on a healthy sweep and inverts on a broken one: NATS down means
+// every publish fails, asked is 0, and a sweep over a hundred wrong documents
+// logs "documents=0" — the same thing a clean sweep would log.
+func repairSummary(stale, asked, failed int, oldestGap int64) []any {
+	return []any{
+		"documents", stale,
+		"asked", asked,
+		"failed", failed,
+		"oldest_gap", oldestGap,
+	}
+}
+
 // repairProjections asks the rooms of stale documents to re-project.
 //
 // The query is the whole design. It compares the collaboration log's head
@@ -1171,11 +1187,22 @@ func repairProjections(ctx context.Context, pool *pgxpool.Pool, nc *nats.Conn, l
 	}
 
 	// WARN, not Debug. Every one of these is a document that is wrong in search
-	// right now, and if the number does not fall over successive sweeps then the
-	// rooms are empty and the requests are going nowhere — which an operator
-	// needs to be able to see without turning on debug logging.
-	l.Warn("asked rooms to repair stale projections",
-		"documents", asked, "failed", failed, "oldest_gap", found[0].Gap())
+	// right now, and an operator needs to see it without turning on debug
+	// logging.
+	//
+	// READ "documents" AGAINST THE BATCH SIZE, not on its own: FindStaleProjections
+	// returns at most projectionRepairBatch, so a backlog larger than that pins
+	// the number at exactly 100 sweep after sweep. Falling means progress;
+	// sitting at 100 means the backlog is bigger than one sweep can drain and
+	// says nothing about whether the requests are being answered — "asked" and
+	// "failed" are what answer that.
+	//
+	// THE HEADLINE IS HOW MANY ARE STALE, not how many were asked. It was
+	// `asked`, which inverts the line exactly when it matters most: with NATS
+	// down every publish fails, asked is 0, and a sweep that found a hundred
+	// broken documents logs "documents=0" — indistinguishable from a healthy
+	// sweep to anyone scanning, and to any alert built on the number.
+	l.Warn("stale projections found", repairSummary(len(found), asked, failed, found[0].Gap())...)
 	if failed > 0 {
 		// Reported to the health registry too: a sweep that could not ask is a
 		// sweep whose claim was spent for nothing, and the next one will not

@@ -55,7 +55,7 @@ func (h *harness) upload(t *testing.T, token, workspaceID, name string) string {
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatalf("upload: %v", err)
 	}
