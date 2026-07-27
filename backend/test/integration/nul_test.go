@@ -551,3 +551,80 @@ func TestANulInAWorkflowConfigIsRefusedByStepNotStripped(t *testing.T) {
 		"/api/v1/workspaces/"+ws+"/workflows", admin,
 		body([]map[string]any{okStep()}, okTriggers))
 }
+
+// THE PATCH ROUTE OPTS OUT TOO, AND HAD TO BE CHECKED SEPARATELY.
+//
+// Create and Patch are two decode sites and switching them to
+// DecodeJSONVerbatim was two edits, so one of them being missed is a silent
+// half-fix: Create refuses the NUL and Patch strips it, and the same workflow
+// ends up acting on a manufactured key by being edited rather than created.
+// Patch is the likelier route for it in practice — a config is usually built up
+// after the workflow exists.
+func TestANulPatchedIntoAWorkflowIsRefusedToo(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	channel := h.createChannel(t, admin, ws, uniqueSlug("wf-pnul"))
+	const nul = "\x00"
+
+	okStep := map[string]any{
+		"kind":   "post_message",
+		"config": map[string]any{"channel_id": channel, "body": "hi"},
+	}
+	resp := h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/workflows", admin, map[string]any{
+			"name":     fmt.Sprintf("patch-nul-%d", time.Now().UnixNano()),
+			"enabled":  true,
+			"steps":    []map[string]any{okStep},
+			"triggers": []map[string]any{{"event_type": "message.created"}},
+		})
+	var created struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, resp.Data, &created)
+	path := "/api/v1/workflows/" + created.ID
+
+	for _, c := range []struct {
+		name  string
+		patch map[string]any
+		want  string
+	}{
+		{
+			"a config key that stripping would turn into channel_id",
+			map[string]any{"steps": []map[string]any{{
+				"kind":   "post_message",
+				"config": map[string]any{"channel_id" + nul: channel, "body": "hi"},
+			}}},
+			"the config of step 0 cannot contain a NUL character",
+		},
+		{
+			"a NUL in the name alone",
+			map[string]any{"name": "pat" + nul + "ched"},
+			"a workflow name or description cannot contain a NUL character",
+		},
+		{
+			"a NUL under a trigger filter",
+			map[string]any{"triggers": []map[string]any{{
+				"event_type": "message.created",
+				"filter":     map[string]any{"k" + nul: "v"},
+			}}},
+			"the filter of trigger 0 cannot contain a NUL character",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			code, got := h.do(t, http.MethodPatch, path, admin, c.patch)
+			if code != http.StatusBadRequest {
+				t.Fatalf("= %d, want 400: PATCH still strips, so Create and Patch "+
+					"disagree about the same body", code)
+			}
+			if got.Error == nil || got.Error.Message != c.want {
+				t.Errorf("message = %#v, want %q", got.Error, c.want)
+			}
+		})
+	}
+
+	// The control: a clean PATCH of the same field is still applied, so the
+	// cases above fail on the NUL and not on the patch shape.
+	h.req(t, http.StatusOK, http.MethodPatch, path, admin,
+		map[string]any{"name": fmt.Sprintf("clean-%d", time.Now().UnixNano())})
+}
