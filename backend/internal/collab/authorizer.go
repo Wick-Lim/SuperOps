@@ -22,6 +22,10 @@ type Authorizer interface {
 	CanRead(ctx context.Context, doc *Document, userID string) (bool, error)
 	CanWrite(ctx context.Context, doc *Document, userID string) (bool, error)
 	CanCreate(ctx context.Context, workspaceID, userID string) (bool, error)
+	// CanOpenResource answers the question CanCreate cannot: may this caller
+	// attach a document to THIS object. CanCreate is about the workspace, and a
+	// resource id in the body is not a capability on the thing it names.
+	CanOpenResource(ctx context.Context, resourceID, userID string) (bool, error)
 }
 
 // WorkspaceAuthorizer is the Phase-0 implementation: a document is readable by
@@ -92,6 +96,23 @@ func (a *WorkspaceAuthorizer) CanWrite(ctx context.Context, doc *Document, userI
 
 func (a *WorkspaceAuthorizer) CanCreate(ctx context.Context, workspaceID, userID string) (bool, error) {
 	return a.canEdit(ctx, workspaceID, userID)
+}
+
+// CanOpenResource asks for read on the OBJECT, which is the same question
+// CanRead asks of an existing document.
+//
+// Read rather than write is currently a choice NOTHING CAN OBSERVE, and saying
+// so is more useful than defending it: OpenDocument calls CanCreate first, that
+// is workspace-level write, and in this model workspace write reaches every
+// file in the tenant. So no caller exists who holds read on the object and not
+// write. Swapping this to CapWrite passes the whole suite.
+//
+// It is still the right spelling. Opening is how a VIEWER reaches a document at
+// all, and the write gate is Authorize's job on the routes that write; when the
+// object-level model in ROADMAP §4 relaxes CanCreate, a read-only share should
+// open and not be refused here by a word nobody meant.
+func (a *WorkspaceAuthorizer) CanOpenResource(ctx context.Context, resourceID, userID string) (bool, error) {
+	return a.checker.Can(ctx, authz.UserSubject(userID), authz.FileObject(resourceID), authz.CapRead)
 }
 
 func (a *WorkspaceAuthorizer) canEdit(ctx context.Context, workspaceID, userID string) (bool, error) {

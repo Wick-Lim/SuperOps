@@ -108,12 +108,40 @@ func (s *Service) Authorize(ctx context.Context, documentID, userID string, need
 }
 
 // OpenDocument returns the collaborative document for a Drive object, creating
-// it on first open. Creating is authorized against the workspace, not the
-// object: the object's own ACL check belongs to whatever hands out the
-// resource id, and duplicating a guess at it here would be a second, weaker
-// answer to the same question.
+// it on first open.
+//
+// IT AUTHORIZES TWICE, against the workspace and against the object, and the
+// second check is the one that matters. This used to say the object's ACL
+// belonged to whatever handed out the resource id — but a resource id in a
+// request body was not handed out by anything, and treating it as proof of
+// access is the confused deputy in its plainest form.
+//
+// What it cost: workspace_id comes from the path and resource_id from the body,
+// nothing related them, and the conflict key is (resource_type, resource_id)
+// with resource_type also caller-supplied and validated only as a character
+// class. So a caller in ANY tenant could name a file in another one, pick a
+// type nobody had used, and take that pair — the row is created in the
+// CLAIMANT'S workspace, and the owner opening their own file then gets
+// `409 this object already has a collaboration document in another workspace`,
+// permanently and for as many types as the claimant cares to spend requests on.
+// Measured end to end: the claim answered 200 and the owner's next open 409.
+//
+// The repository already refused to RETURN a document owned by another
+// workspace, for exactly this reason and in those words. That guard was
+// one-sided: it stopped a caller reading an object someone else had claimed and
+// left them free to claim an unclaimed one.
 func (s *Service) OpenDocument(ctx context.Context, workspaceID, resourceType, resourceID, userID string) (*Document, error) {
 	ok, err := s.authz.CanCreate(ctx, workspaceID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ws.ErrRoomForbidden
+	}
+	// Deliberately not folded into the check above: CanCreate is a workspace
+	// question and this is an object one, and a caller who passes the first and
+	// fails the second is exactly the case this exists for.
+	ok, err = s.authz.CanOpenResource(ctx, resourceID, userID)
 	if err != nil {
 		return nil, err
 	}
