@@ -139,7 +139,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req saveRequest
-	if err := httputil.DecodeJSONLimit(r, &req, maxWorkflowBody); err != nil {
+	// Verbatim, not the stripping decoder: a step config is a map of KEYS, and
+	// removing an invisible byte from one changes which key the executor reads
+	// rather than repairing what the caller typed. saveTx refuses the NUL and
+	// names the step.
+	if err := httputil.DecodeJSONVerbatim(r, &req, maxWorkflowBody); err != nil {
 		httputil.HandleError(w, err)
 		return
 	}
@@ -177,7 +181,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req PatchFields
-	if err := httputil.DecodeJSONLimit(r, &req, maxWorkflowBody); err != nil {
+	// Verbatim, not the stripping decoder: a step config is a map of KEYS, and
+	// removing an invisible byte from one changes which key the executor reads
+	// rather than repairing what the caller typed. saveTx refuses the NUL and
+	// names the step.
+	if err := httputil.DecodeJSONVerbatim(r, &req, maxWorkflowBody); err != nil {
 		httputil.HandleError(w, err)
 		return
 	}

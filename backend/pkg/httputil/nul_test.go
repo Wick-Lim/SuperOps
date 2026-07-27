@@ -3,8 +3,11 @@ package httputil
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -455,7 +458,7 @@ type outerWithEmbedded struct {
 // The Struct arm sets a changed field in place when it can and takes a copy on
 // the first field it cannot — so a struct with a settable field BEFORE a
 // non-settable one has to carry both edits. The Array arm has the same shape:
-// rebuiltSequence replaces one element and must finish stripping the rest.
+// the array copy replaces one element and must finish stripping the rest.
 func TestRebuiltContainersKeepEveryEdit(t *testing.T) {
 	esc := "\\u" + "0000"
 
@@ -470,7 +473,7 @@ func TestRebuiltContainersKeepEveryEdit(t *testing.T) {
 		}
 		want := [3]string{"ab", "cd", "ef"}
 		if v.M["k"] != want {
-			t.Errorf("m.k = %q, want %q — rebuiltSequence stopped at the first "+
+			t.Errorf("m.k = %q, want %q — the array copy stopped at the first "+
 				"element it replaced", v.M["k"], want)
 		}
 	})
@@ -756,8 +759,10 @@ func TestANonStringKeyedMapIsStrippedAndStable(t *testing.T) {
 // inside the embedded struct — a map, a slice and a pointee all kept their NULs,
 // though none of them needs addressability to be mutated.
 //
-// A plain string field still degrades: it is the one that genuinely needs the
-// copy this refuses to take.
+// What still degrades is every field whose repair needed a rebuild — string,
+// array, `any`, a nested struct, an array of structs — not "a plain string", as
+// this comment said while the code it documents was corrected. The three that
+// survive are the three that mutate in place.
 func TestTheEmbeddedSubtreeIsStrippedExceptWhereACopyIsNeeded(t *testing.T) {
 	esc := "\\u" + "0000"
 	var v struct {
@@ -926,9 +931,31 @@ func TestTheArrayCopyGateHandlesItsEdges(t *testing.T) {
 		if v.A[0] != "pq" || v.A[1] != "rs" {
 			t.Errorf("a = %q, want [pq rs]", v.A)
 		}
+
+		// AND NOT COPIED, which is the half this asserted only in its name
+		// while the copy was unconditional.
+		//
+		// It is no longer the addressability gate that carries this: containsNUL
+		// runs first, so a CLEAN array is never copied whether it is addressable
+		// or not, and removing the gate now changes nothing measurable. The
+		// assertion is still worth making — it is the property, and the next
+		// change to that ordering would be caught by it rather than by nothing.
+		var clean struct {
+			A [512]string `json:"a"`
+		}
+		for i := range clean.A {
+			clean.A[i] = "ok"
+		}
+		if n := testing.AllocsPerRun(20, func() { stripNUL(&clean) }); n > 0 {
+			t.Errorf("an addressable array allocates %.0f times: it is being "+
+				"copied when it could be written in place", n)
+		}
 	})
 
-	t.Run("an array of arrays where only the inner needs a copy", func(t *testing.T) {
+	// The OUTER array is the one copied — it is the non-addressable map value.
+	// The inner arrays live inside that copy, are addressable, and take the
+	// in-place path.
+	t.Run("an array of arrays, where the outer is the one copied", func(t *testing.T) {
 		var v struct {
 			M map[string][2][2]string `json:"m"`
 		}
@@ -942,4 +969,554 @@ func TestTheArrayCopyGateHandlesItsEdges(t *testing.T) {
 			t.Errorf("m.k = %q, want %q", v.M["k"], want)
 		}
 	})
+}
+
+// TWO EMBEDDED UNEXPORTED STRUCTS: the second must not be reverted.
+//
+// The rebuild is a snapshot, and the ONLY field that can reach it when `v` is
+// addressable is an embedded unexported struct — everything exported is settable
+// there. `reflect.New(T).Elem()` carries the same read-only flag on that field,
+// so the snapshot is created by the one field kind that can never be written
+// into it. With two of them the second edited the original after the snapshot
+// and was reverted when the snapshot came back: a value correct in memory,
+// overwritten on the way out.
+//
+// An addressable value needs no snapshot at all, which is the fix.
+func TestASecondEmbeddedStructIsNotReverted(t *testing.T) {
+	esc := "\\u" + "0000"
+	body := `{"a":"p` + esc + `q","b":"r` + esc + `s"}`
+
+	t.Run("as a struct field", func(t *testing.T) {
+		var v struct {
+			F twoEmbedded `json:"f"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"f":`+body+`}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.F.A != "pq" || v.F.B != "rs" {
+			t.Errorf("A=%q B=%q, want pq/rs: the snapshot reverted a field edited "+
+				"after it was taken", v.F.A, v.F.B)
+		}
+	})
+
+	t.Run("as a slice element", func(t *testing.T) {
+		var v struct {
+			F []twoEmbedded `json:"f"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"f":[`+body+`]}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.F[0].A != "pq" || v.F[0].B != "rs" {
+			t.Errorf("A=%q B=%q, want pq/rs", v.F[0].A, v.F[0].B)
+		}
+	})
+
+	t.Run("three embedded", func(t *testing.T) {
+		var v struct {
+			F threeEmbedded `json:"f"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"f":{"a":"p`+esc+`q","b":"r`+esc+`s","c":"t`+esc+`u"}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.F.A != "pq" || v.F.B != "rs" || v.F.C != "tu" {
+			t.Errorf("A=%q B=%q C=%q, want pq/rs/tu", v.F.A, v.F.B, v.F.C)
+		}
+	})
+}
+
+// A CLEAN ARRAY IN A MAP MUST NOT BE COPIED.
+//
+// The copy was taken up front, so every clean array paid for one it never used:
+// 200 four-element arrays went from 400 allocations to 600. Copying lazily was
+// never the bug — re-walking from the element after the copy was, which left
+// earlier elements untouched while later ones were stripped.
+func TestACleanArrayInAMapIsNotCopied(t *testing.T) {
+	const entries = 200
+	m := make(map[string][4]string, entries)
+	for i := 0; i < entries; i++ {
+		m[fmt.Sprintf("k%d", i)] = [4]string{"p", "q", "r", "s"}
+	}
+	v := struct {
+		M map[string][4]string `json:"m"`
+	}{M: m}
+
+	got := testing.AllocsPerRun(20, func() { stripNUL(&v) })
+	// Two per entry for MapIter and nothing else. A copy per entry adds one
+	// allocation each, so the slack is a fifth of the smallest regression.
+	const bound = 2*entries + entries/5
+	t.Logf("%d clean arrays: %.0f allocs", entries, got)
+	if got > bound {
+		t.Errorf("a clean map of %d arrays allocates %.0f times, over %d: a copy "+
+			"is being taken for arrays with nothing to strip", entries, got, bound)
+	}
+}
+
+type embA struct {
+	A string `json:"a"`
+}
+
+type embB struct {
+	B string `json:"b"`
+}
+
+type embC struct {
+	C string `json:"c"`
+}
+
+type twoEmbedded struct {
+	embA
+	embB
+}
+
+type threeEmbedded struct {
+	embA
+	embB
+	embC
+}
+
+// containsNUL AND stripValue MUST AGREE, OR AN ARRAY IS NEVER COPIED.
+//
+// The lazy copy asks containsNUL first, so a shape where containsNUL answers
+// false and stripValue would have changed something is a NUL that survives —
+// silently, with no error and no test failing anywhere else. The two walks
+// mirror each other by hand, which is exactly the arrangement that drifts.
+//
+// This drives both over the same values and requires them to agree. It is a
+// differential test rather than a list of shapes, so a shape nobody thought of
+// is still covered as long as it is in the generator.
+func TestContainsNULAgreesWithTheWalk(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	type leaf struct {
+		S string            `json:"s"`
+		M map[string]string `json:"m"`
+		P *string           `json:"p"`
+	}
+	type mid struct {
+		L   leaf      `json:"l"`
+		A   [2]leaf   `json:"a"`
+		Sl  []leaf    `json:"sl"`
+		Any any       `json:"any"`
+		Str [2]string `json:"str"`
+	}
+
+	// Each body puts the NUL in exactly one place, so a disagreement names it.
+	bodies := map[string]string{
+		"a string":              `{"l":{"s":"a` + esc + `b"}}`,
+		"a map value":           `{"l":{"m":{"k":"a` + esc + `b"}}}`,
+		"a map key":             `{"l":{"m":{"a` + esc + `b":"v"}}}`,
+		"behind a pointer":      `{"l":{"p":"a` + esc + `b"}}`,
+		"in an array of struct": `{"a":[{"s":"a` + esc + `b"},{"s":"ok"}]}`,
+		"in a slice of struct":  `{"sl":[{"s":"a` + esc + `b"}]}`,
+		"in an any":             `{"any":{"k":"a` + esc + `b"}}`,
+		"in a string array":     `{"str":["a` + esc + `b","ok"]}`,
+		"deep in an any":        `{"any":[{"k":["a` + esc + `b"]}]}`,
+		// NOT IN ELEMENT ZERO. Every other array case here and elsewhere puts
+		// the NUL first, so scanning only element 0 left the whole suite green
+		// while `["clean","a\u0000b"]` kept its NUL — the same shape as the bug
+		// the array rewrite was about, reintroduced by the lazy scan.
+		"in a later array element":  `{"str":["clean","a` + esc + `b"]}`,
+		"in a later struct element": `{"a":[{"s":"ok"},{"s":"a` + esc + `b"}]}`,
+		"nothing at all":            `{"l":{"s":"clean"},"str":["p","q"]}`,
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			var probe mid
+			if err := json.Unmarshal([]byte(body), &probe); err != nil {
+				t.Fatal(err)
+			}
+			saw := containsNUL(reflect.ValueOf(&probe), 0)
+
+			// DEEP EQUALITY, not %+v. Formatting a struct holding a *string
+			// prints the ADDRESS, so a pointee that was stripped compares equal
+			// to one that was not — the first version of this reported a
+			// disagreement that was its own blindness, not the code's.
+			var walked, untouched mid
+			if err := json.Unmarshal([]byte(body), &walked); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(body), &untouched); err != nil {
+				t.Fatal(err)
+			}
+			stripNUL(&walked)
+			changed := !reflect.DeepEqual(walked, untouched)
+
+			if saw != changed {
+				t.Errorf("containsNUL=%v but the walk changed=%v — the two disagree, "+
+					"so a lazily copied array is never copied and the NUL survives\n"+
+					"body: %s", saw, changed, body)
+			}
+		})
+	}
+}
+
+// A POINTER-SHAPED ARRAY MUST NOT BE COPIED WITH reflect.Copy.
+//
+// An array that occupies exactly one pointer word — [1]map, [1]*T,
+// [1]struct{map} — is stored DIRECTLY in the reflect.Value when it comes from a
+// non-addressable position. reflect.Copy assumes an array source is indirect and
+// copies the first word of the pointed-to object instead of the pointer, so the
+// element comes out as a garbage address.
+//
+// The two failure modes are not equally survivable. A [1]map dereferences nil,
+// which RecoveryMiddleware turns into a 500. A [1]*T builds an address from
+// adjacent bytes and dies in runtime.throw — unrecoverable, taking every
+// in-flight request with it. Nothing routes to these shapes today; a fatal
+// process kill earns a test anyway.
+func TestAPointerShapedArrayInAMapSurvivesTheCopy(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	t.Run("an array of maps", func(t *testing.T) {
+		var v struct {
+			M map[string][1]map[string]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[{"x":"a`+esc+`b"}]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if got := v.M["k"][0]["x"]; got != "ab" {
+			t.Errorf("m.k[0].x = %q, want %q", got, "ab")
+		}
+	})
+
+	t.Run("an array of pointers", func(t *testing.T) {
+		type inner struct {
+			S string `json:"s"`
+		}
+		var v struct {
+			M map[string][1]*inner `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[{"s":"a`+esc+`b"}]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		p := v.M["k"][0]
+		if p == nil || p.S != "ab" {
+			t.Errorf("m.k[0] = %+v, want s=ab", p)
+		}
+	})
+
+	t.Run("an array of structs holding a map", func(t *testing.T) {
+		type inner struct {
+			M map[string]string `json:"m"`
+		}
+		var v struct {
+			M map[string][1]inner `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[{"m":{"x":"a`+esc+`b"}}]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if got := v.M["k"][0].M["x"]; got != "ab" {
+			t.Errorf("m.k[0].m.x = %q, want %q", got, "ab")
+		}
+	})
+
+	t.Run("a pointer-shaped array inside an interface", func(t *testing.T) {
+		var v struct {
+			A any `json:"a"`
+		}
+		// Built in Go: encoding/json would decode this as []any.
+		v.A = [1]map[string]string{{"x": "a\x00b"}}
+		stripNUL(&v)
+		arr, ok := v.A.([1]map[string]string)
+		if !ok {
+			t.Fatalf("the interface no longer holds the array: %T", v.A)
+		}
+		if got := arr[0]["x"]; got != "ab" {
+			t.Errorf("a[0].x = %q, want %q", got, "ab")
+		}
+	})
+
+	t.Run("nested pointer-shaped arrays", func(t *testing.T) {
+		var v struct {
+			M map[string][1][1]map[string]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[[{"x":"a`+esc+`b"}]]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if got := v.M["k"][0][0]["x"]; got != "ab" {
+			t.Errorf("m.k[0][0].x = %q, want %q", got, "ab")
+		}
+	})
+}
+
+// THE ADDRESSABILITY GATE IS LOAD-BEARING FOR CORRECTNESS, NOT COST.
+//
+// containsNUL keeps a clean array from being copied whether it is addressable or
+// not, so removing the gate changes no allocation — and the whole suite stayed
+// green without it. What it actually stops is an ADDRESSABLE array taking the
+// rebuild path: the Pointer arm discards its recursion's return, so a rebuild
+// made under a `*[2]string` is thrown away and the NUL survives.
+func TestAnAddressableArrayIsNotRebuilt(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	t.Run("behind a pointer in a struct", func(t *testing.T) {
+		var v struct {
+			P *[2]string `json:"p"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"p":["p`+esc+`q","r`+esc+`s"]}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.P == nil || v.P[0] != "pq" || v.P[1] != "rs" {
+			t.Errorf("p = %q: the rebuild was discarded by the Pointer arm", v.P)
+		}
+	})
+
+	t.Run("a pointer to an array in a map", func(t *testing.T) {
+		var v struct {
+			M map[string]*[2]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":["p`+esc+`q","r"]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		got := v.M["k"]
+		if got == nil || got[0] != "pq" || got[1] != "r" {
+			t.Errorf("m.k = %q", got)
+		}
+	})
+
+	t.Run("a top-level array", func(t *testing.T) {
+		var v [2]string
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`["p`+esc+`q","r`+esc+`s"]`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v[0] != "pq" || v[1] != "rs" {
+			t.Errorf("v = %q: the rebuild was discarded by the Pointer arm", v)
+		}
+	})
+}
+
+// EVERY ARRAY SHAPE THAT REACHES THE COPY, not only the pointer-shaped ones.
+//
+// `out.Set(v)` replaced `reflect.Copy(out, v)` because Copy assumes an array
+// source is indirect. Set is correct for the direct case; this checks it is
+// correct for the rest too, since the bug it replaced was invisible on exactly
+// the shapes that happened to be tested.
+//
+// NONE OF THESE FAILS UNDER reflect.Copy — measured — because none is one
+// pointer word wide. That is the point: they are here to show Set did not break
+// the ordinary shapes, and TestAPointerShapedArrayInAMapSurvivesTheCopy is what
+// pins the bug. Two tests, two jobs; neither substitutes for the other.
+func TestTheArrayCopyIsCorrectForEveryShape(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	t.Run("a large array", func(t *testing.T) {
+		var v struct {
+			M map[string][64]string `json:"m"`
+		}
+		elems := make([]string, 64)
+		for i := range elems {
+			elems[i] = `"e"`
+		}
+		elems[0] = `"a` + esc + `b"`
+		elems[63] = `"c` + esc + `d"`
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[`+strings.Join(elems, ",")+`]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		got := v.M["k"]
+		if got[0] != "ab" || got[63] != "cd" || got[1] != "e" {
+			t.Errorf("first=%q last=%q middle=%q", got[0], got[63], got[1])
+		}
+	})
+
+	t.Run("an array of arrays", func(t *testing.T) {
+		var v struct {
+			M map[string][2][2]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[["a`+esc+`b","c"],["d","e`+esc+`f"]]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.M["k"] != [2][2]string{{"ab", "c"}, {"d", "ef"}} {
+			t.Errorf("m.k = %q", v.M["k"])
+		}
+	})
+
+	t.Run("a struct with a pointer in the middle", func(t *testing.T) {
+		type mid struct {
+			A string  `json:"a"`
+			P *string `json:"p"`
+			B string  `json:"b"`
+		}
+		var v struct {
+			M map[string][1]mid `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[{"a":"a`+esc+`b","p":"p`+esc+`q","b":"c`+esc+`d"}]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		got := v.M["k"][0]
+		if got.A != "ab" || got.B != "cd" || got.P == nil || *got.P != "pq" {
+			t.Errorf("got %+v with p=%v", got, got.P)
+		}
+	})
+
+	// The empty array is covered by
+	// TestTheArrayCopyGateHandlesItsEdges/an_empty_array_in_a_map — same
+	// struct, same body, same assertion — so it is not repeated here.
+}
+
+// A DIRTY ELEMENT THAT IS NOT THE FIRST.
+//
+// The lazy copy scans elements until one needs work. Every other array case in
+// this file puts the NUL in element ZERO, so narrowing that scan to element 0
+// alone left the whole suite green while a later element kept its NUL — the same
+// shape as the bug the array rewrite was about, reintroduced by the scan that
+// replaced it.
+//
+// It has to be inside a MAP: an addressable array never reaches the copy.
+func TestADirtyElementThatIsNotTheFirstIsFound(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	for _, c := range []struct {
+		name string
+		body string
+		want [3]string
+	}{
+		{"the last element", `{"m":{"k":["clean","also clean","a` + esc + `b"]}}`,
+			[3]string{"clean", "also clean", "ab"}},
+		{"the middle element", `{"m":{"k":["clean","a` + esc + `b","also clean"]}}`,
+			[3]string{"clean", "ab", "also clean"}},
+		{"the first, still", `{"m":{"k":["a` + esc + `b","clean","also clean"]}}`,
+			[3]string{"ab", "clean", "also clean"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var v struct {
+				M map[string][3]string `json:"m"`
+			}
+			req := httptest.NewRequest("POST", "/", strings.NewReader(c.body))
+			if err := DecodeJSON(req, &v); err != nil {
+				t.Fatal(err)
+			}
+			if v.M["k"] != c.want {
+				t.Errorf("m.k = %q, want %q: the scan does not reach every element",
+					v.M["k"], c.want)
+			}
+		})
+	}
+}
+
+// containsNUL MUST APPLY THE SAME EMBEDDED RULE AS THE WALK.
+//
+// The walk descends into an embedded unexported struct because encoding/json
+// fills its promoted fields. If containsNUL does not, an array whose ONLY NUL is
+// in such a field is never copied and keeps it. The existing embedded tests put
+// a NUL in a plain field too, so containsNUL fired through that one regardless
+// of what it did about the embedded struct.
+func TestContainsNULAppliesTheEmbeddedRule(t *testing.T) {
+	esc := "\\u" + "0000"
+	var v struct {
+		M map[string][1]outerWithEmbedded `json:"m"`
+	}
+	// The NUL is ONLY in the promoted field; body is clean.
+	req := httptest.NewRequest("POST", "/", strings.NewReader(
+		`{"m":{"k":[{"title":"a`+esc+`b","body":"clean"}]}}`))
+	if err := DecodeJSON(req, &v); err != nil {
+		t.Fatal(err)
+	}
+	got := v.M["k"][0]
+	if got.Title != "ab" {
+		t.Errorf("title = %q, want %q: containsNUL did not look inside the "+
+			"embedded unexported struct, so the array was never copied", got.Title, "ab")
+	}
+	if got.Body != "clean" {
+		t.Errorf("body = %q, want clean", got.Body)
+	}
+}
+
+// THE TWO DECODERS DIFFER IN EXACTLY ONE WAY.
+//
+// DecodeJSONVerbatim exists so a route whose strings are KEYS can refuse a NUL
+// instead of having one silently removed. Sharing an implementation with
+// DecodeJSONLimit is what keeps the size cap, the unknown-field rejection and
+// the error shapes identical between them — but it also means one misplaced
+// condition makes the pair behave the same, and a `strip` flag that is never
+// read fails silently: the verbatim route goes back to being guessed at, and
+// nothing in the funnel's own tests notices.
+func TestTheVerbatimDecoderDiffersOnlyInStripping(t *testing.T) {
+	esc := "\\u" + "0000"
+	body := `{"name":"a` + esc + `b","n":7}`
+
+	type payload struct {
+		Name string `json:"name"`
+		N    int    `json:"n"`
+	}
+
+	var stripped payload
+	if err := DecodeJSONLimit(
+		httptest.NewRequest("POST", "/", strings.NewReader(body)), &stripped, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if stripped.Name != "ab" {
+		t.Errorf("DecodeJSONLimit left %q, want %q", stripped.Name, "ab")
+	}
+
+	var verbatim payload
+	if err := DecodeJSONVerbatim(
+		httptest.NewRequest("POST", "/", strings.NewReader(body)), &verbatim, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if verbatim.Name != "a\x00b" {
+		t.Errorf("DecodeJSONVerbatim returned %q, want the NUL kept: a route that "+
+			"opts out of the funnel is now being guessed at instead of refusing",
+			verbatim.Name)
+	}
+
+	// Everything else has to match, or "verbatim" quietly means "and also
+	// without the body cap" or "and also accepting unknown fields".
+	if verbatim.N != stripped.N {
+		t.Errorf("N = %d and %d: the decoders disagree beyond stripping",
+			verbatim.N, stripped.N)
+	}
+	for _, c := range []struct {
+		name, body string
+		limit      int64
+		wantStatus int
+	}{
+		{"an unknown field", `{"name":"a","nope":1}`, 1 << 20, http.StatusBadRequest},
+		{"malformed JSON", `{"name":`, 1 << 20, http.StatusBadRequest},
+		{"a body over the cap", `{"name":"aaaaaaaaaaaaaaaa"}`, 4, http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var a, b payload
+			errLimit := DecodeJSONLimit(
+				httptest.NewRequest("POST", "/", strings.NewReader(c.body)), &a, c.limit)
+			errVerbatim := DecodeJSONVerbatim(
+				httptest.NewRequest("POST", "/", strings.NewReader(c.body)), &b, c.limit)
+
+			var ae, be *AppError
+			if !errors.As(errLimit, &ae) || !errors.As(errVerbatim, &be) {
+				t.Fatalf("errors = %v and %v, want *AppError from both", errLimit, errVerbatim)
+			}
+			if ae.Status != c.wantStatus || be.Status != c.wantStatus {
+				t.Errorf("status = %d and %d, want %d from both",
+					ae.Status, be.Status, c.wantStatus)
+			}
+			if ae.Code != be.Code {
+				t.Errorf("code = %q and %q: the decoders disagree beyond stripping",
+					ae.Code, be.Code)
+			}
+		})
+	}
 }

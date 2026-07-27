@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -375,4 +376,178 @@ func TestAHostileAttachmentFilenameDoesNotDropTheEmail(t *testing.T) {
 				"a filename that safeFilename exists to strip", c.label, code, raw)
 		}
 	}
+}
+
+// A CRDT UPDATE FULL OF NUL BYTES MAKES THE ROUND TRIP BYTE FOR BYTE.
+//
+// Every request body decoded by httputil.DecodeJSONLimit has U+0000 removed
+// from its strings. A Yjs update is binary and routinely contains zero bytes,
+// so a stripper that treated it as text would corrupt the document silently —
+// visible only later, when a client fails to apply the log.
+//
+// The stripper skips byte slices, and a unit test pins that in isolation. What
+// no test covered is the WIRING: all five collab HTTP routes had zero
+// integration coverage (collab_revocation_test.go drives Drive share routes
+// despite its name), so nothing said the production route actually carries
+// binary through unaltered. This drives Open, Append and State, and reads the
+// bytes back through the API rather than out of the database, so the response
+// encoding is inside the round trip too.
+func TestACollabUpdateFullOfNULBytesMakesTheRoundTrip(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	file := h.newDocument(t, admin, ws, fmt.Sprintf("nul-crdt-%d", time.Now().UnixNano()))
+
+	// A collab document is opened over an existing resource; the Drive file is
+	// the resource every real client uses.
+	openResp := h.req(t, http.StatusOK, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/collab/documents", admin,
+		map[string]string{"resource_type": "document", "resource_id": file.ID})
+	var doc struct {
+		ID string `json:"id"`
+	}
+	decodeInto(t, openResp.Data, &doc)
+
+	// Deliberately NUL-heavy and not uniform: a leading run of zeros, a zero
+	// between printable bytes, a zero next to 0xff, and a trailing zero all have
+	// to survive. 0xff also makes the payload invalid UTF-8, which is the other
+	// way a text-shaped code path corrupts binary.
+	payload := []byte{0, 0, 0, 'a', 0, 'b', 1, 2, 0, 0xff, 0x00}
+	for i := 0; i < 64; i++ {
+		payload = append(payload, byte(i), 0)
+	}
+
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/collab/documents/"+doc.ID+"/updates", admin,
+		map[string]any{"update": payload})
+
+	stateResp := h.req(t, http.StatusOK, http.MethodGet,
+		"/api/v1/collab/documents/"+doc.ID+"/state?since=0", admin, nil)
+	var state struct {
+		Updates []struct {
+			Payload []byte `json:"payload"`
+		} `json:"updates"`
+	}
+	decodeInto(t, stateResp.Data, &state)
+
+	if len(state.Updates) != 1 {
+		t.Fatalf("state carries %d updates, want 1", len(state.Updates))
+	}
+	got := state.Updates[0].Payload
+	if len(got) != len(payload) {
+		t.Fatalf("the update came back as %d bytes, sent %d: bytes were dropped "+
+			"from a CRDT update, which corrupts the document", len(got), len(payload))
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("the update changed in transit\n sent: %v\n back: %v", payload, got)
+	}
+}
+
+// A NUL IN A WORKFLOW CONFIG IS REFUSED, AND THE REFUSAL NAMES THE STEP.
+//
+// This is the one route that opts OUT of the NUL funnel, and the reason is that
+// its strings are KEYS. Stripping repairs prose — a name, a message, a filename
+// — because U+0000 renders as nothing and removing it gives the caller what
+// they meant. It does not repair a map key: a key's identity decides which code
+// runs. A step config sent with `channel_id` plus a trailing NUL is not a
+// channel_id, but strip it and it becomes one, and the workflow posts to that
+// channel from a key the caller never spelled.
+//
+// That is not hypothetical. The same body answered 400 before the funnel
+// existed and 201 after, so the funnel converted a refusal into a guess. The
+// handler decodes verbatim now and the check in saveTx — which the funnel had
+// made unreachable — refuses it again, naming the step rather than the request.
+func TestANulInAWorkflowConfigIsRefusedByStepNotStripped(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	channel := h.createChannel(t, admin, ws, uniqueSlug("wf-nul"))
+
+	const nul = "\x00"
+	okStep := func() map[string]any {
+		return map[string]any{
+			"kind":   "post_message",
+			"config": map[string]any{"channel_id": channel, "body": "hi"},
+		}
+	}
+	body := func(steps []map[string]any, triggers []map[string]any) map[string]any {
+		return map[string]any{
+			"name":     fmt.Sprintf("nul-cfg-%d", time.Now().UnixNano()),
+			"enabled":  true,
+			"steps":    steps,
+			"triggers": triggers,
+		}
+	}
+	okTriggers := []map[string]any{{"event_type": "message.created"}}
+
+	for _, c := range []struct {
+		name string
+		body map[string]any
+		want string
+	}{
+		{
+			// The case that regressed: stripping turns this into a real
+			// channel_id and the workflow runs.
+			"a NUL that would manufacture a key the executor reads",
+			body([]map[string]any{{
+				"kind":   "post_message",
+				"config": map[string]any{"channel_id" + nul: channel, "body": "hi"},
+			}}, okTriggers),
+			"the config of step 0 cannot contain a NUL character",
+		},
+		{
+			"a NUL in a config value",
+			body([]map[string]any{{
+				"kind":   "post_message",
+				"config": map[string]any{"channel_id": channel, "body": "a" + nul + "b"},
+			}}, okTriggers),
+			"the config of step 0 cannot contain a NUL character",
+		},
+		{
+			// Named by INDEX, which a generic answer from the decoder could not do.
+			"a NUL in the second step",
+			body([]map[string]any{okStep(), {
+				"kind":   "post_message",
+				"config": map[string]any{"channel_id": channel, "bo" + nul + "dy": "hi"},
+			}}, okTriggers),
+			"the config of step 1 cannot contain a NUL character",
+		},
+		{
+			"a NUL nested under a trigger filter",
+			body([]map[string]any{okStep()}, []map[string]any{{
+				"event_type": "message.created",
+				"filter":     map[string]any{"k": map[string]any{"in" + nul + "ner": "v"}},
+			}}),
+			"the filter of trigger 0 cannot contain a NUL character",
+		},
+		{
+			"a NUL in the name",
+			map[string]any{
+				"name":     "wf" + nul + fmt.Sprintf("-%d", time.Now().UnixNano()),
+				"enabled":  true,
+				"steps":    []map[string]any{okStep()},
+				"triggers": okTriggers,
+			},
+			"a workflow name or description cannot contain a NUL character",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			code, resp := h.do(t, http.MethodPost,
+				"/api/v1/workspaces/"+ws+"/workflows", admin, c.body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("= %d, want 400: the NUL was accepted, so the funnel "+
+					"stripped it and the workflow acts on a key nobody sent", code)
+			}
+			if resp.Error == nil || resp.Error.Message != c.want {
+				t.Errorf("message = %#v, want %q: the refusal has to say WHERE",
+					resp.Error, c.want)
+			}
+		})
+	}
+
+	// The control: the same shape without a NUL is still accepted, so the cases
+	// above fail on the NUL rather than on anything else in the body.
+	h.req(t, http.StatusCreated, http.MethodPost,
+		"/api/v1/workspaces/"+ws+"/workflows", admin,
+		body([]map[string]any{okStep()}, okTriggers))
 }

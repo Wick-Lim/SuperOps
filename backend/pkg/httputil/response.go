@@ -75,6 +75,10 @@ func DecodeJSON(r *http.Request, v interface{}) error {
 // DecodeJSONLimit is DecodeJSON with an explicit byte cap, for the rare
 // endpoint whose payload is legitimately larger than the default.
 func DecodeJSONLimit(r *http.Request, v interface{}, limit int64) error {
+	return decodeJSON(r, v, limit, true)
+}
+
+func decodeJSON(r *http.Request, v interface{}, limit int64, strip bool) error {
 	defer r.Body.Close()
 
 	body := http.MaxBytesReader(nil, r.Body, limit)
@@ -110,11 +114,30 @@ func DecodeJSONLimit(r *http.Request, v interface{}, limit int64) error {
 	// It belongs HERE rather than in each handler because the invariant is a
 	// property of the storage layer, not of any one resource — and because a
 	// route written next year gets it without anyone remembering.
-	if v != nil {
+	if strip && v != nil {
 		stripNUL(v)
 	}
 
 	return nil
+}
+
+// DecodeJSONVerbatim is DecodeJSONLimit for a body whose strings are KEYS
+// rather than prose, and it is the exception to everything the block above
+// argues for.
+//
+// Stripping repairs a NAME, a message or a filename: U+0000 renders as nothing,
+// so removing it gives the caller what they meant to send. It does not repair a
+// map key, because a key's identity decides which code runs. A workflow step
+// config sent as `channel_id` with a trailing NUL is not a channel_id — but
+// strip it and it becomes one, and the workflow posts to that channel. Measured: the same body
+// answered 400 "the config of step 0 cannot contain a NUL character" before the
+// funnel existed and 201 after, having invented a key the caller never spelled.
+//
+// A route reaching for this must refuse the NUL itself; nothing downstream will
+// now. That is the point — the refusal it writes can name the step or the field,
+// which a generic answer from here could not.
+func DecodeJSONVerbatim(r *http.Request, v interface{}, limit int64) error {
+	return decodeJSON(r, v, limit, false)
 }
 
 // NotFoundHandler renders an unmatched route in the standard envelope.
@@ -252,12 +275,21 @@ func stripNUL(v any) {
 // left alone, and Postgres refuses them as it did before this existed.
 const maxStripDepth = 40000
 
-// stripValue removes NULs in place where it can, and returns a replacement plus
-// true where it cannot.
+// stripValue removes NULs, and reports whether the value it was given is no
+// longer what it was.
 //
-// The split exists because a map's values and an interface's contents are not
-// addressable: they have to be rebuilt and assigned back through SetMapIndex or
-// Set. Struct fields and slice elements are addressable and are edited directly.
+// `changed` MEANS "MODIFIED", NOT "ASSIGN MY RETURN" — the doc here said the
+// latter for several rounds, and misreading it is what produced a snapshot that
+// silently reverted an already-repaired field. The String arm returns true after
+// writing in place. Callers that can ignore the returned value already do;
+// assigning a value to itself is a no-op, and the two are told apart by identity
+// where it matters (see the `newVal != val` comparison in stripMap).
+//
+// A rebuild is needed where the value is not ADDRESSABLE — a map's values, an
+// interface's contents, and an array or struct sitting inside either. Struct
+// fields and slice elements are addressable when their container is, which is
+// most of the time and not always: a struct in a map is not, and that is what
+// the rebuild path below exists for.
 func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 	if depth > maxStripDepth || !v.IsValid() {
 		return v, false
@@ -322,7 +354,7 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 		}
 		// A SLICE'S ELEMENTS ARE ALWAYS SETTABLE, even inside a map: the header
 		// points at backing storage the map does not own. An ARRAY inside a map
-		// is not, so it is copied ONCE, up front, and walked addressably.
+		// is not, so it is copied and walked addressably.
 		//
 		// It used to copy at the first element that needed a rebuild and re-walk
 		// only what came after. That made one array answer three ways: elements
@@ -331,20 +363,63 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 		// elements after it were stripped because the copy had made them
 		// addressable. Two byte-identical elements came out different, and
 		// changing element 1 decided whether element 0 was stripped.
-		// The condition is on the ELEMENT, not the array: an array's elements
-		// are addressable exactly when the array is, and that is what decides
-		// whether the walk can write into them.
+		// THE ADDRESSABILITY GATE IS FOR CORRECTNESS, NOT COST — containsNUL
+		// below already keeps a clean array from being copied, addressable or
+		// not, so removing this changes no allocation. What it stops is an
+		// ADDRESSABLE array taking the rebuild path at all: the Pointer arm
+		// discards its recursion's return, so a rebuild made under a `*[2]string`
+		// is thrown away and the NUL survives. Measured — without this,
+		// `struct{P *[2]string}`, a top-level `[2]string` and
+		// `map[string]*[2]string` all keep their NULs while the whole suite
+		// stays green.
+		//
+		// `v.Index(0).CanSet()` and `v.CanSet()` are the same test — Value.Index
+		// propagates the array's flags verbatim — so the choice between them is
+		// style, not behaviour.
 		if v.Kind() == reflect.Array && v.Len() > 0 && !v.Index(0).CanSet() {
-			out := reflect.New(v.Type()).Elem()
-			reflect.Copy(out, v)
-			anyChanged := false
-			for i := 0; i < out.Len(); i++ {
-				if repl, changed := stripValue(out.Index(i), depth+1); changed {
-					out.Index(i).Set(repl)
-					anyChanged = true
+			// COPIED ONLY ONCE SOMETHING NEEDS IT, and then re-walked FROM THE
+			// START. Copying up front cost every clean array in a map a copy it
+			// never used: 200 clean four-element arrays went from 400 to 600
+			// allocations. Copying lazily was never the bug — re-walking from
+			// `at+1` was, because it left elements before that point untouched
+			// while later ones were stripped, so one array answered two ways.
+			for i := 0; i < v.Len(); i++ {
+				if !containsNUL(v.Index(i), depth+1) {
+					continue
 				}
+				// Set, NOT reflect.Copy.
+				//
+				// `v` arrives here only from a non-addressable position — a map
+				// value or an interface's contents. When the array type is
+				// POINTER-SHAPED (exactly one pointer word: [1]map, [1]*T,
+				// [1]struct{map}) reflect stores it DIRECTLY in the Value rather
+				// than behind a pointer, and reflect.Copy assumes an array
+				// source is indirect: it copies the first word of the pointed-to
+				// object instead of the pointer itself. Measured on
+				// `map[string][1]map[string]int`: the element's pointer becomes
+				// 0x1, the map's `used` count read as an address.
+				//
+				// The consequences are not equal. A [1]map yields a garbage
+				// pointer and a nil dereference — recoverable, a 500. A [1]*T
+				// builds an address out of adjacent bytes and dies in
+				// runtime.throw with "unexpected fault address", which
+				// RecoveryMiddleware cannot catch: the process goes down and
+				// takes every in-flight request with it.
+				//
+				// Value.Set handles the non-indirect case explicitly. It is also
+				// the more honest call: Copy is for element-wise copying between
+				// sequences of possibly different length, and this is a
+				// whole-value copy between identical types.
+				out := reflect.New(v.Type()).Elem()
+				out.Set(v)
+				for j := 0; j < out.Len(); j++ {
+					if repl, changed := stripValue(out.Index(j), depth+1); changed {
+						out.Index(j).Set(repl)
+					}
+				}
+				return out, true
 			}
-			return out, anyChanged
+			return v, false
 		}
 		modified := false
 		for i := 0; i < v.Len(); i++ {
@@ -418,15 +493,34 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 			// three mutate in place. `any` is the one worth noticing — it is the
 			// ordinary shape of decoded JSON.
 			//
+			// The rule underneath is "a field degrades iff repairing it needed a
+			// rebuild", so array and nested-struct degrade only when what is
+			// INSIDE them does: a `[1]map[string]string` or a
+			// `struct{S []string}` in the same position is stripped fine.
+			//
 			// TWO CONSEQUENCES OF THAT DEGRADATION. `map[string]T` and
 			// `map[string]*T` give different answers for the same T, because a
 			// pointee is addressable. And within ONE array the answer can differ
-			// PER ELEMENT: rebuiltSequence copies the array into an addressable
-			// value, so elements after the first replaced one are re-walked with
-			// addressability and their promoted strings ARE stripped, while the
-			// replaced one is inserted as the rebuild left it. That is the shape
-			// most likely to read as a bug.
-			if !v.CanInterface() {
+			// PER ELEMENT the answer used to differ too: the array was copied at the
+			// first element needing a rebuild and re-walked only after it, so
+			// earlier elements kept their NULs while later ones lost them. The
+			// copy is taken for the whole array now, so every element gets the
+			// same treatment — see TestEveryElementOfAnArrayGetsTheSameTreatment.
+			//
+			// NO REBUILD FOR AN ADDRESSABLE v: every edit already landed in it,
+			// so a snapshot has no job — and taking one caused the loss it was
+			// meant to prevent. The only field that reaches here with v
+			// addressable is an embedded unexported struct, and
+			// `reflect.New(T).Elem()` carries the same read-only flag on that
+			// field, so the snapshot is created by the one field kind that can
+			// never be written into it. With two of them, the second edited v
+			// after the snapshot and was reverted when the snapshot came back:
+			// `{"a":"p\u0000q","b":"r\u0000s"}` gave A="pq" B="r\x00s", a value
+			// that was correct in memory and then overwritten.
+			//
+			// !CanInterface is the read-only case, which cannot be copied at
+			// all. CanAddr is the case where copying is pointless.
+			if !v.CanInterface() || v.CanAddr() {
 				continue
 			}
 			if !rebuilt.IsValid() {
@@ -475,6 +569,13 @@ func stripMap(v reflect.Value, depth int) bool {
 		// Comparing the returned Value against what the iterator held
 		// distinguishes the two: a rebuild is a different Value, an in-place
 		// edit is the same one.
+		//
+		// This compares IDENTITY, not the values represented — reflect.Value's
+		// own documentation warns that `==` does not do the latter, and identity
+		// is exactly what is wanted. It is sound structurally rather than by
+		// luck: every rebuild in this walk is `reflect.New(T).Elem()`, which
+		// carries flagAddr, while `MapIter.Value()` and `Value.Elem()` never do,
+		// so a rebuild can never compare equal to what was handed in.
 		newVal, valChanged := stripValue(val, depth+1)
 		rebuiltVal := valChanged && newVal != val
 		if keyChanged || rebuiltVal {
@@ -485,6 +586,8 @@ func stripMap(v reflect.Value, depth int) bool {
 		}
 	}
 
+	// SORTED, so the outcome is a function of the request rather than of Go's
+	// randomised map iteration order.
 	//
 	// Which entry survives a collision is WHICHEVER ORIGINAL KEY SORTS LAST among
 	// those in `pending` — not "the stripped one", which is what an earlier
@@ -497,8 +600,6 @@ func stripMap(v reflect.Value, depth int) bool {
 	// stored "first" 55 times and "second" 345 over 400 runs of a byte-identical
 	// request. Which key wins is arbitrary either way — arbitrary and stable is
 	// what makes a bug report actionable.
-	// SORTED, so the outcome is a function of the request rather than of Go's
-	// randomised map iteration order.
 	//
 	// Order matters for exactly one interaction: two entries writing the same
 	// newKey, where the last write wins. Everything else is order-free — a
@@ -535,4 +636,72 @@ func removeNUL(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// containsNUL reports whether a value holds U+0000 anywhere, without modifying
+// it.
+//
+// It exists so a NON-ADDRESSABLE array is copied only when the copy will be
+// used. Every other container is walked directly, because it can be edited in
+// place; an array in a map cannot, and paying a copy per clean array is a cost
+// every request with one would carry.
+//
+// The read-only cases it cannot inspect answer false, which is the same answer
+// the walk gives them: they are left alone either way.
+//
+// IT MUST AGREE WITH stripValue, and that is the one silent failure mode of this
+// design: a shape where this answers false and the walk would have changed
+// something means the array is never copied and the NUL survives, with nothing
+// erroring anywhere. The two mirror each other by hand, which is the arrangement
+// that drifts, so TestContainsNULAgreesWithTheWalk drives both over the same
+// bodies and requires the same answer.
+//
+// It costs a SECOND traversal of a dirty array's subtree — linear, and paid only
+// by arrays that turn out to need the copy. A clean one is traversed once and
+// copied never, which is the case worth optimising: 200 clean four-element
+// arrays in a map went from 400 allocations to 600 when the copy was
+// unconditional.
+func containsNUL(v reflect.Value, depth int) bool {
+	if depth > maxStripDepth || !v.IsValid() {
+		return false
+	}
+	switch v.Kind() {
+	case reflect.String:
+		return strings.ContainsRune(v.String(), 0)
+	case reflect.Pointer, reflect.Interface:
+		return !v.IsNil() && containsNUL(v.Elem(), depth+1)
+	case reflect.Slice, reflect.Array:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			return false
+		}
+		for i := 0; i < v.Len(); i++ {
+			if containsNUL(v.Index(i), depth+1) {
+				return true
+			}
+		}
+	case reflect.Map:
+		it := v.MapRange()
+		for it.Next() {
+			k := it.Key()
+			if k.Kind() == reflect.String && strings.ContainsRune(k.String(), 0) {
+				return true
+			}
+			if containsNUL(it.Value(), depth+1) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < v.NumField(); i++ {
+			f := t.Field(i)
+			embedded := f.Anonymous && v.Field(i).Kind() == reflect.Struct
+			if !f.IsExported() && !embedded {
+				continue
+			}
+			if containsNUL(v.Field(i), depth+1) {
+				return true
+			}
+		}
+	}
+	return false
 }

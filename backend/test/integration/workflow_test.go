@@ -1715,12 +1715,15 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 			name: "a name containing NUL",
 			body: map[string]any{"name": "my\x00flow", "steps": []any{step},
 				"triggers": []any{trigger}},
-			// STRIPPED, not refused. The funnel removes the byte before the
-			// handler runs, so the workflow is created without it — refusing
-			// ran before the sanitisers elsewhere in this codebase and broke
-			// two working paths. The repository still refuses, which is what
-			// TestTheRepositoryRefusesNULWithoutTheHTTPFunnel covers.
-			want: "",
+			// REFUSED, not stripped, and this route is the exception. The
+			// funnel strips a NUL everywhere else because removing an
+			// invisible byte repairs prose. It does not repair a step config:
+			// those strings are KEYS, and `channel_id` plus a NUL becomes a
+			// real channel_id if you strip it — a workflow acting on a key
+			// nobody sent. So the handler decodes verbatim and saveTx refuses,
+			// naming the step. TestANulInAWorkflowConfigIsRefusedByStepNotStripped
+			// covers the messages; this asserts no SQLSTATE reaches the wire.
+			want: "cannot contain a NUL character",
 		},
 		{
 			name: "a step config containing NUL",
@@ -1730,12 +1733,15 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 					"config": map[string]any{"body": "a\x00b"}}},
 				"triggers": []any{trigger},
 			},
-			// STRIPPED, not refused. The funnel removes the byte before the
-			// handler runs, so the workflow is created without it — refusing
-			// ran before the sanitisers elsewhere in this codebase and broke
-			// two working paths. The repository still refuses, which is what
-			// TestTheRepositoryRefusesNULWithoutTheHTTPFunnel covers.
-			want: "",
+			// REFUSED, not stripped, and this route is the exception. The
+			// funnel strips a NUL everywhere else because removing an
+			// invisible byte repairs prose. It does not repair a step config:
+			// those strings are KEYS, and `channel_id` plus a NUL becomes a
+			// real channel_id if you strip it — a workflow acting on a key
+			// nobody sent. So the handler decodes verbatim and saveTx refuses,
+			// naming the step. TestANulInAWorkflowConfigIsRefusedByStepNotStripped
+			// covers the messages; this asserts no SQLSTATE reaches the wire.
+			want: "cannot contain a NUL character",
 		},
 		{
 			name: "a trigger filter containing NUL",
@@ -1745,12 +1751,15 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 				"triggers": []any{map[string]any{"event_type": "message.created",
 					"filter": map[string]any{"k": "a\x00b"}}},
 			},
-			// STRIPPED, not refused. The funnel removes the byte before the
-			// handler runs, so the workflow is created without it — refusing
-			// ran before the sanitisers elsewhere in this codebase and broke
-			// two working paths. The repository still refuses, which is what
-			// TestTheRepositoryRefusesNULWithoutTheHTTPFunnel covers.
-			want: "",
+			// REFUSED, not stripped, and this route is the exception. The
+			// funnel strips a NUL everywhere else because removing an
+			// invisible byte repairs prose. It does not repair a step config:
+			// those strings are KEYS, and `channel_id` plus a NUL becomes a
+			// real channel_id if you strip it — a workflow acting on a key
+			// nobody sent. So the handler decodes verbatim and saveTx refuses,
+			// naming the step. TestANulInAWorkflowConfigIsRefusedByStepNotStripped
+			// covers the messages; this asserts no SQLSTATE reaches the wire.
+			want: "cannot contain a NUL character",
 		},
 		{
 			// MANY SMALL KEYS, not one long string. jsonb carries a 4-byte
@@ -1902,18 +1911,19 @@ func manyKeys(n int) map[string]any {
 	return m
 }
 
-// THE REPOSITORY'S OWN NUL CHECKS, DRIVEN WHERE THE FUNNEL IS NOT.
+// THE REPOSITORY'S OWN NUL CHECKS, DRIVEN WHERE NO HANDLER RUNS AT ALL.
 //
-// httputil.DecodeJSON now refuses a NUL before any handler runs, which makes the
-// checks in saveTx unreachable over HTTP — and the subtests named for them pass
-// with those checks deleted, because both layers' messages contain "NUL" and the
-// assertion cannot tell which answered.
+// This comment has been wrong twice, so it is worth saying what is true and how
+// it was measured. The funnel first REFUSED a NUL, then STRIPPED one, and either
+// way saveTx's checks could not fire over HTTP. The workflow route decodes
+// verbatim now — a step config is a map of keys, and stripping a key changes
+// which code runs — so those checks are reachable from HTTP again: deleting them
+// fails the two HTTP tests as well as this one.
 //
-// They still have a job: Repository.Save is EXPORTED and the funnel does not sit
-// in front of it. Anything constructing a workflow in Go — a template gallery, a
-// duplicate-a-workflow path, a migration — reaches saveTx directly, and a NUL
-// there is a 500 at the INSERT. So this drives the checks from that side, where
-// they are the only thing standing between a caller and the database.
+// What is left that only this covers: Repository.Save is EXPORTED and no handler
+// sits in front of it. Anything constructing a workflow in Go — a template
+// gallery, a duplicate-a-workflow path, a migration — reaches saveTx directly,
+// and a NUL there is a 500 at the INSERT.
 func TestTheRepositoryRefusesNULWithoutTheHTTPFunnel(t *testing.T) {
 	h := getHarness(t)
 	admin := h.adminToken(t)
