@@ -271,7 +271,14 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 		cleaned := removeNUL(s)
 		if v.CanSet() {
 			v.SetString(cleaned)
-			return v, false
+			// TRUE EVEN THOUGH IT WAS WRITTEN IN PLACE. `changed` means "this
+			// value is not what it was", not "you must assign my return".
+			// Returning false here lost every strip made inside a COPY: the
+			// array arm walks a copy it has to hand back, and its caller only
+			// hands it back when something changed. A caller that can ignore
+			// the replacement already does — assigning a value to itself is a
+			// no-op.
+			return v, true
 		}
 		out := reflect.New(v.Type()).Elem()
 		out.SetString(cleaned)
@@ -290,9 +297,17 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 		// An interface's contents are never addressable, so whatever comes back
 		// has to be assigned onto the interface itself.
 		if repl, changed := stripValue(inner, depth+1); changed {
+			// A REBUILD IS A DIFFERENT VALUE; an in-place edit hands the same
+			// one back. Only the first needs assigning — treating both as a
+			// rebuild made every level of a deeply nested body allocate an
+			// interface box on the way out, +600 KB on a body that costs 2.1 MB
+			// to decode.
+			if repl == inner {
+				return v, true
+			}
 			if v.CanSet() {
 				v.Set(repl)
-				return v, false
+				return v, true
 			}
 			return repl, true
 		}
@@ -305,25 +320,50 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 		if v.Type().Elem().Kind() == reflect.Uint8 {
 			return v, false
 		}
-		for i := 0; i < v.Len(); i++ {
-			if repl, changed := stripValue(v.Index(i), depth+1); changed {
-				// An ARRAY inside a map is not addressable, so the element the
-				// recursion rebuilt has to be assigned back — discarding it here
-				// silently dropped the strip and left the NUL for Postgres.
-				if v.Index(i).CanSet() {
-					v.Index(i).Set(repl)
-				} else {
-					return rebuiltSequence(v, i, repl, depth), true
+		// A SLICE'S ELEMENTS ARE ALWAYS SETTABLE, even inside a map: the header
+		// points at backing storage the map does not own. An ARRAY inside a map
+		// is not, so it is copied ONCE, up front, and walked addressably.
+		//
+		// It used to copy at the first element that needed a rebuild and re-walk
+		// only what came after. That made one array answer three ways: elements
+		// before the pivot kept their NULs (their recursion had already reported
+		// "nothing I can do"), the pivot got whatever the rebuild produced, and
+		// elements after it were stripped because the copy had made them
+		// addressable. Two byte-identical elements came out different, and
+		// changing element 1 decided whether element 0 was stripped.
+		// The condition is on the ELEMENT, not the array: an array's elements
+		// are addressable exactly when the array is, and that is what decides
+		// whether the walk can write into them.
+		if v.Kind() == reflect.Array && v.Len() > 0 && !v.Index(0).CanSet() {
+			out := reflect.New(v.Type()).Elem()
+			reflect.Copy(out, v)
+			anyChanged := false
+			for i := 0; i < out.Len(); i++ {
+				if repl, changed := stripValue(out.Index(i), depth+1); changed {
+					out.Index(i).Set(repl)
+					anyChanged = true
 				}
 			}
+			return out, anyChanged
 		}
+		modified := false
+		for i := 0; i < v.Len(); i++ {
+			if repl, changed := stripValue(v.Index(i), depth+1); changed {
+				// Reachable for a slice whose element needed a rebuild — the
+				// element is settable, so the value goes straight back.
+				v.Index(i).Set(repl)
+				modified = true
+			}
+		}
+		return v, modified
 
 	case reflect.Map:
-		stripMap(v, depth)
+		return v, stripMap(v, depth)
 
 	case reflect.Struct:
 		t := v.Type()
 		rebuilt := reflect.Value{}
+		modified := false
 		for i := 0; i < v.NumField(); i++ {
 			f := t.Field(i)
 			// An EMBEDDED unexported struct type still has exported fields that
@@ -337,9 +377,20 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 			if !changed {
 				continue
 			}
+			modified = true
 			// A STRUCT inside a map is not addressable either.
+			//
+			// Written to the REBUILD as well once one exists. It is a snapshot
+			// taken at the first field that needed it, so a later field edited
+			// in place was written to `v` and lost when `rebuilt` was returned
+			// instead — an array of structs with an embedded unexported type
+			// came back with the promoted field stripped and the plain one not,
+			// which is neither of the two answers this is supposed to give.
 			if v.Field(i).CanSet() {
 				v.Field(i).Set(repl)
+				if rebuilt.IsValid() && rebuilt.Field(i).CanSet() {
+					rebuilt.Field(i).Set(repl)
+				}
 				continue
 			}
 			// THE REBUILD IS WHAT CANNOT SURVIVE A READ-ONLY VALUE, and it is
@@ -358,8 +409,14 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 			// stopped the panic and threw away far more: a map, a slice or a
 			// pointee inside the embedded struct is mutated through
 			// SetMapIndex or an element write, needs no addressability and never
-			// reaches this line — yet all of them kept their NULs. Only a plain
-			// string field genuinely needs the copy, and that one still degrades.
+			// reaches this line — yet all of them kept their NULs.
+			//
+			// WHAT STILL DEGRADES IS EVERY KIND THAT NEEDS A REBUILD, not just a
+			// plain string as an earlier comment claimed. Measured with a NUL in
+			// each: string, array, `any`, a nested struct and an array of
+			// structs all keep it; map, slice and pointer do not, because those
+			// three mutate in place. `any` is the one worth noticing — it is the
+			// ordinary shape of decoded JSON.
 			//
 			// TWO CONSEQUENCES OF THAT DEGRADATION. `map[string]T` and
 			// `map[string]*T` give different answers for the same T, because a
@@ -383,6 +440,7 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 		if rebuilt.IsValid() {
 			return rebuilt, true
 		}
+		return v, modified
 	}
 	return v, false
 }
@@ -392,7 +450,7 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 // A key is as unstorable as a value — a jsonb object's keys go into the same
 // column — and rewriting one means deleting the old entry, so the mutations are
 // collected first rather than made while ranging.
-func stripMap(v reflect.Value, depth int) {
+func stripMap(v reflect.Value, depth int) bool {
 	type rewrite struct{ oldKey, newKey, val reflect.Value }
 	var pending []rewrite
 
@@ -408,16 +466,25 @@ func stripMap(v reflect.Value, depth int) {
 			keyChanged = true
 		}
 
+		// `changed` means "this value is not what it was", which includes the
+		// case where the recursion edited it IN PLACE and handed the same value
+		// back. Re-writing that through SetMapIndex is pure cost, and at depth
+		// it is not small: every level of a 5,000-deep body paid one, +600 KB
+		// for a body that allocates 2.1 MB to decode.
+		//
+		// Comparing the returned Value against what the iterator held
+		// distinguishes the two: a rebuild is a different Value, an in-place
+		// edit is the same one.
 		newVal, valChanged := stripValue(val, depth+1)
-		if keyChanged || valChanged {
-			if !valChanged {
+		rebuiltVal := valChanged && newVal != val
+		if keyChanged || rebuiltVal {
+			if !rebuiltVal {
 				newVal = val
 			}
 			pending = append(pending, rewrite{oldKey: k, newKey: newKey, val: newVal})
 		}
 	}
 
-	// SORTED, so the outcome does not depend on map iteration order.
 	//
 	// Which entry survives a collision is WHICHEVER ORIGINAL KEY SORTS LAST among
 	// those in `pending` — not "the stripped one", which is what an earlier
@@ -454,6 +521,7 @@ func stripMap(v reflect.Value, depth int) {
 		}
 		v.SetMapIndex(r.newKey, r.val)
 	}
+	return len(pending) > 0
 }
 
 // removeNUL is strings.Map's job, written out so the common case allocates
@@ -467,36 +535,4 @@ func removeNUL(s string) string {
 		}
 	}
 	return b.String()
-}
-
-// rebuiltSequence copies a non-addressable array so one element can be replaced,
-// and finishes stripping the rest.
-//
-// Only arrays reach it: a slice's elements are always addressable, even when the
-// slice itself sits in a map, because the header points at backing storage the
-// map does not own.
-//
-// The check below is UNREACHABLE and no test covers it — deleting it leaves the
-// package green. Read-only originates only at an embedded field, which is always
-// Kind struct, so a slice element is always settable and the Slice arm never
-// rebuilds. It stays because `reflect.New(sliceType).Elem()` is a NIL slice: if
-// the invariant above ever stopped holding, this would panic on the index rather
-// than answer wrongly, and an assumption that fails as a crash is worth one
-// comparison. Named as unverified so it does not read as a guard that fires.
-func rebuiltSequence(v reflect.Value, at int, repl reflect.Value, depth int) reflect.Value {
-	if v.Kind() != reflect.Array {
-		// A slice here means the invariant above is wrong. Leaving the value
-		// alone is the safe answer: the NUL survives to Postgres, which is the
-		// behaviour before this function existed, rather than a panic.
-		return v
-	}
-	out := reflect.New(v.Type()).Elem()
-	reflect.Copy(out, v)
-	out.Index(at).Set(repl)
-	for i := at + 1; i < out.Len(); i++ {
-		if r, changed := stripValue(out.Index(i), depth+1); changed {
-			out.Index(i).Set(r)
-		}
-	}
-	return out
 }

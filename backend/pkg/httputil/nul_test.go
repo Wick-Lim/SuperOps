@@ -363,9 +363,16 @@ func TestStrippingDoesNotScaleWithDepth(t *testing.T) {
 	stripped := measure(deep, true)
 	t.Logf("at depth %d: clean %d B/op, stripped %d B/op", deep, clean, stripped)
 
-	if stripped > clean+(1<<20) {
-		t.Errorf("stripping at depth %d allocated %d B against a clean %d B: the "+
-			"walk is quadratic in depth", deep, stripped, clean)
+	// A MEGABYTE OF SLACK WAS TOO MUCH TO SEE THE REGRESSION THAT ACTUALLY
+	// HAPPENED. Redefining `changed` to mean "modified" — necessary, so that
+	// edits made inside a copy are not discarded — made every level of a nested
+	// body report a rebuild, and the interface arm boxed a fresh value at each
+	// one: +600 KB, comfortably inside a 1 MiB bound. The cost of stripping must
+	// not scale with depth at all, so the bound is a fraction of what the decode
+	// itself costs rather than an absolute number.
+	if stripped > clean+clean/10 {
+		t.Errorf("stripping at depth %d allocated %d B against a clean %d B, over "+
+			"a tenth more: the walk is paying per level again", deep, stripped, clean)
 	}
 }
 
@@ -658,16 +665,16 @@ func TestAnEmbeddedUnexportedTypeInAMapDoesNotPanic(t *testing.T) {
 func TestCollidingKeysResolveTheSameWayEveryTime(t *testing.T) {
 	esc := "\\u" + "0000"
 
-	for _, c := range []struct{ name, body string }{
-		{"two dirty keys colliding", `{"m":{"a` + esc + `b":"first","ab` + esc + `":"second"}}`},
-		{"a dirty key colliding with a clean one", `{"m":{"ab":"clean","a` + esc + `b":"dirty"}}`},
+	for _, c := range []struct{ name, body, want string }{
+		{"two dirty keys colliding", `{"m":{"a` + esc + `b":"first","ab` + esc + `":"second"}}`, "second"},
+		{"a dirty key colliding with a clean one", `{"m":{"ab":"clean","a` + esc + `b":"dirty"}}`, "dirty"},
 		// The winner is whichever ORIGINAL key sorts last among those being
 		// rewritten — not "the stripped one", which is what the pre-sort code
 		// happened to do and what the comment said for a while. Both of these
 		// have two entries in the rewrite list, so both are decided by the sort.
-		{"a clean key whose value is dirty", `{"m":{"ab":"cl` + esc + `ean","a` + esc + `b":"dirty"}}`},
-		{"the clean key sorts last", `{"m":{"ab":"cl` + esc + `ean","` + esc + `ab":"dirty"}}`},
-		{"three keys colliding", `{"m":{"a` + esc + `b":"one","ab` + esc + `":"two","` + esc + `ab":"three"}}`},
+		{"a clean key whose value is dirty", `{"m":{"ab":"cl` + esc + `ean","a` + esc + `b":"dirty"}}`, "clean"},
+		{"the clean key sorts last", `{"m":{"ab":"cl` + esc + `ean","` + esc + `ab":"dirty"}}`, "clean"},
+		{"three keys colliding", `{"m":{"a` + esc + `b":"one","ab` + esc + `":"two","` + esc + `ab":"three"}}`, "two"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			seen := map[string]int{}
@@ -691,8 +698,16 @@ func TestCollidingKeysResolveTheSameWayEveryTime(t *testing.T) {
 					"varied: %v — the outcome depends on map iteration order",
 					runs, seen)
 			}
+			// AND WHICH ONE, not merely that it is always the same. The rule
+			// is "whichever original key sorts last among those being
+			// rewritten" — reversing the comparator leaves every subtest of the
+			// determinism half green while flipping all five outcomes.
 			for got := range seen {
-				t.Logf("%s -> %q", c.name, got)
+				if got != c.want {
+					t.Errorf("the survivor is %q, want %q: the winner is whichever "+
+						"ORIGINAL key sorts last among those being rewritten",
+						got, c.want)
+				}
 			}
 		})
 	}
@@ -762,6 +777,13 @@ func TestTheEmbeddedSubtreeIsStrippedExceptWhereACopyIsNeeded(t *testing.T) {
 	if got.P == nil || got.P.Title != "tu" {
 		t.Errorf("a pointee inside the embedded struct = %+v, want title tu", got.P)
 	}
+	// The length check is not decoration: without it this loop passes on an
+	// empty map, which is what a bug that deletes rewritten keys and never
+	// re-adds them produces.
+	if len(got.M) != 1 {
+		t.Errorf("the map inside the embedded struct has %d entries, want 1: %v",
+			len(got.M), got.M)
+	}
 	for k, val := range got.M {
 		if strings.ContainsRune(k, 0) || strings.ContainsRune(val, 0) {
 			t.Errorf("a map inside the embedded struct kept a NUL: %q=%q", k, val)
@@ -801,4 +823,123 @@ type embeddedPrivate struct {
 type embeddedOuter struct {
 	embeddedPrivate
 	Body string `json:"body"`
+}
+
+// ONE ARRAY, ONE ANSWER — the same input must not come out two ways.
+//
+// The array arm used to copy at the FIRST element that needed a rebuild and
+// re-walk only what came after, so one array answered three ways: elements
+// before that point kept their NULs, the pivot got whatever the rebuild
+// produced, and elements after it were stripped because the copy had made them
+// addressable. Two byte-identical elements came out different, and changing
+// element 1 decided whether element 0 was stripped. It copies once, up front.
+func TestEveryElementOfAnArrayGetsTheSameTreatment(t *testing.T) {
+	esc := "\\u" + "0000"
+	type item struct {
+		A string `json:"a"`
+		B string `json:"b"`
+	}
+	dirty := `{"a":"t` + esc + `x","b":"clean"}`
+	pivot := `{"a":"ok","b":"b` + esc + `y"}`
+
+	var v struct {
+		M map[string][3]item `json:"m"`
+	}
+	req := httptest.NewRequest("POST", "/", strings.NewReader(
+		`{"m":{"k":[`+dirty+`,`+pivot+`,`+dirty+`]}}`))
+	if err := DecodeJSON(req, &v); err != nil {
+		t.Fatal(err)
+	}
+	got := v.M["k"]
+	if got[0] != got[2] {
+		t.Errorf("two byte-identical elements came out different: [0]=%+v [2]=%+v",
+			got[0], got[2])
+	}
+	for i, el := range got {
+		if strings.ContainsRune(el.A, 0) || strings.ContainsRune(el.B, 0) {
+			t.Errorf("element %d kept a NUL: %+v", i, el)
+		}
+	}
+}
+
+// A REBUILD MUST NOT LOSE AN EDIT MADE AFTER IT WAS TAKEN.
+//
+// `rebuilt` is a snapshot of the struct at the first field that needed one. A
+// later field edited IN PLACE was written to the original and lost when the
+// snapshot was returned instead — so an array of structs with an embedded
+// unexported type came back with the promoted field stripped and the plain one
+// not, which is neither of the two answers this is supposed to give.
+func TestARebuildKeepsEditsMadeAfterIt(t *testing.T) {
+	esc := "\\u" + "0000"
+	var v struct {
+		M map[string][1]outerWithEmbedded `json:"m"`
+	}
+	req := httptest.NewRequest("POST", "/", strings.NewReader(
+		`{"m":{"k":[{"title":"a`+esc+`b","body":"c`+esc+`d"}]}}`))
+	if err := DecodeJSON(req, &v); err != nil {
+		t.Fatal(err)
+	}
+	got := v.M["k"][0]
+	if got.Body != "cd" {
+		t.Errorf("body = %q, want %q: an in-place edit made after the rebuild was "+
+			"snapshotted did not survive it", got.Body, "cd")
+	}
+	// And the promoted field, which the copy makes reachable here.
+	if strings.ContainsRune(got.Title, 0) {
+		t.Errorf("title = %q: the array copy makes the promoted field settable, "+
+			"so it should be stripped", got.Title)
+	}
+}
+
+// EDGE SHAPES OF THE ARRAY COPY.
+//
+// The up-front copy is gated on `v.Len() > 0 && !v.Index(0).CanSet()`. Both
+// halves of that gate are worth a case: an empty array must not index element
+// zero, and an array that is already addressable must not be copied at all.
+func TestTheArrayCopyGateHandlesItsEdges(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	t.Run("an empty array in a map", func(t *testing.T) {
+		var v struct {
+			M map[string][0]string `json:"m"`
+			N string               `json:"n"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[]},"n":"a`+esc+`b"}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatalf("an empty array panicked or was refused: %v", err)
+		}
+		if v.N != "ab" {
+			t.Errorf("n = %q: the walk stopped at the empty array", v.N)
+		}
+	})
+
+	t.Run("an addressable array is edited in place", func(t *testing.T) {
+		var v struct {
+			A [2]string `json:"a"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"a":["p`+esc+`q","r`+esc+`s"]}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.A[0] != "pq" || v.A[1] != "rs" {
+			t.Errorf("a = %q, want [pq rs]", v.A)
+		}
+	})
+
+	t.Run("an array of arrays where only the inner needs a copy", func(t *testing.T) {
+		var v struct {
+			M map[string][2][2]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[["a`+esc+`b","c`+esc+`d"],["e`+esc+`f","g"]]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		want := [2][2]string{{"ab", "cd"}, {"ef", "g"}}
+		if v.M["k"] != want {
+			t.Errorf("m.k = %q, want %q", v.M["k"], want)
+		}
+	})
 }
