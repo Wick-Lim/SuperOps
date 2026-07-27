@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // THE DECODE FUNNEL REMOVES U+0000 FROM EVERY STRING IN A REQUEST BODY.
@@ -232,10 +233,22 @@ func TestABinaryFieldIsNeitherAlteredNorWalkedPerByte(t *testing.T) {
 		}
 	}
 
-	allocs := testing.AllocsPerRun(5, func() { stripNUL(&input) })
-	if allocs > 50 {
-		t.Errorf("stripping a 256 KiB binary field allocates %.0f times: the "+
-			"byte-slice skip is gone, so every collab update pays per byte", allocs)
+	// TIME, NOT ALLOCATIONS. Walking a []byte element by element allocates
+	// NOTHING — it is reflect.Value.Index in a loop — so an allocation count is
+	// the one quantity this regression does not move: with the skip deleted the
+	// whole package still passed. Measured on this payload: 54ns with the skip,
+	// 1.08ms without, twenty thousand times.
+	start := time.Now()
+	const runs = 20
+	for i := 0; i < runs; i++ {
+		stripNUL(&input)
+	}
+	per := time.Since(start) / runs
+	// Three orders of magnitude of headroom, so a slow machine cannot trip it
+	// and the regression cannot hide under it.
+	if per > 100*time.Microsecond {
+		t.Errorf("stripping a 256 KiB binary field takes %s: the byte-slice skip "+
+			"is gone, so every collab update pays a reflect visit per byte", per)
 	}
 }
 
@@ -350,4 +363,193 @@ func TestStrippingDoesNotScaleWithDepth(t *testing.T) {
 		t.Errorf("stripping at depth %d allocated %d B against a clean %d B: the "+
 			"walk is quadratic in depth", deep, stripped, clean)
 	}
+}
+
+// THREE SHAPES THE WALK USED TO SKIP SILENTLY.
+//
+// The Struct and Slice/Array arms discarded the (replacement, changed) return
+// that the Map and Interface arms honour. When the container itself is not
+// addressable — a struct or an array sitting inside a map — the rebuilt string
+// was thrown away: no strip, no error, and Postgres 22021 downstream. And an
+// embedded UNEXPORTED struct type was skipped whole, though encoding/json fills
+// and promotes its exported fields.
+//
+// None of these is in a request type today. They are here because the funnel's
+// justification is "a route written next year gets this without anyone
+// remembering", and for these three it did not.
+func TestTheWalkReachesShapesItUsedToSkip(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	t.Run("a struct inside a map", func(t *testing.T) {
+		var v struct {
+			M map[string]struct {
+				S string `json:"s"`
+			} `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":{"s":"a`+esc+`b"}}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if got := v.M["k"].S; got != "ab" {
+			t.Errorf("m.k.s = %q, want %q", got, "ab")
+		}
+	})
+
+	t.Run("an array inside a map", func(t *testing.T) {
+		var v struct {
+			M map[string][2]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":["p`+esc+`q","ok"]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if got := v.M["k"][0]; got != "pq" {
+			t.Errorf("m.k[0] = %q, want %q", got, "pq")
+		}
+		if got := v.M["k"][1]; got != "ok" {
+			t.Errorf("m.k[1] = %q: an untouched element was altered", got)
+		}
+	})
+
+	t.Run("an embedded unexported struct", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"title":"a`+esc+`b","body":"c`+esc+`d"}`))
+		var v outerWithEmbedded
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.Title != "ab" {
+			t.Errorf("the promoted field of an embedded unexported struct = %q, "+
+				"want %q — the whole field was skipped", v.Title, "ab")
+		}
+		if v.Body != "cd" {
+			t.Errorf("body = %q, want %q", v.Body, "cd")
+		}
+	})
+}
+
+type embeddedBase struct {
+	Title string `json:"title"`
+}
+
+type outerWithEmbedded struct {
+	embeddedBase
+	Body string `json:"body"`
+}
+
+// THE REBUILT CONTAINERS MUST NOT LOSE THE EDITS MADE BEFORE THEM.
+//
+// The Struct arm sets a changed field in place when it can and takes a copy on
+// the first field it cannot — so a struct with a settable field BEFORE a
+// non-settable one has to carry both edits. The Array arm has the same shape:
+// rebuiltSequence replaces one element and must finish stripping the rest.
+func TestRebuiltContainersKeepEveryEdit(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	t.Run("later array elements are still stripped", func(t *testing.T) {
+		var v struct {
+			M map[string][3]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":["a`+esc+`b","c`+esc+`d","e`+esc+`f"]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		want := [3]string{"ab", "cd", "ef"}
+		if v.M["k"] != want {
+			t.Errorf("m.k = %q, want %q — rebuiltSequence stopped at the first "+
+				"element it replaced", v.M["k"], want)
+		}
+	})
+
+	t.Run("an array of structs inside a map", func(t *testing.T) {
+		type item struct {
+			S string `json:"s"`
+		}
+		var v struct {
+			M map[string][2]item `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[{"s":"a`+esc+`b"},{"s":"c`+esc+`d"}]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.M["k"][0].S != "ab" || v.M["k"][1].S != "cd" {
+			t.Errorf("m.k = %+v, want both stripped", v.M["k"])
+		}
+	})
+
+	t.Run("an array of arrays inside a map", func(t *testing.T) {
+		var v struct {
+			M map[string][2][2]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":[["a`+esc+`b","c"],["d","e`+esc+`f"]]}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		got := v.M["k"]
+		if got[0][0] != "ab" || got[1][1] != "ef" || got[0][1] != "c" || got[1][0] != "d" {
+			t.Errorf("m.k = %q", got)
+		}
+	})
+
+	t.Run("a struct in a map with several changed fields", func(t *testing.T) {
+		type item struct {
+			A string `json:"a"`
+			B string `json:"b"`
+			C string `json:"c"`
+		}
+		var v struct {
+			M map[string]item `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"m":{"k":{"a":"p`+esc+`q","b":"plain","c":"r`+esc+`s"}}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		got := v.M["k"]
+		if got.A != "pq" || got.B != "plain" || got.C != "rs" {
+			t.Errorf("m.k = %+v: the lazy rebuild dropped an edit", got)
+		}
+	})
+
+	t.Run("an embedded exported struct still works", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/", strings.NewReader(
+			`{"title":"a`+esc+`b","body":"c`+esc+`d"}`))
+		var v struct {
+			ExportedBase
+			Body string `json:"body"`
+		}
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.Title != "ab" || v.Body != "cd" {
+			t.Errorf("got %+v", v)
+		}
+	})
+
+	// AND AN ORDINARY BODY MUST NOT ALLOCATE A REBUILD. reflect.New on every
+	// request would be a cost paid by everyone for a shape almost nobody sends.
+	t.Run("a clean body takes no rebuild", func(t *testing.T) {
+		type item struct {
+			A string `json:"a"`
+			B string `json:"b"`
+		}
+		v := struct {
+			M map[string]item `json:"m"`
+		}{M: map[string]item{"k": {A: "plain", B: "also plain"}}}
+		if n := testing.AllocsPerRun(20, func() { stripNUL(&v) }); n > 10 {
+			t.Errorf("a clean body allocates %.0f times: a rebuild is being taken "+
+				"when nothing changed", n)
+		}
+	})
+}
+
+// ExportedBase is embedded by the case above; a distinct type so the unexported
+// case keeps testing what it names.
+type ExportedBase struct {
+	Title string `json:"title"`
 }

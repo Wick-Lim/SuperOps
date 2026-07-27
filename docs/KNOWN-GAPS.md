@@ -305,6 +305,14 @@ identical with and without a token — but it is a client-visible contract chang
 on paths nobody thinks about. Kept deliberately: a malformed URL is malformed
 regardless of what it would have routed to.
 
+`storableURL` walks EVERY value of every query key, while handlers use
+`Query().Get(k)`, which returns only the first. So `?q=clean&q=a%00b` is refused
+although the handler would have used `"clean"`. Conservative rather than wrong,
+and left that way: a request carrying an unstorable second value is not one
+anybody sends deliberately, and matching `Get`'s first-only rule would mean the
+guard and the handler disagreeing about what the request contains — which is the
+class of bug that produced the `%00` substring match in the first place.
+
 The CORS layer is assigned outermost, so a preflight is answered before the guard
 runs: `OPTIONS /api/v1/users/search?q=a%00b` returns 204 like any other
 preflight, and the actual request that follows returns 400. Measured. That is

@@ -238,13 +238,22 @@ func storableURL(u *url.URL) bool {
 	}
 	// RawQuery is checked through the same decode the handlers use, so the guard
 	// and the handler cannot disagree about what arrived.
-	q, err := url.ParseQuery(u.RawQuery)
-	if err != nil {
-		// Malformed escapes are the handler's problem, not this one's: it sees
-		// the same empty value either way. Refusing here would turn a request
-		// that works today into a 400.
-		return true
-	}
+	// THE ERROR IS DISCARDED, DELIBERATELY, and returning on it was a full
+	// bypass of this guard.
+	//
+	// url.ParseQuery returns a PARTIAL map alongside its error: the error is
+	// global to the query string — one malformed escape or one semicolon
+	// anywhere sets it — while every well-formed pair is still in the map,
+	// because the stdlib parser continues rather than returning. So
+	// `?q=a%00b&x=%zz` produced an error, the early return here allowed the
+	// whole request, and `q` arrived at the handler carrying the NUL. Seven
+	// extra characters turned the guard off.
+	//
+	// Discarding it is also what makes this agree with the handlers:
+	// (*url.URL).Query() is `v, _ := ParseQuery(...)`, so a handler sees exactly
+	// this partial map. A pair that failed to unescape is not in it, which is
+	// why checking the map cannot refuse a request that works today.
+	q, _ := url.ParseQuery(u.RawQuery)
 	for k, vs := range q {
 		if !storableString(k) {
 			return false

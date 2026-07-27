@@ -305,7 +305,16 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 			return v, false
 		}
 		for i := 0; i < v.Len(); i++ {
-			stripValue(v.Index(i), depth+1)
+			if repl, changed := stripValue(v.Index(i), depth+1); changed {
+				// An ARRAY inside a map is not addressable, so the element the
+				// recursion rebuilt has to be assigned back — discarding it here
+				// silently dropped the strip and left the NUL for Postgres.
+				if v.Index(i).CanSet() {
+					v.Index(i).Set(repl)
+				} else {
+					return rebuiltSequence(v, i, repl, depth), true
+				}
+			}
 		}
 
 	case reflect.Map:
@@ -313,11 +322,36 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 
 	case reflect.Struct:
 		t := v.Type()
+		rebuilt := reflect.Value{}
 		for i := 0; i < v.NumField(); i++ {
-			if !t.Field(i).IsExported() {
+			f := t.Field(i)
+			// An EMBEDDED unexported struct type still has exported fields that
+			// encoding/json fills and promotes, so skipping the whole field left
+			// them unwalked. Descend into it; only a genuinely unexported field
+			// is skipped, and reflect cannot read one anyway.
+			embedded := f.Anonymous && v.Field(i).Kind() == reflect.Struct
+			if !f.IsExported() && !embedded {
 				continue
 			}
-			stripValue(v.Field(i), depth+1)
+			repl, changed := stripValue(v.Field(i), depth+1)
+			if !changed {
+				continue
+			}
+			// A STRUCT inside a map is not addressable either.
+			if v.Field(i).CanSet() {
+				v.Field(i).Set(repl)
+				continue
+			}
+			if !rebuilt.IsValid() {
+				rebuilt = reflect.New(v.Type()).Elem()
+				rebuilt.Set(v)
+			}
+			if rebuilt.Field(i).CanSet() {
+				rebuilt.Field(i).Set(repl)
+			}
+		}
+		if rebuilt.IsValid() {
+			return rebuilt, true
 		}
 	}
 	return v, false
@@ -353,6 +387,12 @@ func stripMap(v reflect.Value, depth int) {
 		}
 	}
 
+	// Applied after the range, so a rewritten key that collides with one already
+	// present WINS: `{"ab":"legit","a\u0000b":"attacker"}` ends as
+	// `{"ab":"attacker"}`, deterministically, regardless of JSON order. Both
+	// values are the caller's own and no route treats a body map key as an
+	// identity, so this decides nothing today — it is written down because the
+	// ordering is not obvious and the opposite would be just as arbitrary.
 	for _, r := range pending {
 		if r.oldKey.String() != r.newKey.String() {
 			v.SetMapIndex(r.oldKey, reflect.Value{})
@@ -372,4 +412,22 @@ func removeNUL(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// rebuiltSequence copies a non-addressable array so one element can be replaced,
+// and finishes stripping the rest.
+//
+// Only arrays reach it: a slice's elements are always addressable, even when the
+// slice itself sits in a map, because the header points at backing storage the
+// map does not own.
+func rebuiltSequence(v reflect.Value, at int, repl reflect.Value, depth int) reflect.Value {
+	out := reflect.New(v.Type()).Elem()
+	reflect.Copy(out, v)
+	out.Index(at).Set(repl)
+	for i := at + 1; i < out.Len(); i++ {
+		if r, changed := stripValue(out.Index(i), depth+1); changed {
+			out.Index(i).Set(r)
+		}
+	}
+	return out
 }

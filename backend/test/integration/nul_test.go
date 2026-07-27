@@ -33,6 +33,11 @@ import (
 // hottest write in the product. The workflow save that surfaced this was the
 // LEAST reachable instance.
 //
+// FIVE of those seven are covered below. Editing a message and creating an
+// invitation are not, because the guard lives in the shared decode funnel and
+// these five already drive every arm of it — said here so the gap is a choice
+// rather than something the comment above quietly overstates.
+//
 // Each case sends the same body twice. The control is what says the request is
 // otherwise well-formed: without it, a route that 400s for an unrelated reason
 // would look like a pass.
@@ -120,10 +125,12 @@ func TestANulInAnyRequestBodyIsStrippedNotAFailure(t *testing.T) {
 			if !ok {
 				t.Errorf("with a NUL = %d, want one of %v: %s", code, c.wantOK, raw)
 			}
-			// And no raw NUL byte echoed back into the response — which would
-			// mean it had been stored and read back.
-			if strings.ContainsRune(string(raw), 0) {
-				t.Errorf("a raw NUL byte is in the response body: %q", raw)
+			// And the byte did not come back. Searching `raw` for a raw NUL
+			// could never fire — json.Marshal writes U+0000 as the six-character
+			// escape — so this looks for the escape instead, which is what a
+			// stored-and-echoed NUL actually renders as.
+			if strings.Contains(string(raw), `\u0000`) {
+				t.Errorf("the response echoes a NUL, so it was stored: %s", raw)
 			}
 
 			// The control: the same request with an ordinary letter in place of
@@ -185,6 +192,32 @@ func TestANulInAQueryParameterIsARejectionNotAFailure(t *testing.T) {
 				t.Errorf("the control = %d, want %d: %s", code, c.wantOK, raw)
 			}
 		})
+	}
+
+	// SEVEN EXTRA CHARACTERS MUST NOT TURN THE GUARD OFF.
+	//
+	// url.ParseQuery returns a PARTIAL map alongside its error, and the error is
+	// global to the query string: one malformed escape or one semicolon anywhere
+	// sets it while every well-formed pair survives in the map. Returning early
+	// on that error allowed the whole request, so appending `&x=%zz` sent the
+	// poisoned pair straight to the handler — all four encodings above went back
+	// to 500.
+	for _, suffix := range []string{"&x=%zz", "&x=a;b", "&x=;", "&%zz=1"} {
+		for _, bad := range []string{"%00", "%ff", "%c0%80"} {
+			path := "/api/v1/users/search?q=a" + bad + "b" + suffix
+			code, body := h.do(t, http.MethodGet, path, admin, nil)
+			if code != http.StatusBadRequest {
+				raw, _ := json.Marshal(body)
+				t.Errorf("%s = %d, want 400: a malformed pair elsewhere in the query "+
+					"disarmed the guard: %s", path, code, raw)
+			}
+		}
+		// And a clean query with the same suffix is still served, so the fix
+		// refuses nothing that worked before.
+		if code, _ := h.do(t, http.MethodGet,
+			"/api/v1/users/search?q=hello"+suffix, admin, nil); code != http.StatusOK {
+			t.Errorf("a clean query with %q = %d, want 200", suffix, code)
+		}
 	}
 
 	// A percent sign a caller genuinely wants is `%2500`, and it must still work
