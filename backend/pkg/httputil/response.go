@@ -253,6 +253,11 @@ func (w *envelopeWriter) Flush() {
 // caller cannot act on: U+0000 renders as nothing, so a user who somehow sent
 // one cannot see what they would be asked to remove.
 //
+// That argument holds for PROSE and not for a KEY, which is why
+// DecodeJSONVerbatim exists and the workflow authoring routes use it. See its
+// doc: repairing a name is what the caller meant, and "repairing" a map key
+// changes which code runs.
+//
 // It works on the DECODED value, not the raw body. Scanning the bytes for the
 // escape is the obvious cheap approach and it is wrong in a way that was
 // measured twice: a body carrying the six ordinary characters of that escape —
