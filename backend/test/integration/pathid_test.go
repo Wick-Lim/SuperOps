@@ -94,3 +94,47 @@ func TestAWellFormedIDIsNotRefusedByTheGuard(t *testing.T) {
 		})
 	}
 }
+
+// AN ID FROM THE BODY IS THE SAME MISTAKE AND THE GUARD CANNOT SEE IT.
+//
+// ValidateIDPathParams reads the matched pattern, so it only ever knows about
+// path segments. Sweeping the request bodies that carry an id found two routes
+// with the same 500 and no path parameter to catch it — one of them the most
+// privileged route in the product.
+//
+// There is no funnel for these on purpose: a body may legitimately carry an id
+// that is not a UUID (an OAuth client_id, an external message id), so the rule
+// that holds for `{*_id}` in the route table does not hold for every `_id` in
+// every body. Two handlers, checked where the field's meaning is known.
+func TestAMistypedIDInTheBodyIsRefusedRatherThanA500(t *testing.T) {
+	h := getHarness(t)
+	owner := h.newTenant(t, "badbodyid")
+	ws := owner.workspaceID
+
+	for _, c := range []struct {
+		name, method, path string
+		body               any
+		want               string
+	}{
+		{"transfer-ownership", http.MethodPost,
+			"/api/v1/workspaces/" + ws + "/transfer-ownership",
+			map[string]string{"user_id": "not-a-uuid"}, "user_id must be a UUID"},
+		{"webhook create", http.MethodPost, "/api/v1/webhooks",
+			map[string]string{"name": "x", "channel_id": "not-a-uuid"},
+			"channel_id must be a UUID"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			code, resp := h.do(t, c.method, c.path, owner.token, c.body)
+			if code >= 500 {
+				t.Fatalf("= %d %+v: a mistyped body id reached Postgres", code, resp.Error)
+			}
+			if code != http.StatusBadRequest {
+				t.Fatalf("= %d, want 400 (%+v)", code, resp.Error)
+			}
+			if resp.Error == nil || resp.Error.Message != c.want {
+				t.Errorf("message = %+v, want %q: the refusal has to name the field",
+					resp.Error, c.want)
+			}
+		})
+	}
+}

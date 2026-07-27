@@ -331,6 +331,13 @@ func (h *Handler) TransferOwnership(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "user_id is required")
 		return
 	}
+	// From the BODY, so ValidateIDPathParams never sees it. Without this the
+	// lookup below fails the uuid cast and a mistyped id answered
+	// `500 internal server error` on the most privileged route in the product.
+	if uuid.Validate(input.UserID) != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "user_id must be a UUID")
+		return
+	}
 
 	owner, err := h.az.IsWorkspaceOwner(r.Context(), wsID, userID)
 	if err != nil {

@@ -106,6 +106,13 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "name and channel_id are required")
 		return
 	}
+	// A channel id from the BODY, which ValidateIDPathParams does not see: it
+	// reaches Postgres as a uuid and a value that is not one came back as
+	// `500 internal server error` for a caller's typo.
+	if uuid.Validate(input.ChannelID) != nil {
+		httputil.JSONError(w, http.StatusBadRequest, "BAD_REQUEST", "channel_id must be a UUID")
+		return
+	}
 	if input.Type == "" {
 		input.Type = typeIncoming
 	}
