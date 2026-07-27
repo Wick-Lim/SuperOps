@@ -327,9 +327,27 @@ func stripValue(v reflect.Value, depth int) (reflect.Value, bool) {
 			f := t.Field(i)
 			// An EMBEDDED unexported struct type still has exported fields that
 			// encoding/json fills and promotes, so skipping the whole field left
-			// them unwalked. Descend into it; only a genuinely unexported field
-			// is skipped, and reflect cannot read one anyway.
-			embedded := f.Anonymous && v.Field(i).Kind() == reflect.Struct
+			// them unwalked. Descend into it — but only when it is ADDRESSABLE,
+			// which is the condition under which the recursion can write in
+			// place.
+			//
+			// Without that clause this PANICKED. reflect marks an embedded field
+			// of unexported type read-only, and while that flag is not inherited
+			// by the struct's own fields — which is why encoding/json can fill
+			// them and why the addressable case works — it is carried by the
+			// field itself. So when the parent is a map value the promoted field
+			// is unsettable, the rebuild path below runs, and `rebuilt.Set(v)`
+			// hits `reflect: reflect.Value.Set using value obtained using
+			// unexported field`. Through RecoveryMiddleware that is a 500 with a
+			// stack — the exact answer this funnel exists to prevent.
+			//
+			// The alternative is copying every non-addressable struct BEFORE
+			// descending, since a fresh reflect.New value has settable promoted
+			// fields. That is a copy on every such struct to reach a shape no
+			// request type in this repo has, so the promoted field of an
+			// embedded unexported type inside a map is left alone instead.
+			embedded := f.Anonymous && v.Field(i).Kind() == reflect.Struct &&
+				v.Field(i).CanAddr()
 			if !f.IsExported() && !embedded {
 				continue
 			}
@@ -420,7 +438,18 @@ func removeNUL(s string) string {
 // Only arrays reach it: a slice's elements are always addressable, even when the
 // slice itself sits in a map, because the header points at backing storage the
 // map does not own.
+//
+// That invariant is asserted rather than assumed. `reflect.New(sliceType).Elem()`
+// is a NIL slice, so reflect.Copy would move nothing and the Index below would
+// panic with an index out of range — a load-bearing assumption failing as a
+// crash rather than as a wrong answer.
 func rebuiltSequence(v reflect.Value, at int, repl reflect.Value, depth int) reflect.Value {
+	if v.Kind() != reflect.Array {
+		// A slice here means the invariant above is wrong. Leaving the value
+		// alone is the safe answer: the NUL survives to Postgres, which is the
+		// behaviour before this function existed, rather than a panic.
+		return v
+	}
 	out := reflect.New(v.Type()).Elem()
 	reflect.Copy(out, v)
 	out.Index(at).Set(repl)

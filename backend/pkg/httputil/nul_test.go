@@ -533,17 +533,34 @@ func TestRebuiltContainersKeepEveryEdit(t *testing.T) {
 
 	// AND AN ORDINARY BODY MUST NOT ALLOCATE A REBUILD. reflect.New on every
 	// request would be a cost paid by everyone for a shape almost nobody sends.
+	//
+	// The bound is derived from the payload rather than picked: reflect's map
+	// iteration costs about two allocations per entry and nothing else here
+	// allocates, so anything above that is a rebuild. A one-entry map with a
+	// bound of 10 could not see this — an unconditional reflect.New on every
+	// struct passed it, because there was only one struct and 2.5x of slack.
 	t.Run("a clean body takes no rebuild", func(t *testing.T) {
 		type item struct {
 			A string `json:"a"`
 			B string `json:"b"`
 		}
+		const entries = 200
+		m := make(map[string]item, entries)
+		for i := 0; i < entries; i++ {
+			m[fmt.Sprintf("k%d", i)] = item{A: "plain", B: "also plain"}
+		}
 		v := struct {
 			M map[string]item `json:"m"`
-		}{M: map[string]item{"k": {A: "plain", B: "also plain"}}}
-		if n := testing.AllocsPerRun(20, func() { stripNUL(&v) }); n > 10 {
-			t.Errorf("a clean body allocates %.0f times: a rebuild is being taken "+
-				"when nothing changed", n)
+		}{M: m}
+
+		got := testing.AllocsPerRun(20, func() { stripNUL(&v) })
+		// Two per entry for MapIter, plus a handful of slack for the walk
+		// itself. A rebuild per struct would add another 200.
+		const bound = 2*entries + 20
+		t.Logf("%d entries: %.0f allocs", entries, got)
+		if got > bound {
+			t.Errorf("a clean %d-entry body allocates %.0f times, over %d: a "+
+				"rebuild is being taken when nothing changed", entries, got, bound)
 		}
 	})
 }
@@ -552,4 +569,74 @@ func TestRebuiltContainersKeepEveryEdit(t *testing.T) {
 // case keeps testing what it names.
 type ExportedBase struct {
 	Title string `json:"title"`
+}
+
+// AN EMBEDDED UNEXPORTED TYPE INSIDE A MAP MUST NOT PANIC.
+//
+// reflect marks an embedded field of unexported type read-only. That flag is not
+// inherited by the struct's own fields — which is why encoding/json fills them
+// and why the addressable case above works — but the FIELD carries it. So when
+// the parent is a map value the promoted field is unsettable, the struct arm
+// takes its rebuild path, and `rebuilt.Set(v)` panics with "reflect.Value.Set
+// using value obtained using unexported field".
+//
+// Through RecoveryMiddleware that is a 500 with a logged stack — the exact
+// answer this funnel exists to prevent, arrived at by the funnel itself. The
+// descent is gated on addressability now, so this shape degrades to what it did
+// before: the promoted field is left alone, the rest is stripped.
+func TestAnEmbeddedUnexportedTypeInAMapDoesNotPanic(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	for _, c := range []struct {
+		name   string
+		body   string
+		decode func() (any, func(*testing.T))
+	}{
+		{
+			name: "a struct with an embedded unexported type",
+			body: `{"m":{"k":{"title":"a` + esc + `b","body":"c` + esc + `d"}}}`,
+			decode: func() (any, func(*testing.T)) {
+				v := &struct {
+					M map[string]outerWithEmbedded `json:"m"`
+				}{}
+				return v, func(t *testing.T) {
+					if v.M["k"].Body != "cd" {
+						t.Errorf("body = %q, want %q — the reachable half was not "+
+							"stripped either", v.M["k"].Body, "cd")
+					}
+				}
+			},
+		},
+		{
+			name: "an array of them",
+			body: `{"m":{"k":[{"title":"a` + esc + `b","body":"c` + esc + `d"}]}}`,
+			decode: func() (any, func(*testing.T)) {
+				v := &struct {
+					M map[string][1]outerWithEmbedded `json:"m"`
+				}{}
+				return v, func(t *testing.T) {
+					if v.M["k"][0].Body != "cd" {
+						t.Errorf("body = %q, want %q", v.M["k"][0].Body, "cd")
+					}
+				}
+			},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			v, check := c.decode()
+			req := httptest.NewRequest("POST", "/", strings.NewReader(c.body))
+			// A panic here is the regression; t.Fatal on it rather than letting
+			// the whole package die.
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("stripping panicked: %v\nthis reaches a caller as a "+
+						"500 with a stack, through the guard meant to stop 500s", r)
+				}
+			}()
+			if err := DecodeJSON(req, v); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			check(t)
+		})
+	}
 }
