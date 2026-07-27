@@ -128,3 +128,38 @@ func TestAPercentEncodedUUIDIsAccepted(t *testing.T) {
 			"instead of the value the handler will read", w.Code, http.StatusNoContent)
 	}
 }
+
+// A WILDCARD ROUTE STILL CHECKS THE ID IN FRONT OF IT.
+//
+// No route here uses `{name...}` today, which is why this exists: the first one
+// somebody adds should not quietly stop the id before it being checked.
+//
+// Written first with an explicit stop for wildcards in the walk and a comment
+// explaining what it prevented. Removing that stop failed nothing, because
+// ServeMux only allows `{name...}` as the LAST segment — there is never a later
+// parameter for it to misalign, and `rest...` does not end in `_id` so it is
+// skipped like any other non-id name. The stop went; these cases stayed.
+func TestATrailingWildcardStopsTheWalk(t *testing.T) {
+	const id = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	h := muxFor("GET /api/v1/files/{file_id}/raw/{rest...}")
+
+	for _, c := range []struct {
+		name, path string
+		want       int
+	}{
+		{"a good id before the wildcard", "/api/v1/files/" + id + "/raw/a/b/c",
+			http.StatusNoContent},
+		{"a bad id before the wildcard", "/api/v1/files/nope/raw/a/b/c",
+			http.StatusBadRequest},
+		{"the wildcard swallowing something id-shaped", "/api/v1/files/" + id + "/raw/not-a-uuid",
+			http.StatusNoContent},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest("GET", c.path, nil))
+			if w.Code != c.want {
+				t.Errorf("%s = %d, want %d", c.path, w.Code, c.want)
+			}
+		})
+	}
+}

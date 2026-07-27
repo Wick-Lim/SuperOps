@@ -73,32 +73,55 @@ func badIDParam(mux *http.ServeMux, r *http.Request) (string, bool) {
 	// therefore compares a parameter name with whatever value happens to sit at
 	// that index. Measured both ways: it refused a valid id and let an invalid
 	// one through into the 500 this exists to prevent.
-	pathSegs := strings.Split(strings.TrimPrefix(r.URL.EscapedPath(), "/"), "/")
-	patSegs := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
+	//
+	// Walked in lockstep rather than split into two slices. This runs on every
+	// request in the product, and the pair of splits was three quarters of the
+	// garbage it produced — 192 B/op and 4 allocs against the bare mux's 16 and
+	// 1. Walking costs nothing extra to read and brings that back to one.
+	pat := strings.TrimPrefix(pattern, "/")
+	path := strings.TrimPrefix(r.URL.EscapedPath(), "/")
 
-	for i, seg := range patSegs {
-		if !strings.HasPrefix(seg, "{") || !strings.HasSuffix(seg, "}") {
+	for pat != "" {
+		var seg, value string
+		seg, pat = nextSegment(pat)
+		value, path = nextSegment(path)
+
+		if len(seg) < 2 || seg[0] != '{' || seg[len(seg)-1] != '}' {
 			continue
 		}
+		// A trailing wildcard needs no special case: ServeMux only allows
+		// `{name...}` as the LAST segment, so there is never a later parameter
+		// to be misaligned by what it swallows — and `rest...` does not end in
+		// `_id`, so it is skipped like any other non-id name. An explicit stop
+		// here was unreachable, and removing it changed no test.
 		name := seg[1 : len(seg)-1]
-		// A trailing wildcard swallows the rest of the path and is not an id.
-		if strings.HasSuffix(name, "...") {
-			return "", false
-		}
-		if !strings.HasSuffix(name, "_id") || i >= len(pathSegs) {
+		if !strings.HasSuffix(name, "_id") {
 			continue
 		}
 		// Validate what the HANDLER will read. Every character of a UUID is
 		// unreserved, so nothing legitimate needs escaping — but nothing stops
 		// a client escaping it anyway, and refusing that would be a 400 for a
 		// perfectly good id. An undecodable segment never reached a route.
-		value, err := url.PathUnescape(pathSegs[i])
+		//
+		// PathUnescape allocates only when there is an escape to undo, which
+		// for a UUID there is not.
+		decoded, err := url.PathUnescape(value)
 		if err != nil {
 			return name, true
 		}
-		if uuid.Validate(value) != nil {
+		if uuid.Validate(decoded) != nil {
 			return name, true
 		}
 	}
 	return "", false
+}
+
+// nextSegment splits off the text before the first '/' and returns it with the
+// remainder. A path shorter than its pattern yields empty values, which fail
+// the UUID check like any other malformed id.
+func nextSegment(s string) (seg, rest string) {
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		return s[:i], s[i+1:]
+	}
+	return s, ""
 }
