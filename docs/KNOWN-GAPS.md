@@ -305,6 +305,15 @@ identical with and without a token — but it is a client-visible contract chang
 on paths nobody thinks about. Kept deliberately: a malformed URL is malformed
 regardless of what it would have routed to.
 
+The CORS layer is assigned outermost, so a preflight is answered before the guard
+runs: `OPTIONS /api/v1/users/search?q=a%00b` returns 204 like any other
+preflight, and the actual request that follows returns 400. Measured. That is
+defensible — a preflight answers a question about CORS policy, not about whether
+the URL is storable — but it means a browser learns the request is refused one
+round trip later than it could. `GET /metrics?a=%00` is 400 for the same reason
+`/health` is, which is worth knowing before pointing a scraper at it with a
+templated query.
+
 **Two assertions depend on invariants they cannot enforce.**
 `TestANulRefusalStillCarriesACorrelationID` reads a process-global 4xx counter and
 depends on the integration package being sequential — `t.Parallel()` appears

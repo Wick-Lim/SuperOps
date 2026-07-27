@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -192,15 +194,16 @@ func redactPath(path string) string {
 // unencoded.
 func RejectNULInURL(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if hasEncodedNULInURL(r.URL.RawQuery) || hasEncodedNULInURL(r.URL.EscapedPath()) {
+		if !storableURL(r.URL) {
 			// BAD_REQUEST, not INVALID_BODY: there is no body involved, and
 			// BAD_REQUEST is what 138 other refusals in this codebase use.
 			// Inventing a code for one middleware would give clients something
 			// new to handle for no gain.
 			HandleError(w, &AppError{
-				Status:  http.StatusBadRequest,
-				Code:    "BAD_REQUEST",
-				Message: "the URL contains a NUL character (U+0000), which cannot be stored",
+				Status: http.StatusBadRequest,
+				Code:   "BAD_REQUEST",
+				Message: "the URL contains bytes that are not valid UTF-8 and " +
+					"cannot be stored",
 			})
 			return
 		}
@@ -208,6 +211,53 @@ func RejectNULInURL(next http.Handler) http.Handler {
 	})
 }
 
-func hasEncodedNULInURL(s string) bool {
-	return strings.Contains(s, "%00") || strings.ContainsRune(s, 0)
+// storableURL reports whether a URL's decoded path and query are text Postgres
+// can hold.
+//
+// IT CHECKS THE CLASS, NOT ONE SPELLING. A first version matched the literal
+// `%00`, reasoning that it is the only spelling of the NUL byte in a URL. That
+// is true about the byte and wrong about the bug: the failure is not "a NUL", it
+// is "a byte sequence a text column cannot store", and Postgres refuses all of
+// them with the same SQLSTATE 22021. Measured on `GET /api/v1/users/search`,
+// each one byte from a control that returns 200:
+//
+//	?q=a%00b    -> 22021, invalid byte sequence 0x00
+//	?q=a%ffb    -> 22021, invalid byte sequence 0xff
+//	?q=%c0%80   -> 22021, invalid byte sequence 0xc0 0x80
+//
+// The last is an overlong encoding of U+0000 — the same character the guard was
+// written for, spelled so a substring match cannot see it.
+//
+// Checking the DECODED form also removes the one disagreement the spelling match
+// had with reality: `?q=a%%00b` is a malformed escape that url.ParseQuery drops
+// entirely, so the handler saw an empty q while the guard announced a NUL that
+// was never delivered.
+func storableURL(u *url.URL) bool {
+	if !utf8.ValidString(u.Path) || strings.ContainsRune(u.Path, 0) {
+		return false
+	}
+	// RawQuery is checked through the same decode the handlers use, so the guard
+	// and the handler cannot disagree about what arrived.
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		// Malformed escapes are the handler's problem, not this one's: it sees
+		// the same empty value either way. Refusing here would turn a request
+		// that works today into a 400.
+		return true
+	}
+	for k, vs := range q {
+		if !storableString(k) {
+			return false
+		}
+		for _, v := range vs {
+			if !storableString(v) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func storableString(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
 }

@@ -1,6 +1,7 @@
 package httputil
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -9,95 +10,164 @@ import (
 	"testing"
 )
 
-// THE DECODE FUNNEL REFUSES U+0000, AND SAYS WHICH FIELD.
+// THE DECODE FUNNEL REMOVES U+0000 FROM EVERY STRING IN A REQUEST BODY.
 //
 // It is legal JSON and no Postgres text or jsonb column can store it, so every
 // route that wrote a caller's string answered 500 for a body that is simply
-// unstorable — measured on seven of them, including posting a channel message.
+// unstorable — measured on seven of them, including posting a channel message,
+// which is the hottest write in the product.
 //
 // The guard lives here rather than in each handler because the invariant is a
 // property of the storage layer, and because a route written next year gets it
 // without anyone remembering.
-func TestDecodeRejectsNUL(t *testing.T) {
+//
+// It STRIPS rather than refuses, which is what this codebase had already decided
+// twice: mailbox.safeFilename and webhook.sanitizeName both map every rune below
+// 0x20 to -1 because their input is attacker-supplied. Refusing ran before both
+// of them — see TestStrippingKeepsSanitisedPathsWorking.
+func TestDecodeStripsNUL(t *testing.T) {
 	type nested struct {
 		Deep string `json:"deep"`
 	}
 	type body struct {
-		Name    string         `json:"name"`
-		Tags    []string       `json:"tags"`
-		Config  map[string]any `json:"config"`
-		Child   *nested        `json:"child"`
-		Ignored string         `json:"-"`
+		Name   string         `json:"name"`
+		Tags   []string       `json:"tags"`
+		Config map[string]any `json:"config"`
+		Child  *nested        `json:"child"`
 	}
 
 	// The escape, assembled so this source file holds no NUL of its own.
 	esc := "\\u" + "0000"
 
 	cases := []struct {
-		name      string
-		json      string
-		wantField string // "" means it must be accepted
+		name  string
+		json  string
+		check func(*testing.T, body)
 	}{
-		{"a plain string field", `{"name":"a` + esc + `b"}`, "name"},
-		{"an element of a slice", `{"tags":["ok","a` + esc + `b"]}`, "tags[1]"},
-		{"a value inside a map", `{"config":{"k":"a` + esc + `b"}}`, "config.k"},
-		{"a KEY inside a map", `{"config":{"a` + esc + `b":1}}`, "config"},
-		{"a value nested two deep", `{"config":{"a":{"b":"x` + esc + `"}}}`, "config.a.b"},
-		{"a field behind a pointer", `{"child":{"deep":"a` + esc + `b"}}`, "child.deep"},
+		{"a plain string field", `{"name":"a` + esc + `b"}`, func(t *testing.T, v body) {
+			if v.Name != "ab" {
+				t.Errorf("name = %q, want %q", v.Name, "ab")
+			}
+		}},
+		{"an element of a slice", `{"tags":["ok","a` + esc + `b"]}`, func(t *testing.T, v body) {
+			if len(v.Tags) != 2 || v.Tags[1] != "ab" {
+				t.Errorf("tags = %q", v.Tags)
+			}
+		}},
+		{"a value inside a map", `{"config":{"k":"a` + esc + `b"}}`, func(t *testing.T, v body) {
+			if v.Config["k"] != "ab" {
+				t.Errorf("config[k] = %v", v.Config["k"])
+			}
+		}},
+		{"a KEY inside a map", `{"config":{"a` + esc + `b":1}}`, func(t *testing.T, v body) {
+			if _, ok := v.Config["ab"]; !ok {
+				t.Errorf("config = %v, want the key rewritten to \"ab\"", v.Config)
+			}
+			for k := range v.Config {
+				if strings.ContainsRune(k, 0) {
+					t.Errorf("a key still carries a NUL: %q", k)
+				}
+			}
+		}},
+		{"a value nested two deep", `{"config":{"a":{"b":"x` + esc + `"}}}`, func(t *testing.T, v body) {
+			inner, _ := v.Config["a"].(map[string]any)
+			if inner["b"] != "x" {
+				t.Errorf("config.a.b = %v, want %q", inner["b"], "x")
+			}
+		}},
+		{"an element of an array inside a map", `{"config":{"a":["p` + esc + `q"]}}`,
+			func(t *testing.T, v body) {
+				arr, _ := v.Config["a"].([]any)
+				if len(arr) != 1 || arr[0] != "pq" {
+					t.Errorf("config.a = %v", arr)
+				}
+			}},
+		{"a field behind a pointer", `{"child":{"deep":"a` + esc + `b"}}`, func(t *testing.T, v body) {
+			if v.Child == nil || v.Child.Deep != "ab" {
+				t.Errorf("child = %+v", v.Child)
+			}
+		}},
 
-		// MUST BE ACCEPTED: the six ordinary characters of the escape, which is
-		// what a Windows path or a regex carries. An earlier version of this
-		// check elsewhere searched the ENCODED form and refused these, telling
-		// the caller their input held a character that was not in it.
-		{"a literal backslash-u-0000", `{"name":"C:\\u0000-not-a-nul"}`, ""},
-		{"an ordinary body", `{"name":"hello","tags":["a"],"config":{"k":1}}`, ""},
+		// MUST BE LEFT ALONE: the six ordinary characters of the escape, which
+		// is what a Windows path or a regex carries. A check that searched the
+		// ENCODED form matched these, because encoding/json escapes a backslash
+		// too — as a refusal it told callers their input held a character that
+		// was not in it, and as a stripper it would silently delete text.
+		{"a literal backslash-u-0000", `{"name":"C:\\u0000-not-a-nul"}`, func(t *testing.T, v body) {
+			if v.Name != `C:\u0000-not-a-nul` {
+				t.Errorf("name = %q; a literal escape was mangled", v.Name)
+			}
+		}},
+		{"an ordinary body", `{"name":"hello","tags":["a"],"config":{"k":1}}`,
+			func(t *testing.T, v body) {
+				if v.Name != "hello" || len(v.Tags) != 1 || v.Config["k"] != float64(1) {
+					t.Errorf("an ordinary body was altered: %+v", v)
+				}
+			}},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var v body
 			req := httptest.NewRequest("POST", "/", strings.NewReader(c.json))
-			err := DecodeJSON(req, &v)
-
-			if c.wantField == "" {
-				if err != nil {
-					t.Fatalf("refused a body with no NUL in it: %v", err)
-				}
-				return
+			if err := DecodeJSON(req, &v); err != nil {
+				t.Fatalf("decode: %v", err)
 			}
-			if err == nil {
-				t.Fatal("accepted a body containing U+0000; the INSERT would answer 500")
-			}
-			appErr, ok := err.(*AppError)
-			if !ok {
-				t.Fatalf("error is %T, want *AppError", err)
-			}
-			if appErr.Status != 400 {
-				t.Errorf("status = %d, want 400", appErr.Status)
-			}
-			if !strings.Contains(appErr.Message, c.wantField) {
-				t.Errorf("message %q does not name the field %q", appErr.Message, c.wantField)
-			}
-			if !strings.Contains(appErr.Message, "NUL") {
-				t.Errorf("message %q does not say what is wrong", appErr.Message)
-			}
-			if strings.ContainsRune(appErr.Message, 0) {
-				t.Errorf("the message echoes the raw NUL back: %q", appErr.Message)
-			}
+			c.check(t, v)
 		})
 	}
 }
 
-// DEEP NESTING WAS A BYPASS, NOT A BOUND.
+// STRIPPING IS WHAT KEEPS TWO SANITISED PATHS WORKING.
 //
-// The walk stopped at depth 64 and returned "nothing found", so a NUL far enough
-// down passed as clean. Two units go per JSON object level (Interface, then
-// Map), which put the real ceiling at 32 objects — and the comment justifying it
-// claimed encoding/json refuses deeply nested input, which it does at 10,000,
-// not 64. So there were ~9,968 levels the decoder accepted and the walk declined
-// to look at.
-func TestADeeplyNestedNULIsStillFound(t *testing.T) {
-	for _, depth := range []int{5, 32, 40, 200, 1000} {
+// An earlier version REFUSED, which ran before the handler-level sanitisers that
+// already strip every rune below 0x20 — so a webhook whose display name carried
+// a NUL went from posting to `400 "text is required"`, and an inbound customer
+// email with a NUL in an attachment filename went from being filed to being
+// rejected, which let a sender make a customer's message disappear by naming a
+// file carefully.
+//
+// Both fields are decoded through this funnel, so this is what they see: the NUL
+// goes, everything else survives, and the handler's own sanitiser then does its
+// job on a value it recognises.
+func TestStrippingKeepsSanitisedPathsWorking(t *testing.T) {
+	esc := "\\u" + "0000"
+	var v struct {
+		Filename string `json:"filename"`
+		Username string `json:"username"`
+		Text     string `json:"text"`
+	}
+	body := `{"filename":"../../etc/passwd` + esc + `\r\nX-Injected: yes",` +
+		`"username":"build` + esc + `bot","text":"deploy finished"}`
+	req := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	if err := DecodeJSON(req, &v); err != nil {
+		t.Fatalf("a body a sanitiser would have handled was refused: %v", err)
+	}
+	if strings.ContainsRune(v.Filename, 0) || strings.ContainsRune(v.Username, 0) {
+		t.Fatal("a NUL survived the funnel")
+	}
+	// Everything the sanitisers exist to handle must still reach them.
+	if !strings.Contains(v.Filename, "../../etc/passwd") ||
+		!strings.Contains(v.Filename, "X-Injected") {
+		t.Errorf("filename = %q: the funnel removed more than the NUL, so the "+
+			"sanitiser is no longer tested against what it is for", v.Filename)
+	}
+	if v.Username != "buildbot" {
+		t.Errorf("username = %q, want %q", v.Username, "buildbot")
+	}
+	if v.Text != "deploy finished" {
+		t.Errorf("text = %q: an untouched field was altered", v.Text)
+	}
+}
+
+// DEEP NESTING IS NOT A BYPASS.
+//
+// An earlier version stopped at depth 64 and reported "nothing found", so a NUL
+// far enough down survived: two units go per JSON object level, which put the
+// real ceiling at 32 objects, and the comment justifying it claimed
+// encoding/json refuses deeply nested input — which it does at 10,000, not 64.
+func TestADeeplyNestedNULIsStillRemoved(t *testing.T) {
+	for _, depth := range []int{5, 32, 40, 200, 1000, 9000} {
 		t.Run(fmt.Sprintf("%d levels", depth), func(t *testing.T) {
 			esc := "\\u" + "0000"
 			body := `"a` + esc + `b"`
@@ -108,56 +178,78 @@ func TestADeeplyNestedNULIsStillFound(t *testing.T) {
 				Config map[string]any `json:"config"`
 			}
 			req := httptest.NewRequest("POST", "/", strings.NewReader(`{"config":`+body+`}`))
-			err := DecodeJSON(req, &v)
-			if err == nil {
-				t.Fatalf("a NUL %d levels deep was accepted; the INSERT would answer 500", depth)
+			if err := DecodeJSON(req, &v); err != nil {
+				t.Fatalf("decode: %v", err)
 			}
-			if !strings.Contains(err.Error(), "NUL") {
-				t.Errorf("refused for the wrong reason: %v", err)
+			cur := any(v.Config)
+			for i := 0; i < depth; i++ {
+				m, ok := cur.(map[string]any)
+				if !ok {
+					t.Fatalf("level %d is %T", i, cur)
+				}
+				cur = m["d"]
+			}
+			if cur != "ab" {
+				t.Errorf("the leaf %d levels down is %v, want %q — the walk stopped "+
+					"short, so the NUL reaches Postgres and the route answers 500",
+					depth, cur, "ab")
 			}
 		})
 	}
 }
 
-// EXCEEDING THE BOUND REFUSES. "I could not finish checking" is not "there is
-// nothing here", and returning the same answer for both is what made the old
-// limit a hole. Driven below the funnel because encoding/json will not build a
-// value this deep.
-func TestExceedingTheWalkDepthRefuses(t *testing.T) {
-	var v any = "leaf"
-	for i := 0; i < maxNULWalkDepth+10; i++ {
-		v = map[string]any{"d": v}
+// A BINARY FIELD IS NEITHER ALTERED NOR WALKED BYTE BY BYTE.
+//
+// internal/collab decodes `Update []byte` through this funnel — a Yjs CRDT
+// update, binary and routinely full of NUL bytes. Two things must hold: the
+// bytes survive exactly, because stripping them corrupts the document; and it
+// does not cost a reflect call per byte, which measured 16.8ms per 256 KiB.
+func TestABinaryFieldIsNeitherAlteredNorWalkedPerByte(t *testing.T) {
+	var input struct {
+		Update []byte `json:"update"`
 	}
-	if err := rejectNUL(v); err == nil {
-		t.Error("a value too deep to check was reported clean")
-	} else if !strings.Contains(err.Error(), "nested too deeply") {
-		t.Errorf("the refusal does not say why: %v", err)
+	raw := make([]byte, 256<<10)
+	for i := range raw {
+		if i%3 == 0 {
+			raw[i] = 0
+		} else {
+			raw[i] = byte(i)
+		}
+	}
+	body := fmt.Sprintf(`{"update":%q}`, base64.StdEncoding.EncodeToString(raw))
+
+	req := httptest.NewRequest("POST", "/", strings.NewReader(body))
+	if err := DecodeJSONLimit(req, &input, 4<<20); err != nil {
+		t.Fatalf("a binary field was refused: %v", err)
+	}
+	if len(input.Update) != len(raw) {
+		t.Fatalf("the binary field lost %d bytes: NULs were stripped from a CRDT "+
+			"update, which corrupts the document", len(raw)-len(input.Update))
+	}
+	for i := range raw {
+		if input.Update[i] != raw[i] {
+			t.Fatalf("byte %d changed from %d to %d", i, raw[i], input.Update[i])
+		}
+	}
+
+	allocs := testing.AllocsPerRun(5, func() { stripNUL(&input) })
+	if allocs > 50 {
+		t.Errorf("stripping a 256 KiB binary field allocates %.0f times: the "+
+			"byte-slice skip is gone, so every collab update pays per byte", allocs)
 	}
 }
 
-// THE PATH IS BUILT ON THE WAY OUT, so a clean body allocates nothing for it. It was built eagerly for every element and discarded: four allocations per
-// map key, +480µs and +20,000 allocations on a 5,000-key config — the exact
-// payload the workflow size test posts.
-func TestTheWalkCostsLessThanTheDecodeItGuards(t *testing.T) {
+// A CLEAN BODY IS NOT COPIED — the overwhelmingly common case, and the one the
+// cost has to be judged on.
+func TestACleanBodyIsNotCopied(t *testing.T) {
 	cfg := make(map[string]any, 5000)
 	for i := 0; i < 5000; i++ {
-		cfg[fmt.Sprintf("k%d", i)] = i
+		cfg[fmt.Sprintf("k%d", i)] = fmt.Sprintf("value-%d", i)
 	}
 	v := struct {
 		Config map[string]any `json:"config"`
 	}{Config: cfg}
 
-	walk := testing.AllocsPerRun(20, func() { _ = rejectNUL(&v) })
-
-	// The bar is the DECODE of the same body, which is the work the guard is
-	// attached to. A guard that allocates more than the thing it guards is in
-	// the wrong place; one that allocates less is proportionate. An absolute
-	// number would only encode this machine.
-	//
-	// Reflect map iteration is not free — each Value costs a boxing allocation —
-	// so zero was never available. What was available is not ALSO building a
-	// path string per element, which the eager version did: four allocations per
-	// key, +480µs and +20,000 allocations on this exact body.
 	body, err := json.Marshal(v)
 	if err != nil {
 		t.Fatal(err)
@@ -168,214 +260,32 @@ func TestTheWalkCostsLessThanTheDecodeItGuards(t *testing.T) {
 		}
 		_ = json.Unmarshal(body, &x)
 	})
-
+	walk := testing.AllocsPerRun(20, func() { stripNUL(&v) })
 	t.Logf("walk %.0f allocs, decode %.0f allocs", walk, decode)
+
+	// The bar is the DECODE it is attached to: a guard that allocates more than
+	// the thing it guards is in the wrong place. An absolute number would only
+	// encode this machine.
 	if walk > decode {
-		t.Errorf("the walk allocates %.0f times against the decode's %.0f: it is "+
-			"building a path per element again", walk, decode)
+		t.Errorf("the walk allocates %.0f times against the decode's %.0f", walk, decode)
 	}
 }
 
-// A CALLER-CONTROLLED KEY IS BOUNDED AND SCRUBBED IN THE MESSAGE.
+// STRIPPING DOES NOT COPY TEXT IT LEAVES ALONE.
 //
-// A 100,000-character map key produced a 100 KB error body — an amplification
-// primitive, and a large allocation on the path least worth spending one on.
-// Control characters landed in it verbatim; safe only because the JSON encoder
-// escapes them, which is not a property this should rely on.
-func TestTheRefusalDoesNotEchoAnUnboundedKey(t *testing.T) {
-	esc := "\\u" + "0000"
-	long := strings.Repeat("K", 100000)
-	req := httptest.NewRequest("POST", "/", strings.NewReader(
-		`{"config":{"`+long+`":"a`+esc+`b"}}`))
-	var v struct {
-		Config map[string]any `json:"config"`
-	}
-	err := DecodeJSON(req, &v)
-	if err == nil {
-		t.Fatal("accepted a body containing U+0000")
-	}
-	if n := len(err.Error()); n > 500 {
-		t.Errorf("the refusal is %d bytes; a caller sets its size", n)
-	}
-
-	// THE OTHER AXIS. Capping each segment at 64 did not cap how many segments
-	// there are: `config.a.a.a…` nested ten thousand deep — a 60 KB body the
-	// decoder accepts — produced a 20 KB path. Same primitive, different shape.
-	deep := `"a` + esc + `b"`
-	for i := 0; i < 5000; i++ {
-		deep = `{"aaaaaaaa":` + deep + `}`
-	}
-	// A FRESH VALUE. Reusing `v` merged this body into the map the failed decode
-	// above had already populated, so the walk could hit the long-key entry
-	// first — map iteration order is random — and report a short path. The
-	// assertion then passed for a reason that had nothing to do with the bound,
-	// and the mutation that removes the bound did not fail it.
-	var deepV struct {
-		Config map[string]any `json:"config"`
-	}
-	req = httptest.NewRequest("POST", "/", strings.NewReader(`{"config":`+deep+`}`))
-	err = DecodeJSON(req, &deepV)
-	if err == nil {
-		t.Fatal("accepted a body containing U+0000")
-	}
-	if n := len(err.Error()); n > 500 {
-		t.Errorf("a %d-level path produced a %d-byte refusal; the assembled path "+
-			"is not bounded, only its segments are", 5000, n)
-	}
-	if !strings.ContainsRune(err.Error(), '…') {
-		t.Errorf("the truncated path does not say it was truncated: %q", err.Error())
-	}
-
-	// And a key carrying control characters does not put them in the message.
-	//
-	// A FRESH VALUE for the same reason as above, and it was measured: reusing
-	// `v` left the 100,000-"K" entry in the map, encoding/json merged this body
-	// into it rather than replacing it, and with two NUL-carrying entries map
-	// order picked the winner. Removing the control-character scrubbing failed
-	// this assertion 5 times in 50 — 90% ineffective.
-	var ctrlV struct {
-		Config map[string]any `json:"config"`
-	}
-	req = httptest.NewRequest("POST", "/", strings.NewReader(
-		`{"config":{"a\r\nX-Injected: 1":"a`+esc+`b"}}`))
-	err = DecodeJSON(req, &ctrlV)
-	if err == nil {
-		t.Fatal("accepted a body containing U+0000")
-	}
-	if strings.ContainsAny(err.Error(), "\r\n") {
-		t.Errorf("control characters from a map key are in the message: %q", err.Error())
-	}
-}
-
-// THE FAIL-CLOSED BOUND MUST NOT BE REACHABLE THROUGH THE DECODER, AND MUST NOT
-// BLOW THE STACK BEFORE IT IS REACHED.
-//
-// The bound is 20,000 and encoding/json refuses past 10,000, so a body the
-// decoder accepts can never trip the refusal — but 10,000 frames of recursion is
-// real, and a goroutine stack that overflows is a crash, not a 400.
-func TestTheDecoderCannotReachTheFailClosedBound(t *testing.T) {
-	// Deepest the decoder will build, minus a margin.
-	const deep = 9000
-	body := `"leaf"`
-	for i := 0; i < deep; i++ {
-		body = `{"d":` + body + `}`
-	}
-	var v struct {
-		Config map[string]any `json:"config"`
-	}
-	req := httptest.NewRequest("POST", "/", strings.NewReader(`{"config":`+body+`}`))
-	if err := DecodeJSON(req, &v); err != nil {
-		t.Fatalf("a %d-deep body the decoder accepts was refused: %v", deep, err)
-	}
-
-	// And the same body with a NUL at the bottom is caught, not passed.
-	esc := "\\u" + "0000"
-	body = `"a` + esc + `b"`
-	for i := 0; i < deep; i++ {
-		body = `{"d":` + body + `}`
-	}
-	req = httptest.NewRequest("POST", "/", strings.NewReader(`{"config":`+body+`}`))
-	err := DecodeJSON(req, &v)
-	if err == nil {
-		t.Fatalf("a NUL %d levels deep was accepted", deep)
-	}
-	if strings.Contains(err.Error(), "deeply") {
-		t.Errorf("the bound fired on a body the decoder accepted: %v", err)
-	}
-}
-
-// THE DEPTH MARKER MUST NOT BE FORGEABLE FROM A MAP KEY.
-//
-// rejectNUL distinguishes "I stopped looking" from "I found one here" by the
-// suffix findNUL returns. A caller controls map keys, so a key spelling that
-// suffix would make an ordinary refusal claim the body was too deeply nested —
-// a wrong explanation for a request the caller can otherwise account for.
-func TestTheDepthMarkerCannotBeForged(t *testing.T) {
-	esc := "\\u" + "0000"
-	// The key is the marker's own text, and the NUL is in its value.
-	body := `{"config":{"(nested too deeply to check)":"a` + esc + `b"}}`
-	var v struct {
-		Config map[string]any `json:"config"`
-	}
-	err := DecodeJSON(httptest.NewRequest("POST", "/", strings.NewReader(body)), &v)
-	if err == nil {
-		t.Fatal("accepted a body containing U+0000")
-	}
-	// The phrase itself is expected here — it is the caller's own key, echoed
-	// back as the field name. What must not happen is the DEDICATED depth
-	// sentence, which claims something about the body's shape.
-	if strings.HasPrefix(err.Error(), "the request body is nested too deeply") {
-		t.Errorf("a map key forged the depth refusal: %q", err.Error())
-	}
-	if !strings.Contains(err.Error(), "config.(nested too deeply to check) contains a NUL") {
-		t.Errorf("the refusal does not name the field: %q", err.Error())
-	}
-}
-
-// THE FIELD THE CALLER MUST CHANGE SURVIVES ANY NUMBER OF LONG ANCESTORS.
-//
-// The message is bounded, so something has to go when the path is long — and it
-// must not be the leaf, which is the only part the caller can act on.
-//
-// Truncating from the head made that a function of two coupled constants: with a
-// 64-rune per-segment cap and a 200-byte total, the leaf survived one long
-// ancestor and two, and was lost at three. 64 was not a principled number, it
-// was the largest value for which two still fit. Keeping the TAIL instead makes
-// the guarantee unconditional — which is what this asserts, including at the
-// count where the old shape broke.
-func TestTheLeafSurvivesAnyNumberOfLongAncestors(t *testing.T) {
-	esc := "\\u" + "0000"
-	long := strings.Repeat("K", 300)
-
-	for _, ancestors := range []int{1, 2, 3, 10} {
-		t.Run(fmt.Sprintf("%d long ancestors", ancestors), func(t *testing.T) {
-			body := `{"leaf":"a` + esc + `b"}`
-			for i := 0; i < ancestors; i++ {
-				body = `{"` + long + fmt.Sprint(i) + `":` + body + `}`
-			}
-			var v struct {
-				Config map[string]any `json:"config"`
-			}
-			err := DecodeJSON(httptest.NewRequest("POST", "/",
-				strings.NewReader(`{"config":`+body+`}`)), &v)
-			if err == nil {
-				t.Fatal("accepted a body containing U+0000")
-			}
-			if !strings.Contains(err.Error(), ".leaf ") {
-				t.Errorf("the leaf is not named, so the ancestors ate the path: %q",
-					err.Error())
-			}
-			if n := len(err.Error()); n > 500 {
-				t.Errorf("the refusal is %d bytes; the path is not bounded", n)
-			}
-		})
-	}
-}
-
-// THE ERROR PATH MUST NOT ALLOCATE IN PROPORTION TO A KEY THE CALLER CHOSE.
-//
-// boundPath bounds the MESSAGE, not the work of building it: without a segment
-// cap each frame concatenates the full key before the trim, so a 100 KB key cost
-// +428 KB and eight nested ones +703 KB to produce 261 bytes. Bounded intermediate
-// now — and the cap is not what decides which segments survive, so this cannot
-// drift back into the coupling it replaced.
-func TestTheRefusalDoesNotAllocateInProportionToTheKey(t *testing.T) {
+// Measured in BYTES, not allocation count: a size regression changes how big
+// each allocation is and not how many there are, and reaching for AllocsPerRun
+// here let exactly such a regression through once.
+func TestStrippingDoesNotCopyUntouchedText(t *testing.T) {
 	esc := "\\u" + "0000"
 	long := strings.Repeat("K", 100000)
 
-	build := func(withNUL bool) string {
+	measure := func(withNUL bool) uint64 {
 		leaf := `"ab"`
 		if withNUL {
 			leaf = `"a` + esc + `b"`
 		}
-		return `{"config":{"` + long + `":{"leaf":` + leaf + `}}}`
-	}
-
-	// BYTES, NOT COUNT. The first version of this measured AllocsPerRun and was
-	// useless: removing the cap left the count identical at 59 either way, since
-	// the same handful of concatenations happen — they are just enormous. What
-	// changes is how much each one copies.
-	measure := func(body string) uint64 {
+		body := `{"config":{"` + long + `":{"leaf":` + leaf + `}}}`
 		const runs = 5
 		var before, after runtime.MemStats
 		runtime.GC()
@@ -390,38 +300,20 @@ func TestTheRefusalDoesNotAllocateInProportionToTheKey(t *testing.T) {
 		return (after.TotalAlloc - before.TotalAlloc) / runs
 	}
 
-	clean := measure(build(false))
-	refused := measure(build(true))
-	t.Logf("clean %d B/op, refused %d B/op (key is %d bytes)", clean, refused, len(long))
+	clean := measure(false)
+	stripped := measure(true)
+	t.Logf("clean %d B/op, stripped %d B/op (the untouched key is %d bytes)",
+		clean, stripped, len(long))
 
-	// The refusal may cost a little more than the decode it follows — it builds a
-	// message. What it must not do is scale with the key: unbounded, a 100 KB key
-	// added ~428 KB. Half the key is a generous line no bounded implementation
-	// approaches and no machine-specific noise crosses.
-	if refused > clean+uint64(len(long)/2) {
-		t.Errorf("a refusal on a %d-byte key allocated %d B against a clean decode's "+
-			"%d B: the path is being assembled from full-length keys again",
-			len(long), refused, clean)
+	if stripped > clean+uint64(len(long)/2) {
+		t.Errorf("stripping allocated %d B against %d B for the same body with "+
+			"nothing to strip: text that is not being changed is being copied",
+			stripped, clean)
 	}
 }
 
-// NOR IN PROPORTION TO HOW DEEPLY IT IS NESTED — the other axis, and the one
-// that was 200x worse.
-//
-// Each frame prepends its own segment to the suffix below it, so without a
-// short-circuit every level copies a string two bytes longer than the last and
-// the total is quadratic in depth. Measured: a 54 KB body nested 9,000 deep
-// allocated 86 MB to produce a 261-byte message, and five times the depth cost
-// twenty-five times the bytes.
-//
-// boundPath keeps the tail, so once the suffix is already maxPath bytes nothing
-// prepended in front of it can survive — which is what makes the short-circuit
-// correct rather than a truncation of the answer.
-//
-// The sibling test above measures the key-SIZE axis with a single level and
-// would not have caught this. Keys here are one character so no segment cap can
-// help; only the short-circuit can.
-func TestTheRefusalDoesNotAllocateInProportionToDepth(t *testing.T) {
+// AND DOES NOT SCALE WITH DEPTH.
+func TestStrippingDoesNotScaleWithDepth(t *testing.T) {
 	esc := "\\u" + "0000"
 
 	measure := func(depth int, withNUL bool) uint64 {
@@ -451,82 +343,11 @@ func TestTheRefusalDoesNotAllocateInProportionToDepth(t *testing.T) {
 
 	const deep = 5000
 	clean := measure(deep, false)
-	refused := measure(deep, true)
-	t.Logf("at depth %d: clean %d B/op, refused %d B/op", deep, clean, refused)
+	stripped := measure(deep, true)
+	t.Logf("at depth %d: clean %d B/op, stripped %d B/op", deep, clean, stripped)
 
-	// Quadratic, this was +26.6 MB. Bounded, it is a few hundred bytes. 1 MB
-	// sits far above any bounded implementation and far below the old cost, so
-	// it cannot flake and cannot pass a regression.
-	if refused > clean+(1<<20) {
-		t.Errorf("a refusal at depth %d allocated %d B against a clean decode's %d B: "+
-			"the path assembly is quadratic in depth again", deep, refused, clean)
-	}
-}
-
-// THE PATH MUST STILL POINT AT THE NUL, not merely be short.
-//
-// The short-circuit stops prepending once the suffix fills maxPath, so the
-// reported path is a TAIL of the true one. That is only acceptable while the
-// tail it keeps is genuinely the innermost part — a path naming a field the NUL
-// is not in would be worse than a slow one, because the caller would go and look
-// at the wrong place.
-//
-// WHAT THIS DOES NOT GUARD: boundPath's direction. With the short-circuit in
-// place the assembled path lands just under maxPath for ordinary segments, so
-// boundPath is a no-op here and reversing it changes nothing — measured, this
-// test passes under head truncation alone. It fails only when BOTH are wrong,
-// which is right: the property is held by the short-circuit, and the
-// short-circuit alone is enough to hold it. Tail preservation has its own test,
-// TestTheLeafSurvivesAnyNumberOfLongAncestors, whose 300-byte keys are what make
-// boundPath actually act.
-func TestTheReportedPathIsAlwaysASuffixOfTheRealOne(t *testing.T) {
-	esc := "\\u" + "0000"
-
-	for _, depth := range []int{0, 1, 5, 50, 500, 5000} {
-		t.Run(fmt.Sprintf("depth %d", depth), func(t *testing.T) {
-			// A distinctive innermost field so the tail is identifiable, and
-			// distinctive ancestors so a wrong tail is obvious.
-			body := `{"needle":"a` + esc + `b"}`
-			want := ".needle"
-			for i := 0; i < depth; i++ {
-				body = fmt.Sprintf(`{"anc%d":%s}`, i, body)
-			}
-			var v struct {
-				Config map[string]any `json:"config"`
-			}
-			err := DecodeJSON(httptest.NewRequest("POST", "/",
-				strings.NewReader(`{"config":`+body+`}`)), &v)
-			if err == nil {
-				t.Fatal("accepted a body containing U+0000")
-			}
-			msg := err.Error()
-
-			// The path is everything before " contains a NUL".
-			idx := strings.Index(msg, " contains a NUL")
-			if idx < 0 {
-				t.Fatalf("unexpected message shape: %q", msg)
-			}
-			got := msg[:idx]
-
-			// A TRUNCATED PATH MUST SAY SO. The short-circuit leaves the
-			// result under maxPath, so boundPath — which is what adds the
-			// ellipsis when IT truncates — returns the string unchanged and
-			// says nothing. `lvl91.lvl92.…target` then reads as a complete
-			// path, and the caller goes looking for a field that is not there.
-			// The true path always starts at "config"; anything shorter than
-			// that plus the leaf has had ancestors dropped.
-			if !strings.HasPrefix(got, "config") && !strings.HasPrefix(got, "…") {
-				t.Errorf("the path %q is a tail of the real one but carries no "+
-					"ellipsis, so it reads as complete", got)
-			}
-			if !strings.HasSuffix(got, want) {
-				t.Errorf("the path is %q; it does not end at the field holding the "+
-					"NUL (%q), so it points somewhere the caller would look in vain",
-					got, want)
-			}
-			if len(msg) > 500 {
-				t.Errorf("the message is %d bytes", len(msg))
-			}
-		})
+	if stripped > clean+(1<<20) {
+		t.Errorf("stripping at depth %d allocated %d B against a clean %d B: the "+
+			"walk is quadratic in depth", deep, stripped, clean)
 	}
 }

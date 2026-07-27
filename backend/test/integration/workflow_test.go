@@ -1715,7 +1715,12 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 			name: "a name containing NUL",
 			body: map[string]any{"name": "my\x00flow", "steps": []any{step},
 				"triggers": []any{trigger}},
-			want: "NUL",
+			// STRIPPED, not refused. The funnel removes the byte before the
+			// handler runs, so the workflow is created without it — refusing
+			// ran before the sanitisers elsewhere in this codebase and broke
+			// two working paths. The repository still refuses, which is what
+			// TestTheRepositoryRefusesNULWithoutTheHTTPFunnel covers.
+			want: "",
 		},
 		{
 			name: "a step config containing NUL",
@@ -1725,7 +1730,12 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 					"config": map[string]any{"body": "a\x00b"}}},
 				"triggers": []any{trigger},
 			},
-			want: "NUL",
+			// STRIPPED, not refused. The funnel removes the byte before the
+			// handler runs, so the workflow is created without it — refusing
+			// ran before the sanitisers elsewhere in this codebase and broke
+			// two working paths. The repository still refuses, which is what
+			// TestTheRepositoryRefusesNULWithoutTheHTTPFunnel covers.
+			want: "",
 		},
 		{
 			name: "a trigger filter containing NUL",
@@ -1735,7 +1745,12 @@ func TestCallerReachableLimitsAreRefusedAsBadRequests(t *testing.T) {
 				"triggers": []any{map[string]any{"event_type": "message.created",
 					"filter": map[string]any{"k": "a\x00b"}}},
 			},
-			want: "NUL",
+			// STRIPPED, not refused. The funnel removes the byte before the
+			// handler runs, so the workflow is created without it — refusing
+			// ran before the sanitisers elsewhere in this codebase and broke
+			// two working paths. The repository still refuses, which is what
+			// TestTheRepositoryRefusesNULWithoutTheHTTPFunnel covers.
+			want: "",
 		},
 		{
 			// MANY SMALL KEYS, not one long string. jsonb carries a 4-byte

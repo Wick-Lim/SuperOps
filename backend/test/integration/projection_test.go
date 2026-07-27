@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -254,7 +255,11 @@ func TestProjectionBoundsAreRefusalsNotTruncations(t *testing.T) {
 		body map[string]any
 	}{
 		{"body over 1 MiB", map[string]any{
-			"seq": 1, "schema_version": 1, "body_text": string(make([]byte, (1<<20)+1)),
+			// REAL CONTENT, not `make([]byte, N)`. That filler is a megabyte of
+			// NUL bytes, which httputil.DecodeJSON now strips — so the body
+			// arrived empty and was accepted, and the case stopped testing the
+			// size bound at all. A printable byte is what a caller would send.
+			"seq": 1, "schema_version": 1, "body_text": strings.Repeat("x", (1<<20)+1),
 		}},
 		{"over 1000 refs", map[string]any{
 			"seq": 1, "schema_version": 1, "body_text": "x", "refs": refs,
@@ -266,7 +271,7 @@ func TestProjectionBoundsAreRefusalsNotTruncations(t *testing.T) {
 			"seq": 1, "schema_version": 1, "body_text": "x",
 			"refs": []map[string]any{{
 				"ref_type": "file", "ref_id": "00000000-0000-0000-0000-000000000001",
-				"block_id": string(make([]byte, 65)),
+				"block_id": strings.Repeat("b", 65), // printable, for the same reason
 			}},
 		}},
 		{"a ref_type authz would refuse", map[string]any{

@@ -3,6 +3,8 @@
 package integration
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,13 +13,19 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
 )
 
-// A NUL IN A REQUEST BODY IS A BAD REQUEST, NOT A SERVER FAILURE — EVERYWHERE.
+// A NUL IN A REQUEST BODY IS REMOVED, NOT A SERVER FAILURE — EVERYWHERE.
 //
 // U+0000 is legal JSON, encoding/json decodes the escape to a real NUL, and no
 // Postgres text or jsonb column can store one. Nothing checked for it, so the
 // answer was `500 internal server error` for a body that is simply unstorable.
+//
+// The funnel STRIPS it rather than refusing, because refusing ran before the
+// handler sanitisers that already remove every rune below 0x20 — see
+// TestStrippingKeepsSanitisedPathsWorking in pkg/httputil for what that broke.
 //
 // Measured on seven routes before the guard existed, one byte apart in the same
 // request — a NUL versus the letter X. All seven answered 500 on the NUL and
@@ -28,7 +36,7 @@ import (
 // Each case sends the same body twice. The control is what says the request is
 // otherwise well-formed: without it, a route that 400s for an unrelated reason
 // would look like a pass.
-func TestANulInAnyRequestBodyIsARejectionNotAFailure(t *testing.T) {
+func TestANulInAnyRequestBodyIsStrippedNotAFailure(t *testing.T) {
 	h := getHarness(t)
 	admin := h.adminToken(t)
 	ws := h.firstWorkspace(t, admin)
@@ -98,30 +106,11 @@ func TestANulInAnyRequestBodyIsARejectionNotAFailure(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// The NUL: a 400 that names the offending field.
+			// The NUL: the request SUCCEEDS with the byte removed. It used to
+			// answer 500, and briefly answered 400 — which broke two paths that
+			// had working sanitisers, so the funnel strips instead.
 			code, body := h.do(t, c.method, c.path, admin, c.body("\x00"))
 			raw, _ := json.Marshal(body)
-			if code != http.StatusBadRequest {
-				t.Errorf("with a NUL = %d, want 400: %s", code, raw)
-			}
-			// The MESSAGE is not asserted here. Many handlers in this codebase
-			// replace a decode error with their own "invalid request body"
-			// before it reaches the client — a pre-existing pattern, unrelated
-			// to this guard. What the funnel itself says, and that it names the
-			// field, is pinned by TestDecodeRejectsNUL in pkg/httputil.
-			//
-			// What matters on every route is the status: 400 says "fix your
-			// request", 500 says "the server is broken", and this input is the
-			// former.
-			// And no raw NUL byte echoed back into the response.
-			if strings.ContainsRune(string(raw), 0) {
-				t.Errorf("a raw NUL byte is in the response body: %q", raw)
-			}
-
-			// The control: the same request with an ordinary letter succeeds, so
-			// the 400 above is about the byte and not about the shape.
-			code, body = h.do(t, c.method, c.path, admin, c.body("X"))
-			raw, _ = json.Marshal(body)
 			ok := false
 			for _, w := range c.wantOK {
 				if code == w {
@@ -129,13 +118,33 @@ func TestANulInAnyRequestBodyIsARejectionNotAFailure(t *testing.T) {
 				}
 			}
 			if !ok {
+				t.Errorf("with a NUL = %d, want one of %v: %s", code, c.wantOK, raw)
+			}
+			// And no raw NUL byte echoed back into the response — which would
+			// mean it had been stored and read back.
+			if strings.ContainsRune(string(raw), 0) {
+				t.Errorf("a raw NUL byte is in the response body: %q", raw)
+			}
+
+			// The control: the same request with an ordinary letter in place of
+			// the NUL, so any difference between the two is about that byte and
+			// not about the shape of the request.
+			code, body = h.do(t, c.method, c.path, admin, c.body("X"))
+			raw, _ = json.Marshal(body)
+			ctrlOK := false
+			for _, w := range c.wantOK {
+				if code == w {
+					ctrlOK = true
+				}
+			}
+			if !ctrlOK {
 				t.Errorf("the control = %d, want one of %v: %s", code, c.wantOK, raw)
 			}
 		})
 	}
 }
 
-// A NUL IN A QUERY PARAMETER IS THE SAME BUG WITH NO FUNNEL TO CATCH IT.
+// UNSTORABLE BYTES IN A QUERY PARAMETER ARE THE SAME BUG WITH NO FUNNEL.
 //
 // DecodeJSON never sees a query string. net/url turns `%00` into a real NUL and
 // the handler hands it to Postgres, so `GET /api/v1/users/search?q=a%00b`
@@ -146,19 +155,27 @@ func TestANulInAQueryParameterIsARejectionNotAFailure(t *testing.T) {
 	h := getHarness(t)
 	admin := h.adminToken(t)
 
+	// EVERY SPELLING OF THE CLASS, not one of them. Matching the literal `%00`
+	// was right about the byte and wrong about the bug: what Postgres refuses is
+	// any byte sequence that is not valid UTF-8, all with SQLSTATE 22021, and
+	// `%c0%80` is an overlong encoding of the very character the guard was
+	// written for — spelled so a substring match cannot see it.
 	for _, c := range []struct {
-		name, path string
-		wantOK     int
+		name, path, bad string
+		wantOK          int
 	}{
-		{"searching for a user", "/api/v1/users/search?q=a%sb", http.StatusOK},
+		{"a NUL", "/api/v1/users/search?q=a%sb", "%00", http.StatusOK},
+		{"a lone 0xFF", "/api/v1/users/search?q=a%sb", "%ff", http.StatusOK},
+		{"an overlong encoding of NUL", "/api/v1/users/search?q=a%sb", "%c0%80", http.StatusOK},
+		{"a truncated 3-byte sequence", "/api/v1/users/search?q=a%sb", "%e2%82", http.StatusOK},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			code, body := h.do(t, http.MethodGet, fmt.Sprintf(c.path, "%00"), admin, nil)
+			code, body := h.do(t, http.MethodGet, fmt.Sprintf(c.path, c.bad), admin, nil)
 			raw, _ := json.Marshal(body)
 			if code != http.StatusBadRequest {
 				t.Errorf("with a NUL = %d, want 400: %s", code, raw)
 			}
-			if !strings.Contains(string(raw), "NUL") {
+			if !strings.Contains(string(raw), "UTF-8") {
 				t.Errorf("the refusal does not say what is wrong: %s", raw)
 			}
 
@@ -268,4 +285,57 @@ func (h *harness) requests4xx(t *testing.T) int {
 	}
 	t.Fatalf("no 4xx counter in /metrics (status %d)", res.StatusCode)
 	return 0
+}
+
+// THE PATH A REFUSAL BROKE WORST, END TO END.
+//
+// `mailbox.safeFilename` strips every rune below 0x20 and is documented as
+// existing because "the name is attacker-supplied — it comes from an email
+// anybody can send". Refusing at the funnel ran BEFORE it, so an inbound
+// customer email carrying a NUL in an attachment filename went from being filed
+// to being rejected outright: the body, the subject and every other attachment
+// went with it, and a sender could make somebody's message disappear by naming a
+// file carefully.
+//
+// The first case is the hostile filename this suite already covers, unchanged.
+// The second is that filename plus one byte.
+func TestAHostileAttachmentFilenameDoesNotDropTheEmail(t *testing.T) {
+	h := getHarness(t)
+	admin := h.adminToken(t)
+	ws := h.firstWorkspace(t, admin)
+	me := h.whoami(t, admin)
+	mb := newMailbox(t, ws, me)
+	ctx := context.Background()
+
+	token := fmt.Sprintf("nul-ingest-%d", time.Now().UnixNano())
+	if _, err := h.app.DB.Exec(ctx,
+		`INSERT INTO mail_ingest_tokens (workspace_id, name, token_hash) VALUES ($1, 'nul', $2)`,
+		ws, crypto.HashToken(token)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct{ label, filename string }{
+		{"the hostile filename this suite already covers", "../../etc/passwd\r\nX-Injected: yes"},
+		{"a control character safeFilename strips", "../../etc/passwd\x01\r\nX-Injected: yes"},
+		{"the same filename with a NUL in it", "../../etc/passwd\x00\r\nX-Injected: yes"},
+	} {
+		n := time.Now().UnixNano()
+		code, resp := h.doBearer(t, http.MethodPost, "/api/v1/mail/inbound", token,
+			map[string]any{
+				"event_id": fmt.Sprintf("ev-nul-%d", n), "recipient": mb.Address,
+				"message_id": fmt.Sprintf("<nul-%d@customer.test>", n),
+				"from":       "customer@customer.test", "subject": "with an attachment",
+				"body_text": "please see attached",
+				"attachments": []map[string]any{{
+					"filename": c.filename,
+					"content":  base64.StdEncoding.EncodeToString([]byte("hello")),
+				}},
+			})
+		if code != http.StatusCreated {
+			raw, _ := json.Marshal(resp)
+			t.Errorf("%s: inbound mail = %d, want 201: %s\n"+
+				"a refusal here loses the customer's entire email over one byte in "+
+				"a filename that safeFilename exists to strip", c.label, code, raw)
+		}
+	}
 }
