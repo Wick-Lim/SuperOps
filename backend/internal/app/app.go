@@ -731,6 +731,12 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// outermost (after CORS) so the correlation id exists for RecoveryMiddleware
 	// and LoggingMiddleware, and for logger.FromContext inside handlers.
 	handler := httputil.EnvelopeMuxErrors(mux)
+	// OUTSIDE the envelope, which is why it renders its own JSON: the envelope
+	// only rewrites the stdlib's plain-text 404 and 405, and this never reaches
+	// it — a refusal here returns before the mux is called at all. It has to sit
+	// outside the mux regardless, because what it needs is the matched PATTERN,
+	// and r.PathValue is empty until the mux serves the request.
+	handler = httputil.ValidateIDPathParams(mux)(handler)
 	// INNERMOST but for the mux: outside routing, so no handler ever reads a URL
 	// carrying a NUL, and INSIDE the whole observability stack.
 	//
