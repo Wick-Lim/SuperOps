@@ -237,15 +237,19 @@ func TestABinaryFieldIsNeitherAlteredNorWalkedPerByte(t *testing.T) {
 	// NOTHING — it is reflect.Value.Index in a loop — so an allocation count is
 	// the one quantity this regression does not move: with the skip deleted the
 	// whole package still passed. Measured on this payload: 54ns with the skip,
-	// 1.08ms without, twenty thousand times.
+	// and between 861µs and 1.03ms without across runs and machines — four
+	// orders of magnitude either way.
 	start := time.Now()
 	const runs = 20
 	for i := 0; i < runs; i++ {
 		stripNUL(&input)
 	}
 	per := time.Since(start) / runs
-	// Three orders of magnitude of headroom, so a slow machine cannot trip it
-	// and the regression cannot hide under it.
+	// The headroom is not symmetric, and the pass side is the generous one:
+	// ~1850x on a clean walk (54ns against the bound) and ~9x on the regression
+	// (measured between 861µs and 1.03ms across runs). A slower machine pushes
+	// the regression further above the bound, not below it, so the asymmetry is
+	// in the safe direction. Verified quiet, under load and with -race.
 	if per > 100*time.Microsecond {
 		t.Errorf("stripping a 256 KiB binary field takes %s: the byte-slice skip "+
 			"is gone, so every collab update pays a reflect visit per byte", per)
@@ -554,9 +558,12 @@ func TestRebuiltContainersKeepEveryEdit(t *testing.T) {
 		}{M: m}
 
 		got := testing.AllocsPerRun(20, func() { stripNUL(&v) })
-		// Two per entry for MapIter, plus a handful of slack for the walk
-		// itself. A rebuild per struct would add another 200.
-		const bound = 2*entries + 20
+		// Two per entry for MapIter, plus a tenth of that for the walk itself.
+		// A rebuild per struct would add another `entries`, so the slack is a
+		// fifth of the smallest regression this can see — wide enough that a Go
+		// release changing MapIter's cost by a little does not go red for no
+		// reason, narrow enough that it cannot hide one.
+		const bound = 2*entries + entries/5
 		t.Logf("%d entries: %.0f allocs", entries, got)
 		if got > bound {
 			t.Errorf("a clean %d-entry body allocates %.0f times, over %d: a "+
@@ -639,4 +646,159 @@ func TestAnEmbeddedUnexportedTypeInAMapDoesNotPanic(t *testing.T) {
 			check(t)
 		})
 	}
+}
+
+// THE SAME BYTES MUST PRODUCE THE SAME MAP.
+//
+// When two keys strip to the same thing they are both pending, and applying them
+// in Go's randomised map-iteration order made the survivor a coin flip: a
+// byte-identical request stored "first" 55 times and "second" 345 times over 400
+// runs. Which key wins is arbitrary either way; irreproducible is the part that
+// is not acceptable, because it makes a bug report impossible to act on.
+func TestCollidingKeysResolveTheSameWayEveryTime(t *testing.T) {
+	esc := "\\u" + "0000"
+
+	for _, c := range []struct{ name, body string }{
+		{"two dirty keys colliding", `{"m":{"a` + esc + `b":"first","ab` + esc + `":"second"}}`},
+		{"a dirty key colliding with a clean one", `{"m":{"ab":"clean","a` + esc + `b":"dirty"}}`},
+		// The winner is whichever ORIGINAL key sorts last among those being
+		// rewritten — not "the stripped one", which is what the pre-sort code
+		// happened to do and what the comment said for a while. Both of these
+		// have two entries in the rewrite list, so both are decided by the sort.
+		{"a clean key whose value is dirty", `{"m":{"ab":"cl` + esc + `ean","a` + esc + `b":"dirty"}}`},
+		{"the clean key sorts last", `{"m":{"ab":"cl` + esc + `ean","` + esc + `ab":"dirty"}}`},
+		{"three keys colliding", `{"m":{"a` + esc + `b":"one","ab` + esc + `":"two","` + esc + `ab":"three"}}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			seen := map[string]int{}
+			const runs = 200
+			for i := 0; i < runs; i++ {
+				var v struct {
+					M map[string]any `json:"m"`
+				}
+				req := httptest.NewRequest("POST", "/", strings.NewReader(c.body))
+				if err := DecodeJSON(req, &v); err != nil {
+					t.Fatal(err)
+				}
+				got, _ := v.M["ab"].(string)
+				seen[got]++
+				if len(v.M) != 1 {
+					t.Fatalf("the map has %d entries, want 1: %v", len(v.M), v.M)
+				}
+			}
+			if len(seen) != 1 {
+				t.Errorf("over %d runs of a byte-identical request the survivor "+
+					"varied: %v — the outcome depends on map iteration order",
+					runs, seen)
+			}
+			for got := range seen {
+				t.Logf("%s -> %q", c.name, got)
+			}
+		})
+	}
+}
+
+// A NON-STRING-KEYED MAP IS STRIPPED, AND STABLE.
+//
+// `map[int]string` is a shape encoding/json decodes happily, and such an entry
+// reaches the rewrite list whenever its VALUE carried a NUL — the key does not
+// have to. It is stable for a reason worth knowing rather than by luck: only a
+// string key is ever rewritten, so only string keys can collide, and two entries
+// writing distinct keys cannot depend on the order they are written in.
+//
+// This asserts only what is observable. An earlier version also checked what a
+// helper returned for an int key, which passed or failed with the helper rather
+// than with anything a caller sees — the same shape as an assertion the
+// regression does not move, which this branch has produced three times.
+func TestANonStringKeyedMapIsStrippedAndStable(t *testing.T) {
+	esc := "\\u" + "0000"
+	seen := map[string]int{}
+	const runs = 100
+	for i := 0; i < runs; i++ {
+		var v struct {
+			M map[int]string `json:"m"`
+		}
+		req := httptest.NewRequest("POST", "/",
+			strings.NewReader(`{"m":{"7":"a`+esc+`b","3":"c`+esc+`d"}}`))
+		if err := DecodeJSON(req, &v); err != nil {
+			t.Fatal(err)
+		}
+		if v.M[7] != "ab" || v.M[3] != "cd" {
+			t.Fatalf("values wrong: %v", v.M)
+		}
+		seen[fmt.Sprintf("%v", v.M)]++
+	}
+	if len(seen) != 1 {
+		t.Errorf("a byte-identical body produced %d different maps: %v", len(seen), seen)
+	}
+}
+
+// GATING THE REBUILD, NOT THE DESCENT, KEEPS MOST OF THE EMBEDDED SUBTREE.
+//
+// Only one statement in the walk cannot survive a read-only value: the copy
+// taken when a changed field is not settable. An earlier fix gated the whole
+// DESCENT on addressability, which stopped the panic and abandoned everything
+// inside the embedded struct — a map, a slice and a pointee all kept their NULs,
+// though none of them needs addressability to be mutated.
+//
+// A plain string field still degrades: it is the one that genuinely needs the
+// copy this refuses to take.
+func TestTheEmbeddedSubtreeIsStrippedExceptWhereACopyIsNeeded(t *testing.T) {
+	esc := "\\u" + "0000"
+	var v struct {
+		K map[string]embeddedOuter `json:"k"`
+	}
+	body := `{"k":{"x":{"m":{"a` + esc + `":"v` + esc + `w"},"s":["p` + esc + `q"],` +
+		`"p":{"title":"t` + esc + `u"},"title":"y` + esc + `z","body":"c` + esc + `d"}}}`
+	if err := DecodeJSON(httptest.NewRequest("POST", "/", strings.NewReader(body)), &v); err != nil {
+		t.Fatal(err)
+	}
+	got := v.K["x"]
+
+	// Reachable without a copy — all of these must be clean.
+	if len(got.S) != 1 || got.S[0] != "pq" {
+		t.Errorf("a slice inside the embedded struct = %q, want [pq]", got.S)
+	}
+	if got.P == nil || got.P.Title != "tu" {
+		t.Errorf("a pointee inside the embedded struct = %+v, want title tu", got.P)
+	}
+	for k, val := range got.M {
+		if strings.ContainsRune(k, 0) || strings.ContainsRune(val, 0) {
+			t.Errorf("a map inside the embedded struct kept a NUL: %q=%q", k, val)
+		}
+	}
+	if got.Body != "cd" {
+		t.Errorf("body = %q, want cd", got.Body)
+	}
+
+	// THE DOCUMENTED DEGRADATION, ASSERTED IN BOTH DIRECTIONS. A plain string in
+	// the embedded struct needs the copy this refuses to take, so it keeps its
+	// NUL. Left as a t.Logf, the only record of it was a comment — and a change
+	// that silently started stripping it would be as unnoticed as one that
+	// silently stopped.
+	//
+	// If this fails because the field IS stripped, that is not automatically
+	// wrong: it means a copy is being taken. Check that it is deliberate and
+	// what it costs, then move this assertion.
+	if !strings.ContainsRune(got.Title, 0) {
+		t.Errorf("the promoted string field is stripped (%q): a copy of every "+
+			"non-addressable struct is being taken, which is the cost the "+
+			"CanInterface guard exists to avoid", got.Title)
+	}
+}
+
+type embeddedInner struct {
+	Title string `json:"title"`
+}
+
+type embeddedPrivate struct {
+	M     map[string]string `json:"m"`
+	S     []string          `json:"s"`
+	P     *embeddedInner    `json:"p"`
+	Title string            `json:"title"`
+}
+
+type embeddedOuter struct {
+	embeddedPrivate
+	Body string `json:"body"`
 }

@@ -37,8 +37,9 @@ import (
 // string fields — so what these drive is the funnel being WIRED IN on each route,
 // not the walk's arms. The arms are covered where they can be exercised
 // precisely: pkg/httputil's unit tests for maps, slices, arrays, pointers,
-// interfaces and rebuilds, and the workflow tests for a map value and a map key
-// arriving over HTTP. Editing a message and creating an invitation are left out
+// interfaces and rebuilds, and the workflow tests for a map VALUE arriving over
+// HTTP. A NUL-bearing map KEY is covered only by the unit test — there is no
+// integration case for one, which is worth knowing rather than papering over. Editing a message and creating an invitation are left out
 // because they would repeat what the other five already establish.
 //
 // Each case sends the same body twice. The control is what says the request is
