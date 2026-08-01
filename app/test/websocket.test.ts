@@ -434,10 +434,22 @@ describe('subscriptions', () => {
     expect(resyncCount()).toBe(0)
   })
 
-  it('drops queued sends when the socket is not open', () => {
-    wsManager.connect() // CONNECTING, never opened
-    wsManager.subscribe('c1')
+  it('reports rejection while connecting and acceptance while open', () => {
+    wsManager.connect()
+    expect(wsManager.sendCollabUpdate('document-a', 'YQ==')).toBe(false)
     expect(FakeWebSocket.last.sentRaw).toHaveLength(0)
+
+    FakeWebSocket.last.openNow()
+    expect(wsManager.sendCollabUpdate('document-a', 'YQ==')).toBe(true)
+    expect(FakeWebSocket.last.sentOfType('collab.update')).toHaveLength(1)
+  })
+
+  it('returns false and closes when the platform send throws', () => {
+    const socket = connectOpen()
+    socket.failNextSend = true
+
+    expect(wsManager.sendCollabUpdate('document-a', 'YQ==')).toBe(false)
+    expect(socket.closeCount).toBe(1)
   })
 })
 

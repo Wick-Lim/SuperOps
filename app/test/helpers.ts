@@ -217,6 +217,7 @@ export class FakeWebSocket {
   /** Raw frames handed to `send()`. */
   readonly sentRaw: string[] = []
   closeCount = 0
+  failNextSend = false
 
   onopen: (() => void) | null = null
   onmessage: ((e: { data: string }) => void) | null = null
@@ -229,6 +230,10 @@ export class FakeWebSocket {
   }
 
   send(raw: string): void {
+    if (this.failNextSend) {
+      this.failNextSend = false
+      throw new Error('platform send failed')
+    }
     this.sentRaw.push(raw)
   }
 

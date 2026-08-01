@@ -409,9 +409,19 @@ class WebSocketManager {
   // Sending
   // ---------------------------------------------------------------------------
 
-  send(type: string, data: unknown) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type, data }))
+  send(type: string, data: unknown): boolean {
+    const socket = this.ws
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false
+    try {
+      socket.send(JSON.stringify({ type, data }))
+      return true
+    } catch {
+      try {
+        socket.close()
+      } catch {
+        // The platform may already be closing the socket.
+      }
+      return false
     }
   }
 
@@ -479,8 +489,8 @@ class WebSocketManager {
     return this.joinedRooms.get(documentId)
   }
 
-  sendCollabUpdate(documentId: string, updateBase64: string) {
-    this.send('collab.update', { document_id: documentId, update: updateBase64 })
+  sendCollabUpdate(documentId: string, updateBase64: string): boolean {
+    return this.send('collab.update', { document_id: documentId, update: updateBase64 })
   }
 
   sendAwareness(documentId: string, stateBase64: string) {
