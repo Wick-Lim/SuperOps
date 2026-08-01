@@ -42,6 +42,7 @@ interface UiState {
   setConnection: (status: ConnectionStatus, error?: string | null) => void
   openThread: (channelId: string, parent: Message) => void
   closeThread: () => void
+  clear: () => void
 }
 
 export const useUiStore = create<UiState>()((set) => ({
@@ -95,4 +96,14 @@ export const useUiStore = create<UiState>()((set) => ({
     ),
 
   closeThread: () => set((s) => (s.activeThread === null ? s : { activeThread: null })),
+
+  clear: () =>
+    set({
+      presence: {},
+      typing: {},
+      unreadNotifications: 0,
+      connection: 'idle',
+      connectionError: null,
+      activeThread: null,
+    }),
 }))

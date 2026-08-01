@@ -1,12 +1,90 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useChannelStore } from '../src/stores/channelStore'
+import { useDriveStore } from '../src/stores/driveStore'
 import { useMessageStore } from '../src/stores/messageStore'
 import { useUiStore } from '../src/stores/uiStore'
+import { useUserStore } from '../src/stores/userStore'
+import { useWorkspaceStore } from '../src/stores/workspaceStore'
 import type { Reaction } from '../src/lib/types'
-import { makeChannel, makeMessage, resetStores } from './helpers'
+import { flush, makeChannel, makeMessage, ok, resetStores } from './helpers'
 
 beforeEach(() => {
   resetStores()
+})
+
+const realFetch = globalThis.fetch
+afterEach(() => {
+  globalThis.fetch = realFetch
+})
+
+describe('account-scoped stores', () => {
+  it('clears workspace and UI account data idempotently', () => {
+    useWorkspaceStore.setState({
+      workspaces: [{ id: 'ws-a', name: 'A' } as never],
+      activeWorkspace: { id: 'ws-a', name: 'A' } as never,
+    })
+    useUiStore.setState({
+      presence: { 'user-a': 'online' },
+      typing: { 'channel-a': ['user-a'] },
+      unreadNotifications: 7,
+      connection: 'connected',
+      connectionError: 'OLD_ERROR',
+      activeThread: { channelId: 'channel-a', parent: makeMessage('parent-a', 'channel-a') },
+    })
+
+    useWorkspaceStore.getState().clear()
+    useUiStore.getState().clear()
+    useWorkspaceStore.getState().clear()
+    useUiStore.getState().clear()
+
+    expect(useWorkspaceStore.getState().workspaces).toEqual([])
+    expect(useWorkspaceStore.getState().activeWorkspace).toBeNull()
+    expect(useUiStore.getState()).toMatchObject({
+      presence: {},
+      typing: {},
+      unreadNotifications: 0,
+      connection: 'idle',
+      connectionError: null,
+      activeThread: null,
+    })
+  })
+
+  it('clears Drive navigation but keeps the deployment registry', () => {
+    useDriveStore.setState({
+      registry: [{ type: 'document', label: 'Document', creatable: true } as never],
+      registryLoaded: true,
+      rootId: 'root-a',
+      entries: [{ kind: 'file', file: { id: 'file-a' } } as never],
+      hasMore: true,
+    })
+
+    useDriveStore.getState().clear()
+
+    expect(useDriveStore.getState().registry).toHaveLength(1)
+    expect(useDriveStore.getState()).toMatchObject({
+      registryLoaded: true,
+      rootId: null,
+      folder: null,
+      breadcrumb: [],
+      entries: [],
+      cursor: null,
+      hasMore: false,
+    })
+  })
+
+  it('ignores a user lookup that completes after clear', async () => {
+    let resolve!: (value: Response) => void
+    globalThis.fetch = vi.fn(() => new Promise<Response>((r) => { resolve = r })) as typeof fetch
+
+    useUserStore.getState().ensureUsers(['user-a'])
+    useUserStore.getState().clear()
+    resolve(ok({ id: 'user-a', username: 'old-account' } as never))
+    await flush(20)
+
+    expect(useUserStore.getState().users).toEqual({})
+    expect(useUserStore.getState().pending.size).toBe(0)
+    expect(useUserStore.getState().failed.size).toBe(0)
+  })
 })
 
 function reaction(messageId: string, userId: string, emoji: string): Reaction {

@@ -6,6 +6,7 @@ interface WorkspaceState {
   activeWorkspace: Workspace | null
   setWorkspaces: (ws: Workspace[]) => void
   setActiveWorkspace: (ws: Workspace) => void
+  clear: () => void
 }
 
 export const useWorkspaceStore = create<WorkspaceState>()((set) => ({
@@ -13,4 +14,5 @@ export const useWorkspaceStore = create<WorkspaceState>()((set) => ({
   activeWorkspace: null,
   setWorkspaces: (workspaces) => set({ workspaces }),
   setActiveWorkspace: (ws) => set({ activeWorkspace: ws }),
+  clear: () => set({ workspaces: [], activeWorkspace: null }),
 }))

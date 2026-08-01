@@ -13,7 +13,6 @@ import {
   View,
 } from 'react-native'
 import { messageApi } from '../../api/messages'
-import { channelApi } from '../../api/channels'
 import { errorMessage, fileURL } from '../../api/client'
 import type { UploadedFile } from '../../api/files'
 import { useMessageStore } from '../../stores/messageStore'
@@ -34,6 +33,7 @@ import type { Anchor } from '../message/anchor'
 import { newTempId, optimisticMessage, type OutboxEntry } from '../message/outbox'
 import { useCustomEmoji } from '../message/customEmoji'
 import { announce, useModalFocus } from '../a11y'
+import { getCachedDMRoster, loadDMRoster } from './dmRosterCache'
 
 interface Props {
   channel: Channel
@@ -50,9 +50,6 @@ interface Props {
 
 const EMPTY: Message[] = []
 const NO_TYPING: string[] = []
-
-/** DM participant ids by channel, so reopening a DM costs no extra request. */
-const dmMembers = new Map<string, string[]>()
 
 export default function ChannelView({ channel, onBack, onOpenMembers, showBack }: Props) {
   const currentMessages = useMessageStore((s) => s.messages[channel.id] ?? EMPTY)
@@ -82,7 +79,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers, showBack }
   const [editText, setEditText] = useState('')
   const [forwardTarget, setForwardTarget] = useState<Message | null>(null)
   const [viewerFile, setViewerFile] = useState<FileRef | null>(null)
-  const [dmIds, setDmIds] = useState<string[]>(() => dmMembers.get(channel.id) ?? [])
+  const [dmIds, setDmIds] = useState<string[]>(() => [...(getCachedDMRoster(channel.id) ?? [])])
 
   const loadingMoreRef = useRef(false)
   const lastAnnouncedRef = useRef<string | null>(null)
@@ -125,25 +122,22 @@ export default function ChannelView({ channel, onBack, onOpenMembers, showBack }
   // "Direct message". The member list is the only place the participants are.
   useEffect(() => {
     if (!isDM || channel.name) return
-    const cached = dmMembers.get(channel.id)
+    const cached = getCachedDMRoster(channel.id)
     if (cached) {
-      setDmIds(cached)
-      ensureUsers(cached)
+      const ids = [...cached]
+      setDmIds(ids)
+      ensureUsers(ids)
       return
     }
     let cancelled = false
-    channelApi
-      .listMembers(channel.workspace_id, channel.id)
-      .then((res) => {
-        const ids = (res.data ?? []).map((m) => m.user_id)
-        dmMembers.set(channel.id, ids)
-        if (cancelled) return
+    void loadDMRoster(channel.workspace_id, channel.id)
+      .then((loaded) => {
+        if (cancelled || !loaded) return
+        const ids = [...loaded]
         setDmIds(ids)
         ensureUsers(ids)
       })
-      .catch(() => {
-        /* the header falls back to "Direct message" */
-      })
+      .catch(() => undefined)
     return () => {
       cancelled = true
     }

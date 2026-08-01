@@ -2,6 +2,7 @@ import { useEffect, useSyncExternalStore } from 'react'
 import { emojiApi, type CustomEmoji } from '../../api/emoji'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
 import { API_BASE_URL } from '../../config'
+import { AccountCache } from '../../lib/accountCache'
 
 /**
  * Workspace custom emoji, cached per workspace outside React.
@@ -15,8 +16,8 @@ import { API_BASE_URL } from '../../config'
 
 const EMPTY: CustomEmoji[] = []
 
-const cache = new Map<string, CustomEmoji[]>()
-const inFlight = new Set<string>()
+const cache = new AccountCache<string, CustomEmoji[]>()
+const inFlight = new Map<string, number>()
 const listeners = new Set<() => void>()
 
 function emit() {
@@ -35,25 +36,38 @@ function subscribe(listener: () => void): () => void {
  * retrying: custom emoji are decoration, and a workspace the caller cannot read
  * them for would otherwise re-request on every picker open.
  */
+export function getCustomEmojiSnapshot(workspaceId?: string): CustomEmoji[] {
+  return workspaceId ? cache.get(workspaceId) ?? EMPTY : EMPTY
+}
+
+export function clearCustomEmojiCache(): void {
+  cache.clear()
+  inFlight.clear()
+  emit()
+}
+
 export function loadCustomEmoji(workspaceId: string | undefined): void {
   if (!workspaceId || cache.has(workspaceId) || inFlight.has(workspaceId)) return
-  inFlight.add(workspaceId)
+  const generation = cache.generation
+  inFlight.set(workspaceId, generation)
   emojiApi
     .list(workspaceId)
-    .then((res) => cache.set(workspaceId, res.data ?? EMPTY))
-    .catch(() => cache.set(workspaceId, EMPTY))
+    .then((res) => {
+      cache.setIfCurrent(generation, workspaceId, res.data ?? EMPTY)
+    })
+    .catch(() => {
+      cache.setIfCurrent(generation, workspaceId, EMPTY)
+    })
     .finally(() => {
-      inFlight.delete(workspaceId)
-      emit()
+      if (inFlight.get(workspaceId) === generation) inFlight.delete(workspaceId)
+      if (generation === cache.generation) emit()
     })
 }
 
 /** Custom emoji for the active workspace; `[]` until they load. */
 export function useCustomEmoji(): CustomEmoji[] {
   const workspaceId = useWorkspaceStore((s) => s.activeWorkspace?.id)
-  const list = useSyncExternalStore(subscribe, () =>
-    workspaceId ? cache.get(workspaceId) ?? EMPTY : EMPTY,
-  )
+  const list = useSyncExternalStore(subscribe, () => getCustomEmojiSnapshot(workspaceId))
   useEffect(() => {
     loadCustomEmoji(workspaceId)
   }, [workspaceId])

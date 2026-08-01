@@ -1,9 +1,14 @@
 import { vi } from 'vitest'
 import { useAuthStore } from '../src/stores/authStore'
 import { useChannelStore } from '../src/stores/channelStore'
+import { useDriveStore } from '../src/stores/driveStore'
 import { useMessageStore } from '../src/stores/messageStore'
 import { useUiStore } from '../src/stores/uiStore'
+import { useUserStore } from '../src/stores/userStore'
 import { useWorkspaceStore } from '../src/stores/workspaceStore'
+import { clearDMRosterCache } from '../src/components/channel/dmRosterCache'
+import { clearCustomEmojiCache } from '../src/components/message/customEmoji'
+import { clearWorkspaceRoleCache } from '../src/screens/internal/useWorkspaceRole'
 import type { Channel, Message, User } from '../src/lib/types'
 
 export const API = 'http://api.test/api/v1'
@@ -28,14 +33,13 @@ export function resetStores(): void {
   })
   useChannelStore.setState({ channels: [], activeChannel: null })
   useMessageStore.setState({ messages: {}, cursors: {}, hasMore: {} })
-  useUiStore.setState({
-    presence: {},
-    typing: {},
-    unreadNotifications: 0,
-    connection: 'idle',
-    connectionError: null,
-  })
-  useWorkspaceStore.setState({ workspaces: [], activeWorkspace: null })
+  useDriveStore.getState().clear()
+  useUserStore.getState().clear()
+  useUiStore.getState().clear()
+  useWorkspaceStore.getState().clear()
+  clearDMRosterCache()
+  clearCustomEmojiCache()
+  clearWorkspaceRoleCache()
 }
 
 export function signIn(access = 'access-1', refresh = 'refresh-1', userId = 'u-self'): void {

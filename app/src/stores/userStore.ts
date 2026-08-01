@@ -38,6 +38,7 @@ function withRemoved(set: Set<string>, id: string): Set<string> {
 // Attempt counts live outside the store: they are pure bookkeeping and must not
 // produce a state update (and therefore a rerender) on every retry.
 const attempts = new Map<string, number>()
+let generation = 0
 
 export const useUserStore = create<UserState>()((set, get) => ({
   users: {},
@@ -65,6 +66,7 @@ export const useUserStore = create<UserState>()((set, get) => ({
    * subscriber, and it re-requested permanently-failing ids on every pass.
    */
   ensureUsers: (ids) => {
+    const requestGeneration = generation
     const { users, pending, failed } = get()
     const missing = Array.from(
       new Set(ids.filter((id) => id && !users[id] && !pending.has(id) && !failed.has(id))),
@@ -77,10 +79,12 @@ export const useUserStore = create<UserState>()((set, get) => ({
       userApi
         .get(id)
         .then((res) => {
+          if (requestGeneration !== generation) return
           attempts.delete(id)
           set((s) => ({ users: { ...s.users, [id]: res.data }, pending: withRemoved(s.pending, id) }))
         })
         .catch((err: unknown) => {
+          if (requestGeneration !== generation) return
           // A 404/403 is permanent for this session; a network blip is not.
           const permanent = isApiError(err) && err.status >= 400 && err.status < 500
           const tries = (attempts.get(id) ?? 0) + 1
@@ -100,6 +104,7 @@ export const useUserStore = create<UserState>()((set, get) => ({
   },
 
   clear: () => {
+    generation += 1
     attempts.clear()
     set({ users: {}, pending: new Set(), failed: new Set() })
   },
