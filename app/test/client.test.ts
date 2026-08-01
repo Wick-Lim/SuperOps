@@ -241,6 +241,50 @@ describe('refresh coalescing', () => {
     })
   })
 
+  it('rejects an A transport failure that arrives after reset and preserves B', async () => {
+    let rejectRequest!: (error: Error) => void
+    globalThis.fetch = vi.fn(
+      () => new Promise<Response>((_resolve, reject) => { rejectRequest = reject }),
+    ) as unknown as typeof fetch
+    signIn('access-a', 'refresh-a', 'user-a')
+    const oldRequest = api.get('/slow-failure').catch((error: unknown) => error)
+    await Promise.resolve()
+
+    api.resetSession()
+    signIn('access-b', 'refresh-b', 'user-b')
+    rejectRequest(new TypeError('Failed to fetch'))
+    const error = await oldRequest
+
+    expect((error as ApiError).code).toBe(ApiErrorCode.SessionChanged)
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'access-b',
+      refreshToken: 'refresh-b',
+      user: { id: 'user-b' },
+    })
+  })
+
+  it('rejects an A upload failure that arrives after reset and preserves B', async () => {
+    let rejectUpload!: (error: Error) => void
+    globalThis.fetch = vi.fn(
+      () => new Promise<Response>((_resolve, reject) => { rejectUpload = reject }),
+    ) as unknown as typeof fetch
+    signIn('access-a', 'refresh-a', 'user-a')
+    const oldUpload = api.upload('/slow-upload', new FormData()).catch((error: unknown) => error)
+    await Promise.resolve()
+
+    api.resetSession()
+    signIn('access-b', 'refresh-b', 'user-b')
+    rejectUpload(new TypeError('Failed to fetch'))
+    const error = await oldUpload
+
+    expect((error as ApiError).code).toBe(ApiErrorCode.SessionChanged)
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'access-b',
+      refreshToken: 'refresh-b',
+      user: { id: 'user-b' },
+    })
+  })
+
   it('does not let an A refresh restore tokens after reset', async () => {
     let releaseRefresh!: () => void
     net = mockFetch(async (req) => {

@@ -121,6 +121,10 @@ export default function ChannelView({ channel, onBack, onOpenMembers, showBack }
   // A DM has `name === null`; every one of them rendered the literal
   // "Direct message". The member list is the only place the participants are.
   useEffect(() => {
+    // Props can switch this mounted view directly from one channel to another.
+    // Replace the old roster synchronously so A's names never label B's header
+    // while B's member request is still in flight.
+    setDmIds([...(getCachedDMRoster(channel.id) ?? [])])
     if (!isDM || channel.name) return
     const cached = getCachedDMRoster(channel.id)
     if (cached) {

@@ -50,6 +50,8 @@ export type RoomEvent =
   | { kind: 'awareness'; documentId: string; actorId: string; originConn: string; state: string }
   | { kind: 'compact'; documentId: string; headSeq: number; snapshotSeq: number }
   | { kind: 'project'; documentId: string; headSeq: number; projectionSeq: number }
+  | { kind: 'rejected'; documentId: string; op: string; code: string; message: string }
+  | { kind: 'resync'; documentId: string; reason: 'seq-gap' }
   /** The socket dropped and came back; every room was re-joined from scratch. */
   | { kind: 'resumed'; documentId: string }
 
@@ -341,14 +343,18 @@ class WebSocketManager {
 
   private trackSeq(seq: number | undefined) {
     if (typeof seq !== 'number' || seq <= 0) return
-    if (this.lastSeq !== 0 && seq !== this.lastSeq + 1) {
+    if (this.lastSeq !== 0 && seq > this.lastSeq + 1) {
       // Backpressure dropped frames. Nothing is replayed server-side, so the
-      // only correct response is to refetch.
+      // only correct response is to refetch. Collaboration providers own state
+      // outside the ordinary stores, so they need the same signal explicitly.
       this.lastSeq = seq
+      this.desiredRooms.forEach((documentId) => {
+        this.emitRoom({ kind: 'resync', documentId, reason: 'seq-gap' })
+      })
       void this.resync('seq-gap')
       return
     }
-    this.lastSeq = seq
+    if (seq > this.lastSeq) this.lastSeq = seq
   }
 
   /** Refetches everything realtime is responsible for keeping fresh. */
@@ -587,6 +593,18 @@ class WebSocketManager {
         // never went live and nothing said why.
         console.warn(`[ws] ${code}: ${message}`)
         this.setStatus(this.connected ? 'connected' : 'offline', code)
+        const documentId = str(d, 'document_id')
+        const op = str(d, 'op') ?? 'unknown'
+        if (documentId && this.desiredRooms.has(documentId)) {
+          this.emitRoom({ kind: 'rejected', documentId, op, code, message })
+        } else if (!documentId) {
+          // Older servers did not scope collaboration errors. Providers without
+          // pending bytes ignore this; a provider awaiting an echo recovers over
+          // HTTP rather than trusting an unrelated-looking open socket forever.
+          this.desiredRooms.forEach((roomId) => {
+            this.emitRoom({ kind: 'rejected', documentId: roomId, op, code, message })
+          })
+        }
         break
       }
 

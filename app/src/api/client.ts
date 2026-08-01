@@ -149,6 +149,21 @@ class ApiClient {
     }
   }
 
+  /** A rejected fetch still has to cross the same session fence as a response. */
+  private async fetchForSession(
+    epoch: number,
+    url: string,
+    init: RequestInit,
+    timeoutMs: number,
+  ): Promise<Response> {
+    try {
+      return await fetchWithTimeout(url, init, timeoutMs)
+    } catch (error) {
+      this.assertCurrentSession(epoch)
+      throw error
+    }
+  }
+
   private getHeaders(hasBody: boolean): Record<string, string> {
     const headers: Record<string, string> = {}
     // Only declare a content type when there is content: a GET/DELETE with
@@ -168,7 +183,8 @@ class ApiClient {
     const refreshTokenAtSend = useAuthStore.getState().refreshToken
     const sessionGenerationAtSend = useAuthStore.getState().sessionGeneration
 
-    const res = await fetchWithTimeout(
+    const res = await this.fetchForSession(
+      epoch,
       `${API_BASE_URL}${path}`,
       {
         method,
@@ -276,7 +292,8 @@ class ApiClient {
     const headers: Record<string, string> = {}
     if (tokenAtSend) headers['Authorization'] = `Bearer ${tokenAtSend}`
 
-    const res = await fetchWithTimeout(
+    const res = await this.fetchForSession(
+      epoch,
       `${API_BASE_URL}${path}`,
       { method: 'POST', headers, body: form },
       UPLOAD_TIMEOUT_MS,

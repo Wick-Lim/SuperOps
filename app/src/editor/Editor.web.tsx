@@ -11,6 +11,7 @@ import { Mention, DriveEmbed, IssueEmbed } from './extensions/refs'
 import { RefLabels } from './extensions/refViews'
 import { RefResolver } from './refResolver'
 import { MentionSuggestion } from './extensions/mentionSuggestion'
+import { ProjectionScheduler } from '../lib/collab/projectionScheduler'
 
 /**
  * The block editor, web only.
@@ -59,16 +60,24 @@ export type { EditorProps }
 const PROJECT_DEBOUNCE_MS = 2000
 
 export default function Editor({
-  doc, awareness, editable, user, onProject, seq, fileId, catchUp,
+  doc, awareness, editable, projectable, user, onProject, registerProjectionFlush,
+  seq, fileId, catchUp,
 }: EditorProps) {
   // One resolver per open document. Thrown away with the editor, which is what
   // keeps its cache scoped to the file it was authorized against — a global one
   // would let a name learned through a document you may read leak into one you
   // may not.
   const resolver = useMemo(() => new RefResolver(fileId ?? ''), [fileId])
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const seqRef = useRef(seq)
   seqRef.current = seq
+  const projectableRef = useRef(projectable)
+  projectableRef.current = projectable
+  // The caret extension reads this only when a document/awareness boundary
+  // creates a new editor. Profile changes are applied imperatively below so an
+  // ordinary parent render cannot replace the editor and discard its dirty
+  // projection scheduler while an edit is awaiting acknowledgement.
+  const userRef = useRef(user)
+  userRef.current = user
 
   const extensions = useMemo(
     () => [
@@ -77,7 +86,7 @@ export default function Editor({
         undoRedo: false,
       }),
       Collaboration.configure({ document: doc }),
-      CollaborationCaret.configure({ provider: { awareness }, user }),
+      CollaborationCaret.configure({ provider: { awareness }, user: userRef.current }),
       // References. The nodes carry {refType, refId} and nothing else; the
       // label is painted per caller as a decoration, so it never enters the
       // document, the CRDT, the projection, or a copy-paste.
@@ -87,7 +96,7 @@ export default function Editor({
       RefLabels(resolver),
       MentionSuggestion,
     ],
-    [doc, awareness, user, resolver],
+    [doc, awareness, resolver],
   )
 
   const editor = useEditor(
@@ -100,30 +109,58 @@ export default function Editor({
       // SSR-less hydration in the web build.
       immediatelyRender: false,
     },
-    [extensions, editable],
+    [extensions],
   )
+
+  useEffect(() => {
+    editor?.commands.updateUser(user)
+  }, [editor, user.id, user.name, user.color])
+
+  const schedulerRef = useRef<ProjectionScheduler<Projection> | null>(null)
+  useEffect(() => {
+    if (!editor) return
+    const scheduler = new ProjectionScheduler<Projection>({
+      delayMs: PROJECT_DEBOUNCE_MS,
+      readState: () => ({
+        seq: seqRef.current,
+        synced: projectableRef.current,
+        pending: !projectableRef.current,
+      }),
+      build: (projectionSeq) => extract(editor.getJSON(), projectionSeq),
+      publish: onProject,
+    })
+    schedulerRef.current = scheduler
+    const unregisterFlush = registerProjectionFlush(() => scheduler.flush())
+    return () => {
+      unregisterFlush()
+      // Flush only when the provider has acknowledged a newer sequence. An
+      // unsafe close discards derived work, never labels pending content N.
+      scheduler.flush()
+      scheduler.dispose()
+      if (schedulerRef.current === scheduler) schedulerRef.current = null
+    }
+  }, [editor, onProject, registerProjectionFlush])
+
+  useEffect(() => {
+    schedulerRef.current?.notify()
+  }, [seq, projectable])
 
   // Publish on settle. The projection is derived state — losing one costs
   // search until the next edit and costs zero content — so a failure here is
   // deliberately not surfaced to the writer.
   useEffect(() => {
     if (!editor || !editable) return
-    const schedule = () => {
-      if (timer.current) clearTimeout(timer.current)
-      timer.current = setTimeout(() => {
-        onProject(extract(editor.getJSON(), seqRef.current))
-      }, PROJECT_DEBOUNCE_MS)
-    }
+    const schedule = () => schedulerRef.current?.request()
+    const flushProjection = () => schedulerRef.current?.flush()
     editor.on('update', schedule)
     // On blur as well as on idle: somebody who types a sentence and switches
     // tab has stopped editing, and waiting for the debounce would miss it.
-    editor.on('blur', schedule)
+    editor.on('blur', flushProjection)
     return () => {
       editor.off('update', schedule)
-      editor.off('blur', schedule)
-      if (timer.current) clearTimeout(timer.current)
+      editor.off('blur', flushProjection)
     }
-  }, [editor, editable, onProject])
+  }, [editor, editable])
 
   // CATCH UP once per request, when the stored projection is behind and this
   // caller may write.
@@ -141,7 +178,7 @@ export default function Editor({
   // actually distinguishes "loaded and empty" from "not loaded yet".
   const caughtUp = useRef(0)
   useEffect(() => {
-    if (!editor || !editable || !catchUp || caughtUp.current === catchUp) return
+    if (!editor || !editable || !projectable || !catchUp || caughtUp.current === catchUp) return
     const timer = setTimeout(() => {
       if (caughtUp.current === catchUp) return
       const projection = extract(editor.getJSON(), seqRef.current)
@@ -149,26 +186,10 @@ export default function Editor({
       // which case there is nothing to catch up, or state has not arrived, in
       // which case publishing would destroy the stored text.
       if (!worthPublishing(projection)) return
-      caughtUp.current = catchUp
-      onProject(projection)
+      if (onProject(projection)) caughtUp.current = catchUp
     }, 2500)
     return () => clearTimeout(timer)
-  }, [editor, editable, catchUp, onProject])
-
-  // And once more on unmount, which is the case the reconciler exists for: a
-  // document edited and closed before the debounce fired would otherwise stay
-  // unsearchable until somebody opened it again.
-  useEffect(() => {
-    return () => {
-      if (editor && editable) {
-        try {
-          onProject(extract(editor.getJSON(), seqRef.current))
-        } catch {
-          /* the editor may already be torn down; the reconciler covers it */
-        }
-      }
-    }
-  }, [editor, editable, onProject])
+  }, [editor, editable, projectable, catchUp, onProject, seq])
 
   useEffect(() => {
     editor?.setEditable(editable)

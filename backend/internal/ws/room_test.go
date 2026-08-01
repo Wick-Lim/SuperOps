@@ -241,6 +241,31 @@ func TestCollabFrames(t *testing.T) {
 	}
 }
 
+func TestCollabUpdateErrorIsDocumentScoped(t *testing.T) {
+	hub := NewHub(testLogger())
+	c := newRoomClient(hub, &stubRoom{})
+	c.JoinRoom(testDocumentID, false)
+
+	c.handleMessage(context.Background(), inbound(t, TypeCollabUpdate,
+		CollabUpdateData{DocumentID: testDocumentID, Update: []byte("x")}))
+
+	frames := drain(t, c)
+	if len(frames) != 1 || frames[0].Type != TypeError {
+		t.Fatalf("frames = %v, want one error frame", frames)
+	}
+	var payload struct {
+		Code       string `json:"code"`
+		Op         string `json:"op"`
+		DocumentID string `json:"document_id"`
+	}
+	if err := json.Unmarshal(frames[0].Data, &payload); err != nil {
+		t.Fatalf("decode error frame: %v", err)
+	}
+	if payload.Code != "FORBIDDEN" || payload.Op != "update" || payload.DocumentID != testDocumentID {
+		t.Fatalf("error payload = %+v, want FORBIDDEN update scoped to %s", payload, testDocumentID)
+	}
+}
+
 // TestCollabJoinWithNoHandler: a server without the collaboration layer wired
 // must say so rather than look like a dropped frame.
 func TestCollabJoinWithNoHandler(t *testing.T) {

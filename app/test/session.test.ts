@@ -149,6 +149,18 @@ describe('generational account caches', () => {
     expect(getCachedDMRoster('channel-a')).toBeUndefined()
     expect(getCachedWorkspaceRole('workspace-a:user-a')).toBeUndefined()
   })
+
+  it('resets ChannelView DM state from the newly selected channel before loading', async () => {
+    const fs = await import('node:fs/promises')
+    const source = await fs.readFile('src/components/channel/ChannelView.tsx', 'utf8')
+    const effectStart = source.indexOf('// A DM has `name === null`')
+    const effect = source.slice(effectStart, source.indexOf('const title = useMemo', effectStart))
+    const reset = effect.indexOf('setDmIds([...(getCachedDMRoster(channel.id) ?? [])])')
+    const guard = effect.indexOf('if (!isDM || channel.name) return')
+
+    expect(reset, 'the prior channel roster remains visible after a channel switch').toBeGreaterThan(-1)
+    expect(reset, 'the reset must happen even when the new channel is not an unnamed DM').toBeLessThan(guard)
+  })
 })
 
 describe('account session reset', () => {
@@ -298,6 +310,42 @@ describe('account session reset', () => {
     })
   })
 
+  it('cleans up an accepted A push registration when A logs out mid-request', async () => {
+    populateAccountA()
+    let releaseRegistration!: () => void
+    let enterRegistration!: () => void
+    const registrationEntered = new Promise<void>((resolve) => { enterRegistration = resolve })
+    const registrationGate = new Promise<void>((resolve) => { releaseRegistration = resolve })
+    const deviceOperations: string[] = []
+    mockFetch(async (req) => {
+      if (req.path === '/users/me/devices') {
+        deviceOperations.push(`POST ${req.headers.Authorization}`)
+        enterRegistration()
+        await registrationGate
+        return ok({ token: 'push-shared', platform: 'ios' })
+      }
+      if (req.path === '/users/me/devices/push-shared') {
+        deviceOperations.push(`DELETE ${req.headers.Authorization}`)
+        return ok({ message: 'ok' })
+      }
+      if (req.path === '/auth/logout') return ok({ message: 'ok' })
+      throw new Error(`unexpected request ${req.path}`)
+    })
+
+    const registration = registerPushToken()
+    await registrationEntered
+    const resetting = resetAccountSession()
+    await flush(20)
+    releaseRegistration()
+    await Promise.all([registration, resetting])
+
+    expect(deviceOperations).toEqual([
+      'POST Bearer access-a',
+      'DELETE Bearer access-a',
+    ])
+    expect(await AsyncStorage.getItem('superops-push-token')).toBeNull()
+  })
+
   it('does not let A push cleanup erase B registration for the same device token', async () => {
     populateAccountA()
     await AsyncStorage.setItem('superops-push-token', 'push-shared')
@@ -306,7 +354,7 @@ describe('account session reset', () => {
     const accountAEntered = new Promise<void>((resolve) => { enterAccountA = resolve })
     const accountAGate = new Promise<void>((resolve) => { releaseAccountA = resolve })
     const deleteBearers: string[] = []
-    mockFetch(async (req) => {
+    const network = mockFetch(async (req) => {
       if (req.path === '/users/me/devices/push-shared') {
         deleteBearers.push(req.headers.Authorization)
         if (req.headers.Authorization === 'Bearer access-a') {
@@ -326,10 +374,15 @@ describe('account session reset', () => {
     const resettingAccountA = resetAccountSession()
     await accountAEntered
     signIn('access-b', 'refresh-b', 'user-b')
-    await expect(registerPushToken()).resolves.toBe('registered')
+    const registeringAccountB = registerPushToken()
+    await flush(20)
+    // Registration shares the lifecycle queue with deregistration, so B cannot
+    // race A's remote delete for the same physical token.
+    expect(network.calls.filter((req) => req.method === 'POST' && req.path === '/users/me/devices')).toHaveLength(0)
     await setBadge(7)
     releaseAccountA()
     await resettingAccountA
+    await expect(registeringAccountB).resolves.toBe('registered')
 
     expect(await AsyncStorage.getItem('superops-push-token')).toBe('push-shared')
     expect(notificationMocks.setBadgeCountAsync).toHaveBeenLastCalledWith(7)

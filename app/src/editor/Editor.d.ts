@@ -39,8 +39,13 @@ export interface EditorProps {
   catchUp?: number
   /** The server decides; a read-only surface is rendered, not failed on submit. */
   editable: boolean
-  user: { name: string; color: string }
-  onProject: (projection: Projection) => void
+  /** True only at a fully synchronized provider watermark with no local bytes pending. */
+  projectable: boolean
+  user: { id: string; name: string; color: string }
+  /** Returns false when the provider changed state before the projection reached the screen. */
+  onProject: (projection: Projection) => boolean
+  /** Lets the provider owner flush derived work before tearing transport down. */
+  registerProjectionFlush: (flush: () => boolean) => () => void
   seq: number
 }
 

@@ -39,6 +39,9 @@ import { fromBase64, toBase64 } from './base64'
  */
 const MAX_FRAME_UPDATE_BYTES = 24 * 1024
 
+/** Accepted socket writes must produce their durable echo within this window. */
+export const COLLAB_ACK_TIMEOUT_MS = 10_000
+
 /** Local origin tag, so the provider can tell its own edits from applied ones. */
 const LOCAL_ORIGIN = 'superops-local'
 
@@ -69,6 +72,14 @@ export interface ProviderOptions {
   onProjectRequest?: () => void
 }
 
+export type CollabUser = ProviderOptions['user']
+
+interface PendingSocketSend {
+  payload: string
+  version: number
+  deadline: number
+}
+
 export class CollabProvider {
   readonly documentId: string
   readonly doc: Y.Doc
@@ -93,10 +104,19 @@ export class CollabProvider {
   /** Merged, opaque Yjs bytes that have not yet been durably acknowledged. */
   private pendingUpdate: Uint8Array | null = null
   private pendingVersion = 0
-  private pendingSocketAcks = 0
+  private pendingSocketSends: PendingSocketSend[] = []
+  private socketCycleVersion = 0
+  private ackTimer: ReturnType<typeof setTimeout> | null = null
   private needsHttpRecovery = false
   private recoveryEpoch = 0
   private recoveryInFlight: Promise<void> | null = null
+  private recoveryRequested = false
+  private recoveryCatchUpRequested = false
+
+  /** A server compaction request retained until this replica is safe to answer. */
+  private pendingCompactionHead = 0
+  private compactionRecoveryWatermark = -1
+  private compactionInFlight = false
 
   private offRoom: (() => void) | null = null
   private offConnection: (() => void) | null = null
@@ -122,7 +142,9 @@ export class CollabProvider {
       if (connected) return
       this.recoveryEpoch += 1
       this.recoveryInFlight = null
-      this.pendingSocketAcks = 0
+      this.recoveryRequested = false
+      this.recoveryCatchUpRequested = false
+      this.clearSocketSends()
       if (this.pendingUpdate) this.needsHttpRecovery = true
       this.setStatus('connecting')
     })
@@ -149,6 +171,10 @@ export class CollabProvider {
     if (this.destroyed) return
     this.destroyed = true
     this.recoveryEpoch += 1
+    this.recoveryRequested = false
+    this.recoveryCatchUpRequested = false
+    this.clearSocketSends()
+    this.pendingCompactionHead = 0
     this.offConnection?.()
     this.offConnection = null
     if (this.updateHandler) this.doc.off('update', this.updateHandler)
@@ -175,12 +201,34 @@ export class CollabProvider {
     return this.pendingUpdate !== null
   }
 
+  /** True only when a projection can describe this exact contiguous state. */
+  get projectionReady(): boolean {
+    return (
+      !this.destroyed &&
+      this.canWrite &&
+      this.status === 'synced' &&
+      this.pendingUpdate === null &&
+      this.pendingSocketSends.length === 0 &&
+      !this.needsHttpRecovery &&
+      !this.recoveryInFlight &&
+      this.pendingSeqs.size === 0
+    )
+  }
+
+  /** Refreshes cursor/profile metadata without disturbing transport state. */
+  updateUser(user: CollabUser): void {
+    if (this.destroyed) return
+    this.awareness.setLocalStateField('user', user)
+  }
+
   retry(): void {
     if (this.destroyed || this.status === 'revoked') return
     this.setStatus('connecting')
-    if (wsManager.isConnected() && wsManager.roomAccess(this.documentId)) {
-      this.startRecovery()
+    if (wsManager.isConnected()) {
+      if (wsManager.roomAccess(this.documentId) !== undefined) this.startRecovery()
+      else wsManager.joinRoom(this.documentId)
     } else {
+      wsManager.joinRoom(this.documentId)
       wsManager.connect()
     }
   }
@@ -208,17 +256,24 @@ export class CollabProvider {
         if (e.reason === 'revoked') {
           this.canWrite = false
           this.recoveryEpoch += 1
+          this.recoveryInFlight = null
+          this.recoveryRequested = false
+          this.recoveryCatchUpRequested = false
+          this.clearSocketSends()
+          this.pendingCompactionHead = 0
           this.setStatus('revoked', 'Your access to this document was removed.')
         }
         break
       case 'update':
-        if (this.applyRemote(e.seq, e.update)) this.acknowledgeOwnEcho(e.originConn)
+        if (this.applyRemote(e.seq, e.update)) {
+          this.acknowledgeOwnEcho(e.seq, e.update, e.originConn)
+        }
         break
       case 'awareness':
         this.applyAwareness(e.state, e.actorId)
         break
       case 'compact':
-        void this.compact(e.headSeq)
+        this.requestCompaction(e.headSeq)
         break
       case 'project':
         // Only a writer answers. Every replica holding a member of this room
@@ -226,6 +281,26 @@ export class CollabProvider {
         // harmless, because the server's monotonic guard keeps the first and
         // discards the rest.
         if (this.canWrite) this.onProjectRequest?.()
+        break
+      case 'rejected':
+        if (e.op === 'join') {
+          const terminal = e.code === 'FORBIDDEN' || e.code === 'NOT_FOUND'
+          this.canWrite = false
+          this.recoveryEpoch += 1
+          this.recoveryInFlight = null
+          this.recoveryRequested = false
+          this.recoveryCatchUpRequested = false
+          this.clearSocketSends()
+          if (this.pendingUpdate) this.needsHttpRecovery = true
+          this.pendingCompactionHead = 0
+          wsManager.leaveRoom(this.documentId)
+          this.setStatus(terminal ? 'revoked' : 'error', e.message)
+        } else if (this.pendingUpdate && (e.op === 'update' || e.op === 'unknown')) {
+          this.beginHttpRecovery(true)
+        }
+        break
+      case 'resync':
+        this.beginHttpRecovery(true)
         break
     }
   }
@@ -243,26 +318,41 @@ export class CollabProvider {
    * watermark with a permanent hole exactly where this client's own edits are.
    */
   private applyRemote(seq: number, updateBase64: string): boolean {
+    if (!Number.isSafeInteger(seq) || seq <= 0) {
+      this.beginHttpRecovery(true)
+      return false
+    }
     try {
       Y.applyUpdate(this.doc, fromBase64(updateBase64), LOCAL_ORIGIN)
     } catch {
       // A malformed update cannot be recovered from by retrying, and dropping
       // the document would lose local edits. Refetching state is the honest
       // repair.
-      this.startRecovery(true)
+      this.beginHttpRecovery(true)
       return false
     }
     this.recordAppliedSeq(seq)
     return true
   }
 
-  private acknowledgeOwnEcho(originConn: string): void {
+  private acknowledgeOwnEcho(seq: number, updateBase64: string, originConn: string): void {
     if (!originConn || originConn !== wsManager.getConnectionId()) return
-    if (this.pendingSocketAcks === 0 || this.needsHttpRecovery) return
-    this.pendingSocketAcks -= 1
-    if (this.pendingSocketAcks !== 0) return
+    if (this.pendingSocketSends.length === 0 || this.needsHttpRecovery) return
+    const match = this.pendingSocketSends.findIndex((sent) => sent.payload === updateBase64)
+    if (match < 0) return
+    this.pendingSocketSends.splice(match, 1)
+    this.armAckWatchdog()
+    if (this.pendingSocketSends.length !== 0) return
+    if (this.socketCycleVersion !== this.pendingVersion) return
+
+    this.clearSocketSends()
     this.pendingUpdate = null
+    if (this.pendingSeqs.size > 0 || this.watermark < seq) {
+      this.beginHttpRecovery(true)
+      return
+    }
     this.setStatus(this.canWrite ? 'synced' : 'read-only')
+    this.maybeCompact()
   }
 
   private recordAppliedSeq(seq: number): void {
@@ -282,6 +372,7 @@ export class CollabProvider {
     if (this.pendingSeqs.size > 0 && seq - this.watermark > 64 && !this.recoveryInFlight) {
       this.startRecovery(true)
     }
+    this.maybeCompact()
   }
 
   private advanceThrough(throughSeq: number): void {
@@ -296,6 +387,7 @@ export class CollabProvider {
       this.watermark += 1
     }
     this.emitProjectionAdvance(previous)
+    this.maybeCompact()
   }
 
   private emitProjectionAdvance(previous: number): void {
@@ -316,6 +408,46 @@ export class CollabProvider {
     return !this.destroyed && this.status !== 'revoked' && epoch === this.recoveryEpoch
   }
 
+  private clearSocketSends(): void {
+    this.pendingSocketSends = []
+    this.socketCycleVersion = 0
+    if (this.ackTimer) {
+      clearTimeout(this.ackTimer)
+      this.ackTimer = null
+    }
+  }
+
+  private armAckWatchdog(): void {
+    if (this.ackTimer) {
+      clearTimeout(this.ackTimer)
+      this.ackTimer = null
+    }
+    if (this.pendingSocketSends.length === 0 || this.destroyed || this.status === 'revoked') return
+    const deadline = Math.min(...this.pendingSocketSends.map((sent) => sent.deadline))
+    this.ackTimer = setTimeout(() => {
+      this.ackTimer = null
+      if (this.destroyed || this.status === 'revoked' || this.pendingSocketSends.length === 0) return
+      this.beginHttpRecovery(true)
+    }, Math.max(0, deadline - Date.now()))
+  }
+
+  /**
+   * Stops trusting outstanding socket sends and reconciles the merged pending
+   * state through the authoritative HTTP path. Existing async recovery is
+   * fenced rather than awaited so a stale read cannot make this provider synced.
+   */
+  private beginHttpRecovery(catchUpFirst: boolean): void {
+    if (this.destroyed || this.status === 'revoked') return
+    this.clearSocketSends()
+    if (this.pendingUpdate) this.needsHttpRecovery = true
+    if (this.recoveryInFlight) {
+      this.recoveryRequested = true
+      this.recoveryCatchUpRequested ||= catchUpFirst
+      return
+    }
+    this.startRecovery(catchUpFirst)
+  }
+
   private startRecovery(catchUpFirst = true): void {
     if (this.recoveryInFlight || this.destroyed || this.status === 'revoked') return
     if (catchUpFirst) this.setStatus('connecting')
@@ -327,16 +459,28 @@ export class CollabProvider {
         await this.flushPending(epoch)
         if (!this.active(epoch) || this.pendingUpdate) return
         this.needsHttpRecovery = false
-        this.setStatus(this.canWrite ? 'synced' : 'read-only')
-        this.publishAwareness()
+        if (!this.recoveryRequested) {
+          this.setStatus(this.canWrite ? 'synced' : 'read-only')
+          this.publishAwareness()
+        }
       } catch (error) {
         if (!this.active(epoch)) return
-        this.setStatus(
-          'error',
-          error instanceof Error ? error.message : 'An edit could not be saved',
-        )
+        if (!this.recoveryRequested) {
+          this.setStatus(
+            'error',
+            error instanceof Error ? error.message : 'An edit could not be saved',
+          )
+        }
       } finally {
-        if (this.recoveryEpoch === epoch) this.recoveryInFlight = null
+        if (this.recoveryEpoch === epoch) {
+          this.recoveryInFlight = null
+          const rerun = this.recoveryRequested
+          const catchUpAgain = this.recoveryCatchUpRequested
+          this.recoveryRequested = false
+          this.recoveryCatchUpRequested = false
+          if (rerun) this.startRecovery(catchUpAgain)
+          else this.maybeCompact()
+        }
       }
     })()
     this.recoveryInFlight = operation
@@ -391,12 +535,12 @@ export class CollabProvider {
 
       if (this.pendingVersion === version) {
         this.pendingUpdate = null
-        this.pendingSocketAcks = 0
+        this.clearSocketSends()
         this.needsHttpRecovery = false
       } else {
         // A programmatic local update arrived while the UI was fail-closed.
         // Resend the merged value; duplicate Yjs bytes are state-idempotent.
-        this.pendingSocketAcks = 0
+        this.clearSocketSends()
         this.needsHttpRecovery = true
       }
     }
@@ -420,16 +564,17 @@ export class CollabProvider {
   // Fan-out
   // -------------------------------------------------------------------------
 
-  private mergePending(update: Uint8Array): void {
+  private mergePending(update: Uint8Array): number {
     this.pendingUpdate = this.pendingUpdate
       ? Y.mergeUpdates([this.pendingUpdate, update])
       : update
     this.pendingVersion += 1
+    return this.pendingVersion
   }
 
   private async publish(update: Uint8Array): Promise<void> {
     if (!this.canWrite || this.destroyed || this.status === 'revoked') return
-    this.mergePending(update)
+    const version = this.mergePending(update)
     const encoded = toBase64(update)
 
     if (this.status === 'error') {
@@ -453,17 +598,23 @@ export class CollabProvider {
 
     if (this.needsHttpRecovery) {
       this.setStatus('saving')
-      this.startRecovery(false)
+      this.beginHttpRecovery(false)
       return
     }
 
     if (encoded.length <= MAX_FRAME_UPDATE_BYTES) {
       this.setStatus('saving')
       if (wsManager.sendCollabUpdate(this.documentId, encoded)) {
-        this.pendingSocketAcks += 1
+        this.pendingSocketSends.push({
+          payload: encoded,
+          version,
+          deadline: Date.now() + COLLAB_ACK_TIMEOUT_MS,
+        })
+        this.socketCycleVersion = Math.max(this.socketCycleVersion, version)
+        this.armAckWatchdog()
         return
       }
-      this.pendingSocketAcks = 0
+      this.clearSocketSends()
       this.needsHttpRecovery = true
       this.setStatus('connecting')
       return
@@ -471,7 +622,7 @@ export class CollabProvider {
 
     this.needsHttpRecovery = true
     this.setStatus('saving')
-    this.startRecovery(false)
+    this.beginHttpRecovery(false)
   }
 
   private publishAwareness() {
@@ -491,16 +642,60 @@ export class CollabProvider {
    * the entire compaction mechanism, and a long-lived document whose clients
    * ignore it grows its log forever.
    */
-  private async compact(throughSeq: number): Promise<void> {
-    if (this.destroyed || !this.canWrite) return
-    try {
-      const snapshot = Y.encodeStateAsUpdate(this.doc)
-      await collabApi.snapshot(this.documentId, throughSeq, toBase64(snapshot))
-    } catch {
-      // Losing the race to another client is normal and not an error worth
-      // showing anybody; so is a transient failure, because the server asks
-      // again the next time the threshold is crossed.
+  private requestCompaction(headSeq: number): void {
+    if (!Number.isSafeInteger(headSeq) || headSeq <= 0 || this.destroyed || !this.canWrite) return
+    this.pendingCompactionHead = Math.max(this.pendingCompactionHead, headSeq)
+    this.compactionRecoveryWatermark = -1
+    this.maybeCompact()
+  }
+
+  private maybeCompact(): void {
+    if (
+      this.destroyed ||
+      !this.canWrite ||
+      this.pendingCompactionHead <= 0 ||
+      this.compactionInFlight
+    ) return
+
+    const synchronized =
+      this.status === 'synced' &&
+      this.pendingUpdate === null &&
+      this.pendingSocketSends.length === 0 &&
+      !this.needsHttpRecovery &&
+      !this.recoveryInFlight &&
+      this.pendingSeqs.size === 0
+    const reachedRequest = this.watermark >= this.pendingCompactionHead
+    if (!synchronized || !reachedRequest) {
+      const canCatchUp =
+        this.pendingUpdate === null &&
+        this.pendingSocketSends.length === 0 &&
+        !this.recoveryInFlight &&
+        this.compactionRecoveryWatermark !== this.watermark
+      if (canCatchUp) {
+        this.compactionRecoveryWatermark = this.watermark
+        this.beginHttpRecovery(true)
+      }
+      return
     }
+
+    // Encode and label the exact same verified contiguous state. The request's
+    // head is only a hint; using it here would let the server delete updates this
+    // replica never applied.
+    const throughSeq = this.watermark
+    const requestedHead = this.pendingCompactionHead
+    const snapshot = Y.encodeStateAsUpdate(this.doc)
+    this.compactionInFlight = true
+    void collabApi.snapshot(this.documentId, throughSeq, toBase64(snapshot))
+      .catch(() => {
+        // Another compactor winning and transient failures are retried only when
+        // the server asks again; never spin a full-document upload loop.
+      })
+      .finally(() => {
+        if (this.destroyed) return
+        this.compactionInFlight = false
+        if (this.pendingCompactionHead <= requestedHead) this.pendingCompactionHead = 0
+        this.maybeCompact()
+      })
   }
 
   private setStatus(status: ProviderStatus, detail?: string) {

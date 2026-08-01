@@ -21,6 +21,7 @@ import { extractSheet } from '../lib/sheet/projection'
 import { DesignModel } from '../lib/design/model'
 import { extractDesign } from '../lib/design/projection'
 import type { Projection } from '../editor/projection'
+import { ProjectionScheduler } from '../lib/collab/projectionScheduler'
 
 /**
  * A collaborative document.
@@ -50,8 +51,16 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   const fileType: string = route.params?.fileType ?? 'document'
 
   const user = useAuthStore((s) => s.user)
-  const [status, setStatus] = useState<ProviderStatus>('connecting')
-  const [detail, setDetail] = useState<string | null>(null)
+  const sessionGeneration = useAuthStore((s) => s.sessionGeneration)
+  const providerBoundary = `${sessionGeneration}:${documentId ?? ''}`
+  const [providerLease, setProviderLease] = useState<{
+    boundary: string
+    status: ProviderStatus
+    detail: string | null
+  }>(() => ({ boundary: providerBoundary, status: 'connecting', detail: null }))
+  const status: ProviderStatus =
+    providerLease.boundary === providerBoundary ? providerLease.status : 'connecting'
+  const detail = providerLease.boundary === providerBoundary ? providerLease.detail : null
   const [projectionSeq, setProjectionSeq] = useState(0)
   const projectionSeqRef = useRef(0)
 
@@ -64,12 +73,22 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   useEffect(() => {
     projectionSeqRef.current = 0
     setProjectionSeq(0)
-  }, [documentId])
+  }, [documentId, sessionGeneration])
 
   // One Y.Doc for the life of the screen. Recreating it would discard the
   // in-memory state and re-download the whole document on every render.
-  const doc = useMemo(() => new Y.Doc(), [])
+  const doc = useMemo(() => new Y.Doc(), [documentId, sessionGeneration])
   const providerRef = useRef<CollabProvider | null>(null)
+  const surfaceSchedulerRef = useRef<ProjectionScheduler<Projection> | null>(null)
+  const documentProjectionFlushRef = useRef<() => boolean>(() => false)
+  const registerDocumentProjectionFlush = useCallback((flush: () => boolean) => {
+    documentProjectionFlushRef.current = flush
+    return () => {
+      if (documentProjectionFlushRef.current === flush) {
+        documentProjectionFlushRef.current = () => false
+      }
+    }
+  }, [])
 
   const identity = useMemo(
     () => ({
@@ -77,18 +96,19 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
       name: user?.full_name || user?.username || 'Someone',
       color: colorFor(user?.id ?? ''),
     }),
-    [user],
+    [user?.id, user?.full_name, user?.username],
   )
+  const identityRef = useRef(identity)
+  identityRef.current = identity
 
   useEffect(() => {
     if (!documentId) return
     const provider = new CollabProvider({
       documentId,
       doc,
-      user: identity,
+      user: identityRef.current,
       onStatus: (s, d) => {
-        setStatus(s)
-        setDetail(d ?? null)
+        setProviderLease({ boundary: providerBoundary, status: s, detail: d ?? null })
       },
       onProjectionSeq: acceptProjectionSeq,
       // The server asking for a projection it cannot produce itself. Raises the
@@ -99,10 +119,18 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
     })
     providerRef.current = provider
     return () => {
+      // React tears parent passive effects down before child editor effects.
+      // Flush derived work while this exact provider can still validate it.
+      try { surfaceSchedulerRef.current?.flush() } catch { /* derived state is best effort */ }
+      try { documentProjectionFlushRef.current() } catch { /* editor may already be torn down */ }
       provider.destroy()
-      providerRef.current = null
+      if (providerRef.current === provider) providerRef.current = null
     }
-  }, [documentId, doc, identity, acceptProjectionSeq])
+  }, [documentId, doc, sessionGeneration, providerBoundary, acceptProjectionSeq])
+
+  useEffect(() => {
+    providerRef.current?.updateUser(identity)
+  }, [identity])
 
   // The provider's contiguous watermark owns the projection sequence. The
   // descriptor gap is only a repair hint; its head can be ahead of content
@@ -140,13 +168,20 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   }, [fileId])
 
   const publish = useCallback(
-    (projection: Projection) => {
-      if (!fileId) return
+    (projection: Projection): boolean => {
+      const provider = providerRef.current
+      if (
+        !fileId ||
+        !provider ||
+        !provider.projectionReady ||
+        projection.seq !== projectionSeqRef.current
+      ) return false
       // Best effort and deliberately silent. The projection is derived state:
       // losing one costs search until the next edit and costs zero writing, so
       // interrupting somebody's typing with an error about it would be the
       // wrong trade.
       void driveApi.project(fileId, projection).catch(() => undefined)
+      return true
     },
     [fileId],
   )
@@ -170,14 +205,38 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   // that closing a tab leaves the object searchable, long enough that typing is
   // one projection rather than forty. The server's monotonic write makes a
   // burst harmless regardless.
-  const projectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    if (fileType !== 'spreadsheet' && fileType !== 'design') return
+    const scheduler = new ProjectionScheduler<Projection>({
+      delayMs: 2000,
+      readState: () => {
+        const provider = providerRef.current
+        return {
+          seq: projectionSeqRef.current,
+          synced: provider?.projectionReady ?? false,
+          pending: !(provider?.projectionReady ?? false),
+        }
+      },
+      build: (seq) => (
+        fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq)
+      ),
+      publish,
+    })
+    surfaceSchedulerRef.current = scheduler
+    return () => {
+      scheduler.flush()
+      scheduler.dispose()
+      if (surfaceSchedulerRef.current === scheduler) surfaceSchedulerRef.current = null
+    }
+  }, [documentId, fileType, sheet, design, publish])
+
   const scheduleProjection = useCallback(() => {
-    if (projectTimer.current) clearTimeout(projectTimer.current)
-    projectTimer.current = setTimeout(() => {
-      const seq = projectionSeqRef.current
-      publish(fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq))
-    }, 2000)
-  }, [publish, fileType, sheet, design])
+    surfaceSchedulerRef.current?.request()
+  }, [])
+
+  useEffect(() => {
+    surfaceSchedulerRef.current?.notify()
+  }, [status, projectionSeq])
 
   // FLUSH ON UNMOUNT, do not merely cancel.
   //
@@ -188,15 +247,6 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   // editor already flushes on unmount (Editor.web.tsx); this is the same rule
   // for the two surfaces that project from here.
   //
-  // The refs are read rather than the state values so this effect can have an
-  // empty dependency list and actually run on unmount rather than on every
-  // change of seq.
-  const flushRef = useRef<() => void>(() => {})
-  flushRef.current = () => {
-    if (!fileId || fileType === 'document') return
-    const seq = projectionSeqRef.current
-    publish(fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq))
-  }
   // Catch up once the document is loaded and writable.
   //
   // Gated on `synced` rather than firing on open: projecting an empty Y.Doc
@@ -231,19 +281,10 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
       // also means an empty result leaves the request live for the server's
       // next re-ask rather than burning it.
       if (!worthPublishing(projection)) return
-      caughtUp.current = projectNonce
-      publish(projection)
+      if (publish(projection)) caughtUp.current = projectNonce
     }, 1500)
     return () => clearTimeout(timer)
-  }, [projectNonce, status, fileId, fileType, sheet, design, publish])
-
-  useEffect(() => () => {
-    if (projectTimer.current) {
-      clearTimeout(projectTimer.current)
-      projectTimer.current = null
-      flushRef.current()
-    }
-  }, [])
+  }, [projectNonce, status, projectionSeq, fileId, fileType, sheet, design, publish])
 
   if (!documentId) {
     return (
@@ -307,8 +348,10 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
                 doc={doc}
                 awareness={providerRef.current!.awareness}
                 editable={editable}
-                user={{ name: identity.name, color: identity.color }}
+                projectable={providerRef.current?.projectionReady === true}
+                user={identity}
                 onProject={publish}
+                registerProjectionFlush={registerDocumentProjectionFlush}
                 seq={projectionSeq}
                 fileId={fileId}
                 catchUp={projectNonce}

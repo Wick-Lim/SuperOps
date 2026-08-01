@@ -1,4 +1,3 @@
-import { api } from './client'
 import { API_BASE_URL, REQUEST_TIMEOUT_MS } from '../config'
 
 export type DevicePlatform = 'ios' | 'android' | 'web'
@@ -10,11 +9,37 @@ export type DevicePlatform = 'ios' | 'android' | 'web'
  * rather than an error worth showing anyone.
  */
 export const deviceApi = {
-  register(token: string, platform: DevicePlatform) {
-    return api.post<{ token: string; platform: string }>('/users/me/devices', {
-      token,
-      platform,
-    })
+  /**
+   * Registers for the account that started the lifecycle, even if the shared
+   * auth store changes while the request is in flight. A bare, explicit-bearer
+   * request also avoids the API client's automatic-logout path recursively
+   * waiting on the push lifecycle that called it.
+   */
+  async registerForSession(
+    token: string,
+    platform: DevicePlatform,
+    accessToken: string | null,
+  ): Promise<{ ok: boolean; status: number }> {
+    if (!accessToken) return { ok: false, status: 401 }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+    try {
+      const res = await fetch(`${API_BASE_URL}/users/me/devices`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ token, platform }),
+        signal: controller.signal,
+      })
+      return { ok: res.ok, status: res.status }
+    } catch {
+      return { ok: false, status: 0 }
+    } finally {
+      clearTimeout(timer)
+    }
   },
 
   /**

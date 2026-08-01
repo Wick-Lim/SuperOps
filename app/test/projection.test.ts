@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { extract, SCHEMA_VERSION, type Node } from '../src/editor/projection'
 
 const doc = (...content: Node[]): Node => ({ type: 'doc', content })
@@ -11,6 +11,10 @@ const h = (level: number, text: string, blockId = 'h1'): Node => ({
   type: 'heading',
   attrs: { blockId, level },
   content: [{ text }],
+})
+
+afterEach(() => {
+  vi.useRealTimers()
 })
 
 describe('the projection extractor', () => {
@@ -359,6 +363,165 @@ describe('the catch-up claim', () => {
         `${file} claims the request before checking the projection is worth ` +
           `publishing, so an empty one burns the request`,
       ).toBe(true)
+    }
+  })
+})
+
+describe('projection scheduling waits for durable collaboration state', () => {
+  it('flushes on blur without inventing another required server sequence', async () => {
+    const fs = await import('node:fs/promises')
+    const source = await fs.readFile('src/editor/Editor.web.tsx', 'utf8')
+
+    expect(source).toContain("editor.on('update', schedule)")
+    expect(source).toContain("editor.on('blur', flushProjection)")
+    expect(source).not.toContain("editor.on('blur', schedule)")
+  })
+
+  it('keeps the debounce after an early acknowledgement and flushes at its original floor', async () => {
+    vi.useFakeTimers()
+    const { ProjectionScheduler } = await import('../src/lib/collab/projectionScheduler')
+    const state = { seq: 7, synced: false, pending: true }
+    const published: number[] = []
+    const scheduler = new ProjectionScheduler({
+      delayMs: 2_000,
+      readState: () => state,
+      build: (seq) => seq,
+      publish: (seq) => {
+        published.push(seq)
+        return true
+      },
+    })
+
+    scheduler.request()
+    state.seq = 8
+    state.synced = true
+    state.pending = false
+    scheduler.notify()
+    expect(published, 'acknowledgement bypassed the settle debounce').toEqual([])
+
+    expect(scheduler.flush()).toBe(true)
+    expect(published).toEqual([8])
+    expect(scheduler.flush(), 'blur created a synthetic requirement for seq 9').toBe(false)
+    scheduler.dispose()
+  })
+
+  it('flushes every durable surface before destroying its provider', async () => {
+    const fs = await import('node:fs/promises')
+    const source = await fs.readFile('src/screens/CollabDocumentScreen.tsx', 'utf8')
+    const cleanupStart = source.indexOf('return () => {', source.indexOf('const provider = new CollabProvider'))
+    const cleanupEnd = source.indexOf('}, [documentId', cleanupStart)
+    const cleanup = source.slice(cleanupStart, cleanupEnd)
+    const surfaceFlush = cleanup.indexOf('surfaceSchedulerRef.current?.flush()')
+    const documentFlush = cleanup.indexOf('documentProjectionFlushRef.current()')
+    const destroy = cleanup.indexOf('provider.destroy()')
+
+    expect(surfaceFlush).toBeGreaterThan(-1)
+    expect(documentFlush).toBeGreaterThan(-1)
+    expect(surfaceFlush).toBeLessThan(destroy)
+    expect(documentFlush).toBeLessThan(destroy)
+  })
+
+  it('renders a replacement provider boundary as connecting until that provider reports status', async () => {
+    const fs = await import('node:fs/promises')
+    const source = await fs.readFile('src/screens/CollabDocumentScreen.tsx', 'utf8')
+
+    expect(source).toContain('const providerBoundary =')
+    expect(source).toContain("providerLease.boundary === providerBoundary ? providerLease.status : 'connecting'")
+    expect(source).toContain('boundary: providerBoundary, status: s')
+  })
+
+  it('keeps cleanup bound to the document publish target that created the scheduler', async () => {
+    const fs = await import('node:fs/promises')
+    const source = await fs.readFile('src/editor/Editor.web.tsx', 'utf8')
+
+    expect(
+      source,
+      'a route change can make an old editor cleanup publish its content to the new file',
+    ).not.toContain('onProjectRef')
+    expect(source).toContain('publish: onProject')
+    expect(source).toContain('}, [editor, onProject, registerProjectionFlush])')
+  })
+
+  it('keeps a pending editor projection alive across status and profile renders', async () => {
+    const fs = await import('node:fs/promises')
+    const editorSource = await fs.readFile('src/editor/Editor.web.tsx', 'utf8')
+    const screenSource = await fs.readFile('src/screens/CollabDocumentScreen.tsx', 'utf8')
+
+    // A saving -> synced render and a profile refresh must update the existing
+    // editor. Recreating it disposes the scheduler while its dirty floor is
+    // still unsafe, so the later acknowledgement has nothing left to publish.
+    expect(screenSource).toContain('user={identity}')
+    expect(editorSource).toContain('[doc, awareness, resolver]')
+    expect(editorSource).not.toContain('[doc, awareness, user, resolver]')
+    expect(editorSource).toContain('editor?.commands.updateUser(user)')
+    expect(editorSource).toContain('[editor, user.id, user.name, user.color]')
+    expect(editorSource).toContain('[extensions],')
+    expect(editorSource).not.toContain('[extensions, editable]')
+  })
+
+  it('retains a document edit until its acknowledged sequence is projectable', async () => {
+    vi.useFakeTimers()
+    const { ProjectionScheduler } = await import('../src/lib/collab/projectionScheduler')
+    const state = { seq: 7, synced: false, pending: true }
+    let body = 'draft'
+    const published: Array<{ seq: number; body: string }> = []
+    const scheduler = new ProjectionScheduler({
+      delayMs: 2_000,
+      readState: () => state,
+      build: (seq) => ({ seq, body }),
+      publish: (projection) => {
+        published.push(projection)
+        return true
+      },
+    })
+
+    scheduler.request()
+    body = 'latest durable content'
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(published).toEqual([])
+
+    // Merely becoming "synced" at the edit's old watermark is not enough.
+    state.synced = true
+    state.pending = false
+    scheduler.notify()
+    expect(published).toEqual([])
+
+    state.seq = 8
+    scheduler.notify()
+    expect(published).toEqual([{ seq: 8, body: 'latest durable content' }])
+    scheduler.dispose()
+  })
+
+  it('retains sheet and design work across an unsafe timer and regenerates it at the new sequence', async () => {
+    vi.useFakeTimers()
+    const { ProjectionScheduler } = await import('../src/lib/collab/projectionScheduler')
+
+    for (const surface of ['spreadsheet', 'design']) {
+      const state = { seq: 12, synced: false, pending: true }
+      let revision = 1
+      const published: Array<{ seq: number; surface: string; revision: number }> = []
+      const scheduler = new ProjectionScheduler({
+        delayMs: 2_000,
+        readState: () => state,
+        build: (seq) => ({ seq, surface, revision }),
+        publish: (projection) => {
+          published.push(projection)
+          return true
+        },
+      })
+
+      scheduler.request()
+      revision = 2
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(published, surface).toEqual([])
+      expect(scheduler.flush(), `${surface} unsafe unmount flush`).toBe(false)
+
+      state.seq = 13
+      state.synced = true
+      state.pending = false
+      scheduler.notify()
+      expect(published, surface).toEqual([{ seq: 13, surface, revision: 2 }])
+      scheduler.dispose()
     }
   })
 })

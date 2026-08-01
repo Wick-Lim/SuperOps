@@ -198,7 +198,7 @@ func (c *Client) handleCollabUpdate(ctx context.Context, raw json.RawMessage) {
 		return
 	}
 	if c.roomHandler == nil || !c.InRoom(data.DocumentID) {
-		c.sendError("FORBIDDEN", "join the document before sending updates")
+		c.sendRoomError("update", data.DocumentID, ErrRoomForbidden)
 		return
 	}
 	if !c.CanWriteRoom(data.DocumentID) {
@@ -236,7 +236,7 @@ func (c *Client) handleCollabAwareness(ctx context.Context, raw json.RawMessage)
 		return
 	}
 	if c.roomHandler == nil || !c.InRoom(data.DocumentID) {
-		c.sendError("FORBIDDEN", "join the document before sending awareness")
+		c.sendRoomError("awareness", data.DocumentID, ErrRoomForbidden)
 		return
 	}
 	if len(data.State) == 0 || len(data.State) > maxCollabPayloadBytes {
@@ -268,22 +268,26 @@ func (c *Client) documentArg(raw json.RawMessage) (string, bool) {
 // that is not one of the sentinels is a failure to decide, not a denial, and is
 // reported as an internal error with the detail kept server-side.
 func (c *Client) sendRoomError(op, documentID string, err error) {
+	code := "INTERNAL_ERROR"
+	message := "could not process collaboration frame"
 	switch {
 	case errors.Is(err, ErrRoomNotFound):
-		c.sendError("NOT_FOUND", "collaboration document not found")
+		code, message = "NOT_FOUND", "collaboration document not found"
 	case errors.Is(err, ErrRoomForbidden):
-		c.sendError("FORBIDDEN", "not allowed to open this collaboration document")
+		code, message = "FORBIDDEN", "not allowed to open this collaboration document"
 	case errors.Is(err, ErrRoomReadOnly):
-		c.sendError("FORBIDDEN", "read-only access to this collaboration document")
+		code, message = "FORBIDDEN", "read-only access to this collaboration document"
 	case errors.Is(err, ErrRoomInvalidPayload):
-		c.sendError("BAD_REQUEST", "invalid collaboration payload")
+		code, message = "BAD_REQUEST", "invalid collaboration payload"
 	case errors.Is(err, ErrRoomPayloadTooLarge):
-		c.sendError("PAYLOAD_TOO_LARGE", "collaboration update too large for the socket; use the HTTP append endpoint")
+		code, message = "PAYLOAD_TOO_LARGE", "collaboration update too large for the socket; use the HTTP append endpoint"
 	default:
 		c.logger.Warn("collaboration frame failed",
 			"op", op, "user_id", c.userID, "document_id", documentID, "error", err)
-		c.sendError("INTERNAL_ERROR", "could not process collaboration frame")
 	}
+	c.SendMessage(TypeError, map[string]string{
+		"code": code, "message": message, "op": op, "document_id": documentID,
+	})
 }
 
 // recheckRooms re-validates every live room membership. RevokeRoom is the

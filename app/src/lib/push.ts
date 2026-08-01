@@ -6,7 +6,6 @@ import * as Notifications from 'expo-notifications'
 import { deviceApi, type DevicePlatform } from '../api/devices'
 import { channelApi } from '../api/channels'
 import { notificationApi } from '../api/notifications'
-import { isApiError } from './errors'
 import { useAuthStore } from '../stores/authStore'
 import { useChannelStore } from '../stores/channelStore'
 import { useWorkspaceStore } from '../stores/workspaceStore'
@@ -39,11 +38,11 @@ import { navigationRef } from '../navigation/navigationRef'
  */
 const PUSH_TOKEN_KEY = 'superops-push-token'
 
-let pushPersistenceTail: Promise<void> = Promise.resolve()
+let pushLifecycleTail: Promise<void> = Promise.resolve()
 
-function enqueuePushPersistence<T>(work: () => Promise<T>): Promise<T> {
-  const run = pushPersistenceTail.then(work, work)
-  pushPersistenceTail = run.then(() => undefined, () => undefined)
+function enqueuePushLifecycle<T>(work: () => Promise<T>): Promise<T> {
+  const run = pushLifecycleTail.then(work, work)
+  pushLifecycleTail = run.then(() => undefined, () => undefined)
   return run
 }
 
@@ -177,6 +176,14 @@ export async function registerPushToken(): Promise<PushOutcome> {
   // this project does not ship; the web client already has the live WebSocket.
   if (currentPlatform() === 'web') return 'unsupported'
 
+  const origin = useAuthStore.getState()
+  const originGeneration = origin.sessionGeneration
+  const originAccessToken = origin.accessToken
+  const registrationIsCurrent = () => {
+    const auth = useAuthStore.getState()
+    return auth.sessionGeneration === originGeneration && auth.isAuthenticated
+  }
+
   let permissions: Notifications.NotificationPermissionsStatus
   try {
     permissions = await Notifications.getPermissionsAsync()
@@ -206,21 +213,25 @@ export async function registerPushToken(): Promise<PushOutcome> {
     return 'unavailable'
   }
 
-  try {
-    await deviceApi.register(token, currentPlatform())
-  } catch (err) {
-    // 404 is the deployment saying PUSH_ENABLED is off. Anything else is a
-    // real failure, but still not one worth interrupting the user for.
-    if (isApiError(err) && err.status === 404) return 'unsupported'
-    return 'failed'
-  }
+  return enqueuePushLifecycle(async () => {
+    if (!registrationIsCurrent()) return 'failed'
 
-  try {
-    await enqueuePushPersistence(() => AsyncStorage.setItem(PUSH_TOKEN_KEY, token))
-  } catch {
-    // Only costs us the ability to deregister on logout without a fresh token.
-  }
-  return 'registered'
+    // Persist a cleanup lease before the remote write. If logout starts while
+    // the POST is in flight, its queued deregistration can then remove a write
+    // the server accepted even when the response belongs to the old session.
+    try {
+      await AsyncStorage.setItem(PUSH_TOKEN_KEY, token)
+    } catch {
+      // Do not create a remote registration we cannot later identify safely.
+      return 'failed'
+    }
+    if (!registrationIsCurrent()) return 'failed'
+
+    const result = await deviceApi.registerForSession(token, currentPlatform(), originAccessToken)
+    if (result.status === 404) return 'unsupported'
+    if (!result.ok || !registrationIsCurrent()) return 'failed'
+    return 'registered'
+  })
 }
 
 /**
@@ -235,16 +246,16 @@ export async function deregisterPushToken(
   accessToken: string | null,
   resetGeneration: number,
 ): Promise<void> {
-  let token: string | null = null
-  try {
-    token = await enqueuePushPersistence(() => AsyncStorage.getItem(PUSH_TOKEN_KEY))
-  } catch {
-    return
-  }
-  if (!token) return
+  await enqueuePushLifecycle(async () => {
+    let token: string | null
+    try {
+      token = await AsyncStorage.getItem(PUSH_TOKEN_KEY)
+    } catch {
+      return
+    }
+    if (!token) return
 
-  await deviceApi.deregister(token, accessToken)
-  await enqueuePushPersistence(async () => {
+    await deviceApi.deregister(token, accessToken)
     const cleanupIsCurrent = () => {
       const auth = useAuthStore.getState()
       return auth.sessionGeneration === resetGeneration && !auth.isAuthenticated
