@@ -4,6 +4,8 @@ import { wsManager } from '../src/lib/websocket'
 import { CollabProvider, type ProviderStatus } from '../src/lib/collab/provider'
 import { fromBase64, toBase64 } from '../src/lib/collab/base64'
 import {
+  apiFailure,
+  envelope,
   FakeWebSocket,
   flush,
   installFakeWebSocket,
@@ -78,7 +80,11 @@ beforeEach(() => {
   resetStores()
   installFakeWebSocket()
   signIn()
-  net = mockFetch((req) => (req.path.includes('/state') ? emptyState() : ok({})))
+  net = mockFetch((req) => {
+    if (req.path.includes('/state')) return emptyState()
+    if (req.path.includes('/updates')) return envelope(201, { data: { seq: 1 } })
+    return ok({})
+  })
 })
 
 afterEach(() => {
@@ -312,6 +318,7 @@ describe('the collaboration provider', () => {
   // watermark exactly where this client's own edits are.
   it('applies its own echo rather than skipping it', async () => {
     const socket = connectOpen()
+    socket.emit({ type: 'hello', seq: 1, data: { connection_id: 'connection-a' } })
     const { doc, provider } = makeProvider()
     await flush()
     socket.emit({ type: 'collab.joined', data: { document_id: DOC, head_seq: 0, can_write: true } })
@@ -323,7 +330,13 @@ describe('the collaboration provider', () => {
 
     socket.emit({
       type: 'collab.update',
-      data: { document_id: DOC, seq: 1, actor_id: 'u-self', origin_conn: '', update: sent },
+      data: {
+        document_id: DOC,
+        seq: 1,
+        actor_id: 'u-self',
+        origin_conn: 'connection-a',
+        update: sent,
+      },
     })
     await flush()
 
@@ -338,6 +351,233 @@ describe('the collaboration provider', () => {
     await settle()
     const stateCalls = net.calls.filter((c) => c.path.includes('/state'))
     expect(sinceOf(stateCalls[0].path), 'the echo was skipped, leaving a hole at this clients own edits').toBe('1')
+    provider.destroy()
+  })
+
+  it('stays saving until an echo from its own connection is durable', async () => {
+    const socket = connectOpen()
+    socket.emit({ type: 'hello', seq: 1, data: { connection_id: 'connection-a' } })
+    const statuses: ProviderStatus[] = []
+    const { doc, provider } = makeProvider((status) => statuses.push(status))
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 0, can_write: true },
+    })
+    await settle()
+
+    doc.getText('body').insert(0, 'pending')
+    await flush()
+    const update = socket.sentOfType('collab.update')[0].data.update as string
+    expect(provider.currentStatus).toBe('saving')
+    expect(provider.hasPendingChanges).toBe(true)
+
+    socket.emit({
+      type: 'collab.update',
+      data: {
+        document_id: DOC,
+        seq: 1,
+        actor_id: 'u-self',
+        origin_conn: 'another-connection',
+        update,
+      },
+    })
+    await flush()
+    expect(provider.currentStatus).toBe('saving')
+
+    socket.emit({
+      type: 'collab.update',
+      data: {
+        document_id: DOC,
+        seq: 2,
+        actor_id: 'u-self',
+        origin_conn: 'connection-a',
+        update,
+      },
+    })
+    await flush()
+    expect(provider.currentStatus).toBe('synced')
+    expect(provider.hasPendingChanges).toBe(false)
+    expect(statuses).toContain('saving')
+    provider.destroy()
+  })
+
+  it('keeps an unacknowledged update and fails closed when send is rejected', async () => {
+    const socket = connectOpen()
+    socket.emit({ type: 'hello', seq: 1, data: { connection_id: 'connection-a' } })
+    const { doc, provider } = makeProvider()
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 0, can_write: true },
+    })
+    await settle()
+
+    socket.failNextSend = true
+    doc.getText('body').insert(0, 'survive the race')
+    await flush()
+
+    expect(provider.currentStatus).toBe('connecting')
+    expect(provider.hasPendingChanges).toBe(true)
+    provider.destroy()
+  })
+
+  it('catches up before appending the merged pending update and only then syncs', async () => {
+    const socket = connectOpen()
+    socket.emit({ type: 'hello', data: { connection_id: 'connection-a' } })
+    const statuses: ProviderStatus[] = []
+    const { doc, provider } = makeProvider((status) => statuses.push(status))
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 0, can_write: true },
+    })
+    await settle()
+
+    doc.getText('body').insert(0, 'race edit')
+    await flush()
+    socket.dropNow()
+    expect(provider.currentStatus).toBe('connecting')
+    expect(provider.hasPendingChanges).toBe(true)
+
+    net.calls.length = 0
+    const resumed = connectOpen()
+    resumed.emit({ type: 'hello', data: { connection_id: 'connection-b' } })
+    resumed.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 0, can_write: true },
+    })
+    await settle()
+
+    const stateIndex = net.calls.findIndex((call) => call.path.includes('/state'))
+    const appendIndex = net.calls.findIndex((call) => call.path.includes('/updates'))
+    expect(stateIndex).toBeGreaterThanOrEqual(0)
+    expect(appendIndex).toBeGreaterThan(stateIndex)
+    const body = net.calls[appendIndex].body as { update: string }
+    const restored = new Y.Doc()
+    Y.applyUpdate(restored, fromBase64(body.update))
+    expect(restored.getText('body').toString()).toContain('race edit')
+    expect(provider.currentStatus).toBe('synced')
+    expect(provider.hasPendingChanges).toBe(false)
+    expect(statuses[statuses.length - 1]).toBe('synced')
+    provider.destroy()
+  })
+
+  it('retains failed recovery bytes and retries the same update', async () => {
+    let appendAttempts = 0
+    net = mockFetch((req) => {
+      if (req.path.includes('/state')) return emptyState()
+      if (req.path.includes('/updates')) {
+        appendAttempts += 1
+        return appendAttempts === 1
+          ? apiFailure(503, 'SERVICE_UNAVAILABLE')
+          : envelope(201, { data: { seq: 1 } })
+      }
+      return ok({})
+    })
+    const socket = connectOpen()
+    socket.emit({ type: 'hello', data: { connection_id: 'connection-a' } })
+    const { doc, provider } = makeProvider()
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 0, can_write: true },
+    })
+    await settle()
+    doc.getText('body').insert(0, 'retry me')
+    await flush()
+    socket.dropNow()
+    const resumed = connectOpen()
+    resumed.emit({ type: 'hello', data: { connection_id: 'connection-b' } })
+    resumed.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 0, can_write: true },
+    })
+    await settle()
+
+    expect(provider.currentStatus).toBe('error')
+    expect(provider.hasPendingChanges).toBe(true)
+    provider.retry()
+    await settle()
+
+    expect(appendAttempts).toBe(2)
+    expect(provider.currentStatus).toBe('synced')
+    expect(provider.hasPendingChanges).toBe(false)
+    provider.destroy()
+  })
+
+  it('ignores a state response released after destroy', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const remote = new Y.Doc()
+    remote.getText('body').insert(0, 'must not appear')
+    net = mockFetch(async (req) => {
+      if (!req.path.includes('/state')) return ok({})
+      await gate
+      return ok({
+        document_id: DOC,
+        snapshot_seq: 0,
+        updates: [{ seq: 1, payload: toBase64(Y.encodeStateAsUpdate(remote)) }],
+        through_seq: 1,
+        head_seq: 1,
+        has_more: false,
+      })
+    })
+    const socket = connectOpen()
+    const statuses: ProviderStatus[] = []
+    const { doc, provider } = makeProvider((status) => statuses.push(status))
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 1, can_write: true },
+    })
+    await flush(10)
+    const callbacksBeforeDestroy = statuses.length
+
+    provider.destroy()
+    release()
+    await settle()
+
+    expect(doc.getText('body').toString()).toBe('')
+    expect(statuses).toHaveLength(callbacksBeforeDestroy)
+  })
+
+  it('lets revocation win over a delayed recovery append', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    net = mockFetch(async (req) => {
+      if (req.path.includes('/state')) return emptyState()
+      if (req.path.includes('/updates')) {
+        await gate
+        return envelope(201, { data: { seq: 1 } })
+      }
+      return ok({})
+    })
+    const socket = connectOpen()
+    const statuses: ProviderStatus[] = []
+    const { doc, provider } = makeProvider((status) => statuses.push(status))
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 0, can_write: true },
+    })
+    await settle()
+    doc.getText('body').insert(0, 'x'.repeat(60_000))
+    await flush(10)
+
+    socket.emit({ type: 'collab.left', data: { document_id: DOC, reason: 'revoked' } })
+    await flush()
+    const revokedAt = statuses.lastIndexOf('revoked')
+    release()
+    await settle()
+
+    expect(provider.currentStatus).toBe('revoked')
+    expect(statuses.slice(revokedAt + 1)).not.toContain('synced')
+    expect(statuses.slice(revokedAt + 1)).not.toContain('error')
     provider.destroy()
   })
 

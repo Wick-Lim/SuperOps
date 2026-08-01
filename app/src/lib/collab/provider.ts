@@ -42,7 +42,17 @@ const MAX_FRAME_UPDATE_BYTES = 24 * 1024
 /** Local origin tag, so the provider can tell its own edits from applied ones. */
 const LOCAL_ORIGIN = 'superops-local'
 
-export type ProviderStatus = 'connecting' | 'synced' | 'read-only' | 'revoked' | 'error'
+export type ProviderStatus =
+  | 'connecting'
+  | 'saving'
+  | 'synced'
+  | 'read-only'
+  | 'revoked'
+  | 'error'
+
+export function isProviderEditable(status: ProviderStatus): boolean {
+  return status === 'synced' || status === 'saving'
+}
 
 export interface ProviderOptions {
   documentId: string
@@ -79,7 +89,16 @@ export class CollabProvider {
   private pending = new Set<number>()
   private headSeq = 0
 
+  /** Merged, opaque Yjs bytes that have not yet been durably acknowledged. */
+  private pendingUpdate: Uint8Array | null = null
+  private pendingVersion = 0
+  private pendingSocketAcks = 0
+  private needsHttpRecovery = false
+  private recoveryEpoch = 0
+  private recoveryInFlight: Promise<void> | null = null
+
   private offRoom: (() => void) | null = null
+  private offConnection: (() => void) | null = null
   private updateHandler: ((update: Uint8Array, origin: unknown) => void) | null = null
   private awarenessHandler: ((changes: unknown, origin: unknown) => void) | null = null
   private destroyed = false
@@ -95,6 +114,15 @@ export class CollabProvider {
     this.awareness.setLocalStateField('user', opts.user)
 
     this.offRoom = wsManager.onRoom((e) => this.handleRoom(e))
+    this.offConnection = wsManager.onStatus((connected) => {
+      if (this.destroyed || this.status === 'revoked') return
+      if (connected) return
+      this.recoveryEpoch += 1
+      this.recoveryInFlight = null
+      this.pendingSocketAcks = 0
+      if (this.pendingUpdate) this.needsHttpRecovery = true
+      this.setStatus('connecting')
+    })
 
     this.updateHandler = (update, origin) => {
       // Only LOCAL edits go back out. Re-broadcasting an update we just applied
@@ -117,6 +145,9 @@ export class CollabProvider {
   destroy() {
     if (this.destroyed) return
     this.destroyed = true
+    this.recoveryEpoch += 1
+    this.offConnection?.()
+    this.offConnection = null
     if (this.updateHandler) this.doc.off('update', this.updateHandler)
     if (this.awarenessHandler) this.awareness.off('update', this.awarenessHandler)
     this.offRoom?.()
@@ -137,17 +168,31 @@ export class CollabProvider {
     return this.status
   }
 
+  get hasPendingChanges(): boolean {
+    return this.pendingUpdate !== null
+  }
+
+  retry(): void {
+    if (this.destroyed || this.status === 'revoked') return
+    this.setStatus('connecting')
+    if (wsManager.isConnected() && wsManager.roomAccess(this.documentId)) {
+      this.startRecovery()
+    } else {
+      wsManager.connect()
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Room events
   // -------------------------------------------------------------------------
 
   private handleRoom(e: RoomEvent) {
-    if (e.documentId !== this.documentId || this.destroyed) return
+    if (e.documentId !== this.documentId || this.destroyed || this.status === 'revoked') return
     switch (e.kind) {
       case 'joined':
         this.canWrite = e.canWrite
         this.headSeq = e.headSeq
-        void this.catchUp()
+        this.startRecovery(true)
         break
       case 'resumed':
         // Nothing published while the socket was down is replayed, so the only
@@ -159,11 +204,12 @@ export class CollabProvider {
       case 'left':
         if (e.reason === 'revoked') {
           this.canWrite = false
+          this.recoveryEpoch += 1
           this.setStatus('revoked', 'Your access to this document was removed.')
         }
         break
       case 'update':
-        this.applyRemote(e.seq, e.update, e.originConn)
+        if (this.applyRemote(e.seq, e.update)) this.acknowledgeOwnEcho(e.originConn)
         break
       case 'awareness':
         this.applyAwareness(e.state, e.actorId)
@@ -193,16 +239,30 @@ export class CollabProvider {
    * update twice is a no-op in Yjs, and skipping the echo would leave the
    * watermark with a permanent hole exactly where this client's own edits are.
    */
-  private applyRemote(seq: number, updateBase64: string, _originConn: string) {
+  private applyRemote(seq: number, updateBase64: string): boolean {
     try {
       Y.applyUpdate(this.doc, fromBase64(updateBase64), LOCAL_ORIGIN)
     } catch {
       // A malformed update cannot be recovered from by retrying, and dropping
       // the document would lose local edits. Refetching state is the honest
       // repair.
-      void this.catchUp()
-      return
+      this.startRecovery(true)
+      return false
     }
+    this.recordAppliedSeq(seq)
+    return true
+  }
+
+  private acknowledgeOwnEcho(originConn: string): void {
+    if (!originConn || originConn !== wsManager.getConnectionId()) return
+    if (this.pendingSocketAcks === 0 || this.needsHttpRecovery) return
+    this.pendingSocketAcks -= 1
+    if (this.pendingSocketAcks !== 0) return
+    this.pendingUpdate = null
+    this.setStatus(this.canWrite ? 'synced' : 'read-only')
+  }
+
+  private recordAppliedSeq(seq: number): void {
     this.advanceWatermark(seq)
   }
 
@@ -219,7 +279,7 @@ export class CollabProvider {
     // merely reordered — it was dropped by backpressure, and nothing replays
     // it. Refetch rather than sit behind a hole forever.
     if (this.pending.size > 0 && seq - this.watermark > 64) {
-      void this.catchUp()
+      this.startRecovery(true)
     }
   }
 
@@ -231,41 +291,96 @@ export class CollabProvider {
    * reconnect after a long absence gets. One path, so the rare case is the one
    * that is exercised constantly.
    */
-  private async catchUp(): Promise<void> {
-    if (this.destroyed) return
-    try {
-      let since = this.watermark
-      for (;;) {
-        const res = await collabApi.state(this.documentId, since)
-        const state = res.data
-        if (!state) break
+  private active(epoch: number): boolean {
+    return !this.destroyed && this.status !== 'revoked' && epoch === this.recoveryEpoch
+  }
 
-        if (state.snapshot) {
-          Y.applyUpdate(this.doc, fromBase64(state.snapshot), LOCAL_ORIGIN)
-        }
-        for (const u of state.updates ?? []) {
-          Y.applyUpdate(this.doc, fromBase64(u.payload), LOCAL_ORIGIN)
-        }
-
-        // The watermark jumps to through_seq wholesale, which is legitimate
-        // precisely because this response IS contiguous — the server read the
-        // log in order. Everything buffered below it is now redundant.
-        this.watermark = Math.max(this.watermark, state.through_seq)
-        this.headSeq = Math.max(this.headSeq, state.head_seq)
-        for (const seq of [...this.pending]) {
-          if (seq <= this.watermark) this.pending.delete(seq)
-        }
-
-        if (!state.has_more) break
-        since = state.through_seq
+  private startRecovery(catchUpFirst = true): void {
+    if (this.recoveryInFlight || this.destroyed || this.status === 'revoked') return
+    if (catchUpFirst) this.setStatus('connecting')
+    const epoch = ++this.recoveryEpoch
+    const operation = (async () => {
+      try {
+        if (catchUpFirst) await this.catchUp(epoch)
+        if (!this.active(epoch)) return
+        await this.flushPending(epoch)
+        if (!this.active(epoch) || this.pendingUpdate) return
+        this.needsHttpRecovery = false
+        this.setStatus(this.canWrite ? 'synced' : 'read-only')
+        this.publishAwareness()
+      } catch (error) {
+        if (!this.active(epoch)) return
+        this.setStatus(
+          'error',
+          error instanceof Error ? error.message : 'An edit could not be saved',
+        )
+      } finally {
+        if (this.recoveryEpoch === epoch) this.recoveryInFlight = null
       }
-      this.setStatus(this.canWrite ? 'synced' : 'read-only')
-      // Announce this client's cursor once it is caught up. The server sends no
-      // roster by design, so the protocol is that a client re-announces itself
-      // whenever it sees somebody it does not know — and on join, nobody does.
-      this.publishAwareness()
-    } catch (err) {
-      this.setStatus('error', err instanceof Error ? err.message : 'Could not load the document')
+    })()
+    this.recoveryInFlight = operation
+  }
+
+  private async catchUp(epoch: number): Promise<void> {
+    let since = this.watermark
+    for (;;) {
+      const res = await collabApi.state(this.documentId, since)
+      if (!this.active(epoch)) return
+      const state = res.data
+      if (!state) break
+
+      if (state.snapshot) {
+        if (!this.active(epoch)) return
+        Y.applyUpdate(this.doc, fromBase64(state.snapshot), LOCAL_ORIGIN)
+      }
+      for (const u of state.updates ?? []) {
+        if (!this.active(epoch)) return
+        Y.applyUpdate(this.doc, fromBase64(u.payload), LOCAL_ORIGIN)
+      }
+
+      if (!this.active(epoch)) return
+      // The watermark jumps to through_seq wholesale, which is legitimate
+      // precisely because this response IS contiguous — the server read the
+      // log in order. Everything buffered below it is now redundant.
+      this.watermark = Math.max(this.watermark, state.through_seq)
+      this.headSeq = Math.max(this.headSeq, state.head_seq)
+      for (const seq of [...this.pending]) {
+        if (seq <= this.watermark) this.pending.delete(seq)
+      }
+
+      if (!state.has_more) break
+      since = state.through_seq
+    }
+  }
+
+  private async flushPending(epoch: number): Promise<void> {
+    while (this.pendingUpdate) {
+      const update = this.pendingUpdate
+      const version = this.pendingVersion
+      const res = await collabApi.append(this.documentId, toBase64(update))
+      if (!this.active(epoch)) return
+      const seq = res.data?.seq
+      if (!Number.isSafeInteger(seq) || seq <= 0) {
+        throw new Error('The server did not acknowledge the edit sequence.')
+      }
+
+      this.recordAppliedSeq(seq)
+      if (this.watermark < seq) await this.catchUp(epoch)
+      if (!this.active(epoch)) return
+      if (this.watermark < seq) {
+        throw new Error('The saved edit could not be reconciled locally.')
+      }
+
+      if (this.pendingVersion === version) {
+        this.pendingUpdate = null
+        this.pendingSocketAcks = 0
+        this.needsHttpRecovery = false
+      } else {
+        // A programmatic local update arrived while the UI was fail-closed.
+        // Resend the merged value; duplicate Yjs bytes are state-idempotent.
+        this.pendingSocketAcks = 0
+        this.needsHttpRecovery = true
+      }
     }
   }
 
@@ -287,20 +402,58 @@ export class CollabProvider {
   // Fan-out
   // -------------------------------------------------------------------------
 
+  private mergePending(update: Uint8Array): void {
+    this.pendingUpdate = this.pendingUpdate
+      ? Y.mergeUpdates([this.pendingUpdate, update])
+      : update
+    this.pendingVersion += 1
+  }
+
   private async publish(update: Uint8Array): Promise<void> {
-    if (!this.canWrite) return
+    if (!this.canWrite || this.destroyed || this.status === 'revoked') return
+    this.mergePending(update)
     const encoded = toBase64(update)
-    if (encoded.length <= MAX_FRAME_UPDATE_BYTES) {
-      wsManager.sendCollabUpdate(this.documentId, encoded)
+
+    if (this.status === 'error') {
+      this.needsHttpRecovery = true
       return
     }
-    // Too large for a frame — a paste, or a backlog flushed on reconnect. The
-    // socket would refuse it outright, so this is the only route it has.
-    try {
-      await collabApi.append(this.documentId, encoded)
-    } catch (err) {
-      this.setStatus('error', err instanceof Error ? err.message : 'An edit could not be sent')
+
+    if (this.status === 'connecting') {
+      this.needsHttpRecovery = true
+      this.setStatus('connecting')
+      return
     }
+
+    if (this.recoveryInFlight) {
+      // A normal large online append is already saving. Keep the editor live;
+      // its version-stable flush loop will include this newer update.
+      this.needsHttpRecovery = true
+      this.setStatus('saving')
+      return
+    }
+
+    if (this.needsHttpRecovery) {
+      this.setStatus('saving')
+      this.startRecovery(false)
+      return
+    }
+
+    if (encoded.length <= MAX_FRAME_UPDATE_BYTES) {
+      this.setStatus('saving')
+      if (wsManager.sendCollabUpdate(this.documentId, encoded)) {
+        this.pendingSocketAcks += 1
+        return
+      }
+      this.pendingSocketAcks = 0
+      this.needsHttpRecovery = true
+      this.setStatus('connecting')
+      return
+    }
+
+    this.needsHttpRecovery = true
+    this.setStatus('saving')
+    this.startRecovery(false)
   }
 
   private publishAwareness() {
@@ -333,7 +486,7 @@ export class CollabProvider {
   }
 
   private setStatus(status: ProviderStatus, detail?: string) {
-    if (this.status === status) return
+    if (this.destroyed || this.status === status) return
     this.status = status
     this.onStatus?.(status, detail)
   }
