@@ -16,6 +16,12 @@ import {
   type FetchMock,
 } from './helpers'
 
+const pushMocks = vi.hoisted(() => ({
+  deregisterPushToken: vi.fn<(accessToken: string | null) => Promise<void>>(),
+}))
+
+vi.mock('../src/lib/push', () => pushMocks)
+
 const realFetch = globalThis.fetch
 let net: FetchMock = { calls: [], to: () => [] }
 
@@ -24,6 +30,7 @@ function bearer(headers: Record<string, string>): string | undefined {
 }
 
 beforeEach(() => {
+  pushMocks.deregisterPushToken.mockReset().mockResolvedValue(undefined)
   resetStores()
 })
 
@@ -288,6 +295,70 @@ describe('refresh coalescing', () => {
     releaseB()
     await expect(Promise.all([b1, b2])).resolves.toHaveLength(2)
     expect(refreshTokens.filter((token) => token === 'refresh-b')).toHaveLength(1)
+  })
+})
+
+describe('session-safe logout after refresh failure', () => {
+  it('does not let a stale request logout clear a newer account', async () => {
+    let releasePush!: () => void
+    let enteredPush!: () => void
+    const pushEntered = new Promise<void>((resolve) => { enteredPush = resolve })
+    const pushGate = new Promise<void>((resolve) => { releasePush = resolve })
+    pushMocks.deregisterPushToken.mockImplementation(async () => {
+      enteredPush()
+      await pushGate
+    })
+    net = mockFetch((req) => {
+      if (req.path === '/auth/refresh') return apiFailure(401, 'INVALID_REFRESH_TOKEN')
+      if (req.path === '/auth/logout') return ok({ message: 'ok' })
+      return apiFailure(401, ServerErrorCode.Unauthorized)
+    })
+    signIn('access-a', 'refresh-a', 'user-a')
+    const stale = api.get('/needs-refresh').catch((error: unknown) => error)
+    await pushEntered
+
+    api.resetSession()
+    signIn('access-b', 'refresh-b', 'user-b')
+    releasePush()
+    const error = await stale
+
+    expect((error as ApiError).code).toBe(ApiErrorCode.SessionChanged)
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'access-b',
+      refreshToken: 'refresh-b',
+      user: { id: 'user-b' },
+    })
+  })
+
+  it('does not let a stale upload logout clear a newer account', async () => {
+    let releasePush!: () => void
+    let enteredPush!: () => void
+    const pushEntered = new Promise<void>((resolve) => { enteredPush = resolve })
+    const pushGate = new Promise<void>((resolve) => { releasePush = resolve })
+    pushMocks.deregisterPushToken.mockImplementation(async () => {
+      enteredPush()
+      await pushGate
+    })
+    net = mockFetch((req) => {
+      if (req.path === '/auth/refresh') return apiFailure(401, 'INVALID_REFRESH_TOKEN')
+      if (req.path === '/auth/logout') return ok({ message: 'ok' })
+      return apiFailure(401, ServerErrorCode.Unauthorized)
+    })
+    signIn('access-a', 'refresh-a', 'user-a')
+    const stale = api.upload('/upload', new FormData()).catch((error: unknown) => error)
+    await pushEntered
+
+    api.resetSession()
+    signIn('access-b', 'refresh-b', 'user-b')
+    releasePush()
+    const error = await stale
+
+    expect((error as ApiError).code).toBe(ApiErrorCode.SessionChanged)
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'access-b',
+      refreshToken: 'refresh-b',
+      user: { id: 'user-b' },
+    })
   })
 })
 

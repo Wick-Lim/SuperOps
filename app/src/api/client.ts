@@ -164,6 +164,7 @@ class ApiClient {
     // Captured before the call so a 401 can tell "my token is stale" from
     // "another request already refreshed while this one was in flight".
     const tokenAtSend = useAuthStore.getState().accessToken
+    const refreshTokenAtSend = useAuthStore.getState().refreshToken
 
     const res = await fetchWithTimeout(
       `${API_BASE_URL}${path}`,
@@ -193,7 +194,10 @@ class ApiClient {
             return this.request<T>(method, path, body, retriesLeft - 1)
           }
           this.assertCurrentSession(epoch)
-          await useAuthStore.getState().logout()
+          await useAuthStore.getState().logout({
+            accessToken: tokenAtSend,
+            refreshToken: refreshTokenAtSend,
+          })
           this.assertCurrentSession(epoch)
           throw new ApiError(401, ApiErrorCode.SessionExpired, 'Your session expired. Please sign in again.')
         }
@@ -258,6 +262,7 @@ class ApiClient {
   async upload<T>(path: string, form: FormData, retriesLeft = 1): Promise<ApiResponse<T>> {
     const epoch = this.sessionEpoch
     const tokenAtSend = useAuthStore.getState().accessToken
+    const refreshTokenAtSend = useAuthStore.getState().refreshToken
     const headers: Record<string, string> = {}
     if (tokenAtSend) headers['Authorization'] = `Bearer ${tokenAtSend}`
 
@@ -280,7 +285,10 @@ class ApiClient {
         return this.upload<T>(path, form, retriesLeft - 1)
       }
       this.assertCurrentSession(epoch)
-      await useAuthStore.getState().logout()
+      await useAuthStore.getState().logout({
+        accessToken: tokenAtSend,
+        refreshToken: refreshTokenAtSend,
+      })
       this.assertCurrentSession(epoch)
       throw new ApiError(401, ApiErrorCode.SessionExpired, 'Your session expired. Please sign in again.')
     }

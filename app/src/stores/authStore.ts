@@ -25,7 +25,7 @@ interface AuthState {
   setTokens: (access: string, refresh: string) => Promise<void>
   setUser: (user: User) => Promise<void>
   /** Clears the local session and best-effort revokes the server refresh token. */
-  logout: () => Promise<void>
+  logout: (expectedSession?: { accessToken: string | null; refreshToken: string | null }) => Promise<void>
   hydrate: () => Promise<void>
 }
 
@@ -59,11 +59,35 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
     }
   },
 
-  logout: async () => {
+  logout: async (expectedSession) => {
     // Captured before clearing: the revoke call needs the token, and the route
     // (POST /api/v1/auth/logout) is unauthenticated by design.
-    const refresh = get().refreshToken
-    const access = get().accessToken
+    const targetSession = expectedSession ?? {
+      accessToken: get().accessToken,
+      refreshToken: get().refreshToken,
+    }
+    const refresh = targetSession.refreshToken
+    const access = targetSession.accessToken
+    const isTargetSessionCurrent = () => {
+      const current = get()
+      return current.accessToken === access && current.refreshToken === refresh
+    }
+
+    const revoke = async () => {
+      if (!refresh) return
+      try {
+        await authApi.logout(refresh)
+      } catch {
+        // An offline logout is still a logout locally.
+      }
+    }
+
+    // A caller may have crossed a reset before reaching the store. Never let
+    // its cleanup clear the account that replaced it.
+    if (!isTargetSessionCurrent()) {
+      await revoke()
+      return
+    }
 
     // Deregister this device's push token BEFORE the session is cleared — the
     // DELETE needs the access token. Without it, the next person to sign in on
@@ -81,6 +105,14 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
       // No push module, no permission, or offline. Signing out still proceeds.
     }
 
+    // Push cleanup is asynchronous. The user may have signed into a different
+    // account while it was running, in which case this logout now belongs to
+    // the old session and must not touch the replacement's local state.
+    if (!isTargetSessionCurrent()) {
+      await revoke()
+      return
+    }
+
     set({ accessToken: null, refreshToken: null, user: null, isAuthenticated: false, persistError: null })
 
     await Promise.all([
@@ -90,15 +122,9 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
       AsyncStorage.removeItem(LEGACY_AUTH_KEY).catch(() => {}),
     ])
 
-    if (refresh) {
-      // Best effort: without this the refresh-token row survives every
-      // user-initiated logout until it expires naturally.
-      try {
-        await authApi.logout(refresh)
-      } catch {
-        // An offline logout is still a logout locally.
-      }
-    }
+    // Best effort: without this the refresh-token row survives every
+    // user-initiated logout until it expires naturally.
+    await revoke()
   },
 
   hydrate: async () => {
