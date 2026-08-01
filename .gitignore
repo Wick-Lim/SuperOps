@@ -41,6 +41,9 @@ coverage/
 *.cover
 *.out
 
+# Isolated implementation worktrees
+.worktrees/
+
 # Docker
 docker-compose.override.yml
 
