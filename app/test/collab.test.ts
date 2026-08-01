@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import * as Y from 'yjs'
 import { wsManager } from '../src/lib/websocket'
-import { CollabProvider, type ProviderStatus } from '../src/lib/collab/provider'
+import {
+  CollabProvider,
+  isProviderEditable,
+  type ProviderStatus,
+} from '../src/lib/collab/provider'
 import { fromBase64, toBase64 } from '../src/lib/collab/base64'
 import {
   apiFailure,
@@ -62,8 +66,9 @@ function connectOpen(): FakeWebSocket {
 }
 
 function makeProvider(
-  onStatus?: (s: ProviderStatus, d?: string) => void,
+  onStatus?: (status: ProviderStatus, detail?: string) => void,
   onProjectRequest?: () => void,
+  onProjectionSeq: (seq: number) => void = () => undefined,
 ) {
   const doc = new Y.Doc()
   const provider = new CollabProvider({
@@ -72,6 +77,7 @@ function makeProvider(
     user: { id: 'u-self', name: 'Self', color: '#f00' },
     onStatus,
     onProjectRequest,
+    onProjectionSeq,
   })
   return { doc, provider }
 }
@@ -125,6 +131,15 @@ describe('base64', () => {
 })
 
 describe('the collaboration provider', () => {
+  it('edits only in synced and saving states', () => {
+    expect(isProviderEditable('synced')).toBe(true)
+    expect(isProviderEditable('saving')).toBe(true)
+    expect(isProviderEditable('connecting')).toBe(false)
+    expect(isProviderEditable('error')).toBe(false)
+    expect(isProviderEditable('read-only')).toBe(false)
+    expect(isProviderEditable('revoked')).toBe(false)
+  })
+
   it('joins the room and reports read-only when the server says so', async () => {
     const socket = connectOpen()
     const statuses: ProviderStatus[] = []
@@ -232,6 +247,84 @@ describe('the collaboration provider', () => {
     provider.destroy()
   })
 
+  it('emits only the contiguous projection watermark across a gap', async () => {
+    const socket = connectOpen()
+    const projected: number[] = []
+    const { provider } = makeProvider(undefined, undefined, (seq) => projected.push(seq))
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 9, can_write: true },
+    })
+    await settle()
+
+    const payload = (text: string) => {
+      const other = new Y.Doc()
+      other.getText('body').insert(0, text)
+      return toBase64(Y.encodeStateAsUpdate(other))
+    }
+    socket.emit({
+      type: 'collab.update',
+      data: { document_id: DOC, seq: 1, actor_id: 'x', origin_conn: 'x', update: payload('1') },
+    })
+    socket.emit({
+      type: 'collab.update',
+      data: { document_id: DOC, seq: 3, actor_id: 'x', origin_conn: 'x', update: payload('3') },
+    })
+    await flush()
+    expect(projected).toEqual([1])
+
+    socket.emit({
+      type: 'collab.update',
+      data: { document_id: DOC, seq: 2, actor_id: 'x', origin_conn: 'x', update: payload('2') },
+    })
+    socket.emit({
+      type: 'collab.update',
+      data: { document_id: DOC, seq: 2, actor_id: 'x', origin_conn: 'x', update: payload('2') },
+    })
+    await flush()
+    expect(projected).toEqual([1, 3])
+    expect(projected).not.toContain(9)
+    provider.destroy()
+  })
+
+  it('drains buffered seqs after contiguous HTTP catch-up', async () => {
+    net = mockFetch((req) => req.path.includes('/state')
+      ? ok({
+          document_id: DOC,
+          snapshot_seq: 0,
+          updates: [],
+          through_seq: 2,
+          head_seq: 3,
+          has_more: false,
+        })
+      : ok({}))
+    const socket = connectOpen()
+    const projected: number[] = []
+    const { provider } = makeProvider(undefined, undefined, (seq) => projected.push(seq))
+    await flush()
+    const other = new Y.Doc()
+    other.getText('body').insert(0, 'three')
+    socket.emit({
+      type: 'collab.update',
+      data: {
+        document_id: DOC,
+        seq: 3,
+        actor_id: 'x',
+        origin_conn: 'x',
+        update: toBase64(Y.encodeStateAsUpdate(other)),
+      },
+    })
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 3, can_write: true },
+    })
+    await settle()
+
+    expect(projected).toEqual([3])
+    provider.destroy()
+  })
+
   it('sends a small update over the socket and a large one over HTTP', async () => {
     const socket = connectOpen()
     const { doc, provider } = makeProvider()
@@ -319,7 +412,8 @@ describe('the collaboration provider', () => {
   it('applies its own echo rather than skipping it', async () => {
     const socket = connectOpen()
     socket.emit({ type: 'hello', seq: 1, data: { connection_id: 'connection-a' } })
-    const { doc, provider } = makeProvider()
+    const projected: number[] = []
+    const { doc, provider } = makeProvider(undefined, undefined, (seq) => projected.push(seq))
     await flush()
     socket.emit({ type: 'collab.joined', data: { document_id: DOC, head_seq: 0, can_write: true } })
     await settle()
@@ -339,6 +433,7 @@ describe('the collaboration provider', () => {
       },
     })
     await flush()
+    expect(projected).toEqual([1])
 
     // Applying an update twice is a no-op in Yjs, so the text is unchanged...
     expect(doc.getText('body').toString()).toBe('mine')
@@ -351,6 +446,85 @@ describe('the collaboration provider', () => {
     await settle()
     const stateCalls = net.calls.filter((c) => c.path.includes('/state'))
     expect(sinceOf(stateCalls[0].path), 'the echo was skipped, leaving a hole at this clients own edits').toBe('1')
+    provider.destroy()
+  })
+
+  it('waits for the append sequence to become contiguous before clearing pending', async () => {
+    let stateCalls = 0
+    let appendPayload = ''
+    let releaseGap!: () => void
+    const gapGate = new Promise<void>((resolve) => { releaseGap = resolve })
+    const seq4Doc = new Y.Doc()
+    seq4Doc.getText('body').insert(0, 'remote-four')
+    const seq4 = toBase64(Y.encodeStateAsUpdate(seq4Doc))
+
+    net = mockFetch(async (req) => {
+      if (req.path.includes('/state')) {
+        stateCalls += 1
+        if (stateCalls <= 2) {
+          return ok({
+            document_id: DOC,
+            snapshot_seq: 0,
+            updates: [],
+            through_seq: 3,
+            head_seq: 3,
+            has_more: false,
+          })
+        }
+        await gapGate
+        return ok({
+          document_id: DOC,
+          snapshot_seq: 0,
+          updates: [
+            { seq: 4, payload: seq4 },
+            { seq: 5, payload: appendPayload },
+          ],
+          through_seq: 5,
+          head_seq: 5,
+          has_more: false,
+        })
+      }
+      if (req.path.includes('/updates')) {
+        appendPayload = (req.body as { update: string }).update
+        return envelope(201, { data: { seq: 5 } })
+      }
+      return ok({})
+    })
+
+    const socket = connectOpen()
+    socket.emit({ type: 'hello', data: { connection_id: 'connection-a' } })
+    const projected: number[] = []
+    const { doc, provider } = makeProvider(undefined, undefined, (seq) => projected.push(seq))
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 3, can_write: true },
+    })
+    await settle()
+    expect(projected).toEqual([3])
+    projected.length = 0
+
+    doc.getText('body').insert(0, 'local-five')
+    await flush()
+    socket.dropNow()
+    const resumed = connectOpen()
+    resumed.emit({ type: 'hello', data: { connection_id: 'connection-b' } })
+    resumed.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 3, can_write: true },
+    })
+    await flush(50)
+
+    expect(appendPayload).not.toBe('')
+    expect(projected).toEqual([])
+    expect(provider.currentStatus).toBe('connecting')
+    expect(provider.hasPendingChanges).toBe(true)
+
+    releaseGap()
+    await settle()
+    expect(projected).toEqual([5])
+    expect(provider.currentStatus).toBe('synced')
+    expect(provider.hasPendingChanges).toBe(false)
     provider.destroy()
   })
 
@@ -542,6 +716,35 @@ describe('the collaboration provider', () => {
 
     expect(doc.getText('body').toString()).toBe('')
     expect(statuses).toHaveLength(callbacksBeforeDestroy)
+  })
+
+  it('does not emit a projection watermark after destroy', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    net = mockFetch(async () => {
+      await gate
+      return ok({
+        document_id: DOC,
+        snapshot_seq: 0,
+        updates: [],
+        through_seq: 1,
+        head_seq: 1,
+        has_more: false,
+      })
+    })
+    const socket = connectOpen()
+    const projected: number[] = []
+    const { provider } = makeProvider(undefined, undefined, (seq) => projected.push(seq))
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 1, can_write: true },
+    })
+    await flush(10)
+    provider.destroy()
+    release()
+    await settle()
+    expect(projected).toEqual([])
   })
 
   it('lets revocation win over a delayed recovery append', async () => {

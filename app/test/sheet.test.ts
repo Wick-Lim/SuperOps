@@ -334,6 +334,7 @@ describe('the design model', () => {
     m.add('r', 'rect', { parent: 'f' })
 
     const p = extractDesign(m, 3)
+    expect(p.seq).toBe(3)
     expect(p.body_text).toContain('Checkout flow')
     expect(p.body_text).toContain('Pay now')
     // A frame is the canvas's heading; a button caption is not.

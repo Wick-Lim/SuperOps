@@ -60,6 +60,7 @@ export interface ProviderOptions {
   /** The local user, for the awareness state other people render as a cursor. */
   user: { id: string; name: string; color: string }
   onStatus?: (status: ProviderStatus, detail?: string) => void
+  onProjectionSeq: (seq: number) => void
   /** The server has noticed this document's stored projection sitting behind
    * the log and is asking for a fresh one. It cannot produce one itself — it
    * never interprets a CRDT update — so this is the repair path for a document
@@ -86,7 +87,7 @@ export class CollabProvider {
    */
   private watermark = 0
   /** Out-of-order seqs held until the gap closes. */
-  private pending = new Set<number>()
+  private pendingSeqs = new Set<number>()
   private headSeq = 0
 
   /** Merged, opaque Yjs bytes that have not yet been durably acknowledged. */
@@ -104,12 +105,14 @@ export class CollabProvider {
   private destroyed = false
   private readonly onStatus?: (status: ProviderStatus, detail?: string) => void
   private readonly onProjectRequest?: () => void
+  private readonly onProjectionSeq: (seq: number) => void
 
   constructor(opts: ProviderOptions) {
     this.documentId = opts.documentId
     this.doc = opts.doc
     this.onStatus = opts.onStatus
     this.onProjectRequest = opts.onProjectRequest
+    this.onProjectionSeq = opts.onProjectionSeq
     this.awareness = new Awareness(this.doc)
     this.awareness.setLocalStateField('user', opts.user)
 
@@ -263,23 +266,41 @@ export class CollabProvider {
   }
 
   private recordAppliedSeq(seq: number): void {
-    this.advanceWatermark(seq)
-  }
-
-  private advanceWatermark(seq: number) {
-    if (seq <= this.watermark) return
-    this.pending.add(seq)
-    while (this.pending.has(this.watermark + 1)) {
-      this.pending.delete(this.watermark + 1)
+    if (!Number.isSafeInteger(seq) || seq <= this.watermark) return
+    const previous = this.watermark
+    this.pendingSeqs.add(seq)
+    while (this.pendingSeqs.has(this.watermark + 1)) {
+      this.pendingSeqs.delete(this.watermark + 1)
       this.watermark += 1
     }
-    if (seq > this.headSeq) this.headSeq = seq
+    this.headSeq = Math.max(this.headSeq, seq)
+    this.emitProjectionAdvance(previous)
 
     // A gap that has not closed after a while means the missing update was not
     // merely reordered — it was dropped by backpressure, and nothing replays
     // it. Refetch rather than sit behind a hole forever.
-    if (this.pending.size > 0 && seq - this.watermark > 64) {
+    if (this.pendingSeqs.size > 0 && seq - this.watermark > 64 && !this.recoveryInFlight) {
       this.startRecovery(true)
+    }
+  }
+
+  private advanceThrough(throughSeq: number): void {
+    if (!Number.isSafeInteger(throughSeq) || throughSeq < this.watermark) return
+    const previous = this.watermark
+    this.watermark = throughSeq
+    for (const seq of [...this.pendingSeqs]) {
+      if (seq <= this.watermark) this.pendingSeqs.delete(seq)
+    }
+    while (this.pendingSeqs.has(this.watermark + 1)) {
+      this.pendingSeqs.delete(this.watermark + 1)
+      this.watermark += 1
+    }
+    this.emitProjectionAdvance(previous)
+  }
+
+  private emitProjectionAdvance(previous: number): void {
+    if (!this.destroyed && this.status !== 'revoked' && this.watermark > previous) {
+      this.onProjectionSeq(this.watermark)
     }
   }
 
@@ -342,11 +363,8 @@ export class CollabProvider {
       // The watermark jumps to through_seq wholesale, which is legitimate
       // precisely because this response IS contiguous — the server read the
       // log in order. Everything buffered below it is now redundant.
-      this.watermark = Math.max(this.watermark, state.through_seq)
+      this.advanceThrough(state.through_seq)
       this.headSeq = Math.max(this.headSeq, state.head_seq)
-      for (const seq of [...this.pending]) {
-        if (seq <= this.watermark) this.pending.delete(seq)
-      }
 
       if (!state.has_more) break
       since = state.through_seq

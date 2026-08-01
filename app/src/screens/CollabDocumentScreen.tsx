@@ -3,9 +3,12 @@ import { SafeAreaView, View, Text, StyleSheet } from 'react-native'
 import * as Y from 'yjs'
 import { theme } from '../lib/theme'
 import { space } from '../lib/responsive'
-import { errorMessage } from '../api/client'
 import { driveApi } from '../api/drive'
-import { CollabProvider, type ProviderStatus } from '../lib/collab/provider'
+import {
+  CollabProvider,
+  isProviderEditable,
+  type ProviderStatus,
+} from '../lib/collab/provider'
 import { useAuthStore } from '../stores/authStore'
 import { ErrorState, LoadingState, ScreenHeader } from './internal/ui'
 import Editor from '../editor/Editor'
@@ -27,8 +30,9 @@ import type { Projection } from '../editor/projection'
  * reuse everything here except the last component — they differ in how they
  * render a Y.Doc, not in how they get one.
  *
- * There is no save button. The document is a CRDT and every keystroke is
- * already durable; a save button would be a lie about where the truth lives.
+ * There is no save button. Local updates remain pending until the provider
+ * receives an own echo or a valid HTTP append acknowledgement; the header
+ * reports that lifecycle directly.
  */
 export default function CollabDocumentScreen({ navigation, route }: { navigation: any; route: any }) {
   const documentId: string | undefined = route.params?.documentId
@@ -48,7 +52,19 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   const user = useAuthStore((s) => s.user)
   const [status, setStatus] = useState<ProviderStatus>('connecting')
   const [detail, setDetail] = useState<string | null>(null)
-  const [seq, setSeq] = useState(0)
+  const [projectionSeq, setProjectionSeq] = useState(0)
+  const projectionSeqRef = useRef(0)
+
+  const acceptProjectionSeq = useCallback((next: number) => {
+    if (next <= projectionSeqRef.current) return
+    projectionSeqRef.current = next
+    setProjectionSeq(next)
+  }, [])
+
+  useEffect(() => {
+    projectionSeqRef.current = 0
+    setProjectionSeq(0)
+  }, [documentId])
 
   // One Y.Doc for the life of the screen. Recreating it would discard the
   // in-memory state and re-download the whole document on every render.
@@ -74,6 +90,7 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
         setStatus(s)
         setDetail(d ?? null)
       },
+      onProjectionSeq: acceptProjectionSeq,
       // The server asking for a projection it cannot produce itself. Raises the
       // same counter as the gap on open, so both arrive at whichever surface
       // owns this file's content — and both wait for `synced` rather than
@@ -85,12 +102,11 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
       provider.destroy()
       providerRef.current = null
     }
-  }, [documentId, doc, identity])
+  }, [documentId, doc, identity, acceptProjectionSeq])
 
-  // The projection's seq must not exceed the log head, so it is read from the
-  // descriptor rather than guessed. A projection above the head is refused —
-  // correctly, since it would be a client describing content the log does not
-  // have.
+  // The provider's contiguous watermark owns the projection sequence. The
+  // descriptor gap is only a repair hint; its head can be ahead of content
+  // this client has applied and must never be assigned to projection state.
   //
   // THE GAP IS ALSO THE BACKSTOP, and reading it without acting on it was the
   // whole of what the design called one. A document edited and closed while its
@@ -111,7 +127,6 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
       .then((res) => {
         if (cancelled) return
         const p = res.data?.projection
-        setSeq(p?.head_seq ?? 0)
         // Strictly behind. Equal means somebody already projected this exact
         // state, and re-sending it would be a write the server discards.
         if (p && p.head_seq > p.projection_seq) setProjectNonce((n) => n + 1)
@@ -159,9 +174,10 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   const scheduleProjection = useCallback(() => {
     if (projectTimer.current) clearTimeout(projectTimer.current)
     projectTimer.current = setTimeout(() => {
+      const seq = projectionSeqRef.current
       publish(fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq))
     }, 2000)
-  }, [publish, fileType, sheet, design, seq])
+  }, [publish, fileType, sheet, design])
 
   // FLUSH ON UNMOUNT, do not merely cancel.
   //
@@ -178,6 +194,7 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
   const flushRef = useRef<() => void>(() => {})
   flushRef.current = () => {
     if (!fileId || fileType === 'document') return
+    const seq = projectionSeqRef.current
     publish(fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq))
   }
   // Catch up once the document is loaded and writable.
@@ -207,6 +224,7 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
       // counter exists to prevent, which I had fixed for `document` and left
       // here. Editor.web.tsx claims inside its timer for the same reason.
       if (caughtUp.current === projectNonce) return
+      const seq = projectionSeqRef.current
       const projection =
         fileType === 'spreadsheet' ? extractSheet(sheet, seq) : extractDesign(design, seq)
       // EMPTY IS NOT A REPAIR — see worthPublishing. Claiming after this check
@@ -217,7 +235,7 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
       publish(projection)
     }, 1500)
     return () => clearTimeout(timer)
-  }, [projectNonce, status, fileId, fileType, sheet, design, seq, publish])
+  }, [projectNonce, status, fileId, fileType, sheet, design, publish])
 
   useEffect(() => () => {
     if (projectTimer.current) {
@@ -245,6 +263,8 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
     )
   }
 
+  const editable = isProviderEditable(status)
+
   return (
     <SafeAreaView style={styles.screen}>
       <ScreenHeader
@@ -255,7 +275,11 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
       {status === 'connecting' ? (
         <LoadingState label="Opening" />
       ) : status === 'error' ? (
-        <ErrorState message={detail ?? errorMessage(new Error('Could not load the document'))} />
+        <ErrorState
+          message={detail ?? 'Changes have not been saved.'}
+          onRetry={() => providerRef.current?.retry()}
+          retryLabel="Retry saving"
+        />
       ) : (
         <View style={styles.body}>
           {status === 'read-only' && (
@@ -266,14 +290,14 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
           {fileType === 'spreadsheet' ? (
             <Grid
               model={sheet}
-              editable={status === 'synced'}
+              editable={editable}
               revision={revision}
               onEdit={scheduleProjection}
             />
           ) : fileType === 'design' ? (
             <Canvas
               model={design}
-              editable={status === 'synced'}
+              editable={editable}
               revision={revision}
               onEdit={scheduleProjection}
             />
@@ -282,10 +306,10 @@ export default function CollabDocumentScreen({ navigation, route }: { navigation
               <Editor
                 doc={doc}
                 awareness={providerRef.current!.awareness}
-                editable={status === 'synced'}
+                editable={editable}
                 user={{ name: identity.name, color: identity.color }}
                 onProject={publish}
-                seq={seq}
+                seq={projectionSeq}
                 fileId={fileId}
                 catchUp={projectNonce}
               />
@@ -308,10 +332,12 @@ function subtitleFor(status: ProviderStatus): string {
       return 'Connecting'
     case 'synced':
       return 'All changes saved'
+    case 'saving':
+      return 'Saving changes…'
     case 'read-only':
       return 'Read only'
     case 'error':
-      return 'Disconnected'
+      return 'Changes not saved'
     default:
       return ''
   }
