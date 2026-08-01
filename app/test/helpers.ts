@@ -9,6 +9,8 @@ import { useWorkspaceStore } from '../src/stores/workspaceStore'
 import { clearDMRosterCache } from '../src/components/channel/dmRosterCache'
 import { clearCustomEmojiCache } from '../src/components/message/customEmoji'
 import { clearWorkspaceRoleCache } from '../src/screens/internal/useWorkspaceRole'
+import { api } from '../src/api/client'
+import { wsManager } from '../src/lib/websocket'
 import type { Channel, Message, User } from '../src/lib/types'
 
 export const API = 'http://api.test/api/v1'
@@ -23,6 +25,8 @@ export const API = 'http://api.test/api/v1'
  * closures are untouched.
  */
 export function resetStores(): void {
+  api.resetSession()
+  wsManager.reset()
   useAuthStore.setState({
     accessToken: null,
     refreshToken: null,

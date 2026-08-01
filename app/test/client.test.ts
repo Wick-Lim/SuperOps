@@ -7,6 +7,7 @@ import {
   API,
   apiFailure,
   envelope,
+  flush,
   htmlError,
   mockFetch,
   ok,
@@ -200,6 +201,93 @@ describe('refresh coalescing', () => {
     expect(res.data.ok).toBe(true)
     expect(seen).toBe(2)
     expect(net.to('/auth/refresh')).toHaveLength(0)
+  })
+
+  it('rejects an A response that arrives after reset and preserves B', async () => {
+    let release!: () => void
+    net = mockFetch(async () => {
+      await new Promise<void>((resolve) => { release = resolve })
+      return ok({ owner: 'account-a' })
+    })
+    signIn('access-a', 'refresh-a', 'user-a')
+    const oldRequest = api.get<{ owner: string }>('/slow')
+    await Promise.resolve()
+
+    api.resetSession()
+    signIn('access-b', 'refresh-b', 'user-b')
+    release()
+    const error = await oldRequest.then(() => null).catch((value: unknown) => value)
+
+    expect((error as ApiError).code).toBe(ApiErrorCode.SessionChanged)
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'access-b',
+      refreshToken: 'refresh-b',
+      user: { id: 'user-b' },
+    })
+  })
+
+  it('does not let an A refresh restore tokens after reset', async () => {
+    let releaseRefresh!: () => void
+    net = mockFetch(async (req) => {
+      if (req.path === '/auth/refresh') {
+        await new Promise<void>((resolve) => { releaseRefresh = resolve })
+        return ok({ access_token: 'revived-a', refresh_token: 'revived-refresh-a' })
+      }
+      return apiFailure(401, ServerErrorCode.Unauthorized)
+    })
+    signIn('access-a', 'refresh-a', 'user-a')
+    const oldRequest = api.get('/needs-refresh').catch((error: unknown) => error)
+    await flush(20)
+
+    api.resetSession()
+    signIn('access-b', 'refresh-b', 'user-b')
+    releaseRefresh()
+    await oldRequest
+
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'access-b',
+      refreshToken: 'refresh-b',
+      user: { id: 'user-b' },
+    })
+  })
+
+  it('does not let A refresh completion detach B callers from B single-flight', async () => {
+    let releaseA!: () => void
+    let releaseB!: () => void
+    const gateA = new Promise<void>((resolve) => { releaseA = resolve })
+    const gateB = new Promise<void>((resolve) => { releaseB = resolve })
+    const refreshTokens: string[] = []
+    net = mockFetch(async (req) => {
+      if (req.path === '/auth/refresh') {
+        const token = (req.body as { refresh_token: string }).refresh_token
+        refreshTokens.push(token)
+        if (token === 'refresh-a') {
+          await gateA
+          return ok({ access_token: 'fresh-a', refresh_token: 'rotated-a' })
+        }
+        await gateB
+        return ok({ access_token: 'fresh-b', refresh_token: 'rotated-b' })
+      }
+      if (req.headers.Authorization === 'Bearer fresh-b') return ok({ path: req.path })
+      return apiFailure(401, ServerErrorCode.Unauthorized)
+    })
+
+    signIn('access-a', 'refresh-a', 'user-a')
+    const oldA = api.get('/a').catch((error: unknown) => error)
+    await flush(20)
+    api.resetSession()
+    signIn('access-b', 'refresh-b', 'user-b')
+    const b1 = api.get('/b-1')
+    const b2 = api.get('/b-2')
+    await flush(20)
+
+    expect(refreshTokens).toEqual(['refresh-a', 'refresh-b'])
+    releaseA()
+    await oldA
+    expect(refreshTokens).toEqual(['refresh-a', 'refresh-b'])
+    releaseB()
+    await expect(Promise.all([b1, b2])).resolves.toHaveLength(2)
+    expect(refreshTokens.filter((token) => token === 'refresh-b')).toHaveLength(1)
   })
 })
 

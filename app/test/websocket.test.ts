@@ -130,6 +130,78 @@ describe('disconnect()', () => {
   })
 })
 
+describe('reset()', () => {
+  it('ignores callbacks from a socket that existed before reset', async () => {
+    const oldSocket = connectOpen()
+    let roomEvents = 0
+    let statusEvents = 0
+    wsManager.onRoom(() => { roomEvents += 1 })
+    wsManager.onStatus(() => { statusEvents += 1 })
+    wsManager.subscribe('channel-a')
+    wsManager.joinRoom('document-a')
+
+    wsManager.reset()
+    const statusAtReset = statusEvents
+    oldSocket.emit({ type: 'hello', seq: 1, data: { connection_id: 'old-connection' } })
+    oldSocket.emit({
+      type: 'collab.joined',
+      seq: 2,
+      data: { document_id: 'document-a', head_seq: 9, can_write: true },
+    })
+    await flush()
+
+    expect(roomEvents).toBe(0)
+    expect(statusEvents).toBe(statusAtReset)
+    expect(wsManager.getConnectionId()).toBeNull()
+    expect(useUiStore.getState().connection).toBe('idle')
+  })
+
+  it('does not apply an A resync response after reset or carry its cooldown to B', async () => {
+    let releaseA!: () => void
+    let requestCount = 0
+    mockFetch(async (req) => {
+      requestCount += 1
+      if (requestCount === 1) {
+        await new Promise<void>((resolve) => { releaseA = resolve })
+        return ok([makeChannel('channel-a')])
+      }
+      if (req.path.includes('/channels')) return ok([makeChannel('channel-b')])
+      if (req.path.includes('/unread-count')) return ok({ count: 0 })
+      return ok([])
+    })
+    useWorkspaceStore.setState({ activeWorkspace: { id: 'workspace-a' } as never })
+    const stale = wsManager.resync('manual')
+    await flush()
+
+    wsManager.reset()
+    useWorkspaceStore.setState({ activeWorkspace: { id: 'workspace-b' } as never })
+    await wsManager.resync('manual')
+    releaseA()
+    await stale
+
+    expect(useChannelStore.getState().channels.map((channel) => channel.id)).toEqual(['channel-b'])
+    expect(requestCount).toBeGreaterThan(1)
+  })
+
+  it('does not replay A subscriptions or rooms on B connection', () => {
+    signIn('access-a', 'refresh-a', 'user-a')
+    const accountA = connectOpen()
+    wsManager.subscribe('channel-a')
+    wsManager.joinRoom('document-a')
+    expect(accountA.sentOfType('subscribe')).toHaveLength(1)
+    expect(accountA.sentOfType('collab.join')).toHaveLength(1)
+
+    wsManager.reset()
+    signIn('access-b', 'refresh-b', 'user-b')
+    wsManager.connect()
+    const accountB = FakeWebSocket.last
+    accountB.openNow()
+
+    expect(accountB.sentOfType('subscribe')).toHaveLength(0)
+    expect(accountB.sentOfType('collab.join')).toHaveLength(0)
+  })
+})
+
 describe('reconnect', () => {
   it('reconnects after an unintentional close', async () => {
     const socket = connectOpen()

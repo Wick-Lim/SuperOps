@@ -43,6 +43,8 @@ export const ApiErrorCode = {
   InvalidResponse: 'INVALID_RESPONSE',
   /** Refresh failed or was impossible; the local session has been cleared. */
   SessionExpired: 'SESSION_EXPIRED',
+  /** A request belongs to an account session that has already ended. */
+  SessionChanged: 'SESSION_CHANGED',
   Unknown: 'UNKNOWN',
 } as const
 

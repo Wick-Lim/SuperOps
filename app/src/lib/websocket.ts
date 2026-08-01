@@ -100,6 +100,7 @@ function asChannel(data: unknown): Channel | null {
 
 class WebSocketManager {
   private ws: WebSocket | null = null
+  private lifecycleGeneration = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectDelay = INITIAL_RECONNECT_DELAY_MS
   private connected = false
@@ -157,8 +158,10 @@ class WebSocketManager {
     // WebSocket constructor cannot set an Authorization header.
     const socket = new WebSocket(`${WS_BASE_URL}?token=${encodeURIComponent(token)}`)
     this.ws = socket
+    const generation = this.lifecycleGeneration
 
     socket.onopen = () => {
+      if (generation !== this.lifecycleGeneration || this.ws !== socket) return
       this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS
       this.lastSeq = 0
       this.confirmedChannels.clear()
@@ -184,6 +187,7 @@ class WebSocketManager {
     }
 
     socket.onmessage = (event) => {
+      if (generation !== this.lifecycleGeneration || this.ws !== socket) return
       let frame: InboundFrame
       try {
         frame = JSON.parse(String((event as MessageEvent).data)) as InboundFrame
@@ -196,7 +200,7 @@ class WebSocketManager {
     }
 
     socket.onclose = () => {
-      if (this.ws !== socket) return // superseded by a newer socket
+      if (generation !== this.lifecycleGeneration || this.ws !== socket) return
       this.connectionId = null
       this.confirmedChannels.clear()
       this.setConnected(false)
@@ -210,6 +214,7 @@ class WebSocketManager {
     }
 
     socket.onerror = () => {
+      if (generation !== this.lifecycleGeneration || this.ws !== socket) return
       // onerror is always followed by onclose; closing here just makes it prompt.
       try {
         socket.close()
@@ -259,11 +264,22 @@ class WebSocketManager {
 
   /** Full teardown for sign-out: drops listeners and reconnect history too. */
   reset() {
-    this.disconnect()
+    this.lifecycleGeneration += 1
     this.handlers.clear()
+    this.statusListeners.clear()
     this.resyncListeners.clear()
     this.roomListeners.clear()
     this.huddleListeners.clear()
+    this.resyncInFlight = false
+    this.lastResyncAt = 0
+    const socket = this.ws
+    if (socket) {
+      socket.onopen = null
+      socket.onmessage = null
+      socket.onerror = null
+      socket.onclose = null
+    }
+    this.disconnect()
     this.everConnected = false
     this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS
   }
@@ -271,7 +287,9 @@ class WebSocketManager {
   private scheduleReconnect() {
     if (this.reconnectTimer || this.intentionalClose) return
     if (!useAuthStore.getState().accessToken) return
+    const generation = this.lifecycleGeneration
     this.reconnectTimer = setTimeout(() => {
+      if (generation !== this.lifecycleGeneration) return
       this.reconnectTimer = null
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY_MS)
       this.connect()
@@ -335,6 +353,7 @@ class WebSocketManager {
 
   /** Refetches everything realtime is responsible for keeping fresh. */
   async resync(reason: ResyncReason = 'manual'): Promise<void> {
+    const generation = this.lifecycleGeneration
     const now = Date.now()
     if (this.resyncInFlight || now - this.lastResyncAt < RESYNC_COOLDOWN_MS) return
     this.resyncInFlight = true
@@ -345,8 +364,10 @@ class WebSocketManager {
       if (workspaceId) {
         try {
           const res = await channelApi.list(workspaceId)
+          if (generation !== this.lifecycleGeneration) return
           useChannelStore.getState().setChannels(res.data ?? [])
         } catch {
+          if (generation !== this.lifecycleGeneration) return
           /* keep the stale list rather than blanking the sidebar */
         }
       }
@@ -356,25 +377,31 @@ class WebSocketManager {
         loaded.map(async (channelId) => {
           try {
             const res = await messageApi.list(channelId)
+            if (generation !== this.lifecycleGeneration) return
             useMessageStore
               .getState()
               .setMessages(channelId, res.data ?? [], res.meta?.cursor ?? '', res.meta?.has_more ?? false)
           } catch {
+            if (generation !== this.lifecycleGeneration) return
             /* one channel failing must not abort the rest */
           }
         }),
       )
+      if (generation !== this.lifecycleGeneration) return
 
       try {
         const res = await notificationApi.unreadCount()
+        if (generation !== this.lifecycleGeneration) return
         useUiStore.getState().setUnread(res.data?.count ?? 0)
       } catch {
+        if (generation !== this.lifecycleGeneration) return
         /* badge stays stale */
       }
     } finally {
-      this.resyncInFlight = false
+      if (generation === this.lifecycleGeneration) this.resyncInFlight = false
     }
 
+    if (generation !== this.lifecycleGeneration) return
     this.resyncListeners.forEach((l) => l(reason))
   }
 
@@ -600,9 +627,11 @@ class WebSocketManager {
         }
         ui.addTyping(channelId, userId)
         this.stopTypingTimer(key)
+        const generation = this.lifecycleGeneration
         this.typingTimers.set(
           key,
           setTimeout(() => {
+            if (generation !== this.lifecycleGeneration) return
             this.typingTimers.delete(key)
             useUiStore.getState().removeTyping(channelId, userId)
           }, TYPING_TTL_MS),

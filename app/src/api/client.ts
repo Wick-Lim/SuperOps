@@ -126,6 +126,8 @@ function settle<T>(res: Response, envelope: Envelope | undefined): ApiResponse<T
 }
 
 class ApiClient {
+  private sessionEpoch = 0
+
   /**
    * The single in-flight refresh. RefreshTokens rotates by DELETING the session
    * row before issuing (backend/internal/auth/service.go), so two concurrent
@@ -134,6 +136,17 @@ class ApiClient {
    * session resume.
    */
   private refreshInFlight: Promise<boolean> | null = null
+
+  resetSession(): void {
+    this.sessionEpoch += 1
+    this.refreshInFlight = null
+  }
+
+  private assertCurrentSession(epoch: number): void {
+    if (epoch !== this.sessionEpoch) {
+      throw new ApiError(0, ApiErrorCode.SessionChanged, 'This request belonged to a previous sign-in.')
+    }
+  }
 
   private getHeaders(hasBody: boolean): Record<string, string> {
     const headers: Record<string, string> = {}
@@ -146,6 +159,7 @@ class ApiClient {
   }
 
   async request<T>(method: string, path: string, body?: unknown, retriesLeft = 1): Promise<ApiResponse<T>> {
+    const epoch = this.sessionEpoch
     const hasBody = body !== undefined && body !== null
     // Captured before the call so a 401 can tell "my token is stale" from
     // "another request already refreshed while this one was in flight".
@@ -160,39 +174,49 @@ class ApiClient {
       },
       REQUEST_TIMEOUT_MS,
     )
+    this.assertCurrentSession(epoch)
 
     const envelope = await readEnvelope(res)
+    this.assertCurrentSession(epoch)
 
     if (res.status === 401 && retriesLeft > 0 && !isCredentialPath(path)) {
       const code = envelope?.error?.code
       if (!code || !NON_SESSION_401.has(code)) {
         // Someone else already rotated the token — just retry with the new one.
         if (useAuthStore.getState().accessToken !== tokenAtSend) {
+          this.assertCurrentSession(epoch)
           return this.request<T>(method, path, body, retriesLeft - 1)
         }
         if (useAuthStore.getState().refreshToken) {
-          if (await this.tryRefresh()) {
+          if (await this.tryRefresh(epoch)) {
+            this.assertCurrentSession(epoch)
             return this.request<T>(method, path, body, retriesLeft - 1)
           }
+          this.assertCurrentSession(epoch)
           await useAuthStore.getState().logout()
+          this.assertCurrentSession(epoch)
           throw new ApiError(401, ApiErrorCode.SessionExpired, 'Your session expired. Please sign in again.')
         }
       }
     }
 
+    this.assertCurrentSession(epoch)
     return settle<T>(res, envelope)
   }
 
   /** Coalesces concurrent refreshes onto one request. */
-  private tryRefresh(): Promise<boolean> {
+  private tryRefresh(epoch: number): Promise<boolean> {
+    this.assertCurrentSession(epoch)
     if (this.refreshInFlight) return this.refreshInFlight
-    const inFlight = this.doRefresh().then(
+    const refreshToken = useAuthStore.getState().refreshToken
+    if (!refreshToken) return Promise.resolve(false)
+    const inFlight = this.doRefresh(epoch, refreshToken).then(
       (ok) => {
-        this.refreshInFlight = null
+        if (this.refreshInFlight === inFlight) this.refreshInFlight = null
         return ok
       },
       () => {
-        this.refreshInFlight = null
+        if (this.refreshInFlight === inFlight) this.refreshInFlight = null
         return false
       },
     )
@@ -200,9 +224,7 @@ class ApiClient {
     return inFlight
   }
 
-  private async doRefresh(): Promise<boolean> {
-    const refreshToken = useAuthStore.getState().refreshToken
-    if (!refreshToken) return false
+  private async doRefresh(epoch: number, refreshToken: string): Promise<boolean> {
     try {
       const res = await fetchWithTimeout(
         `${API_BASE_URL}/auth/refresh`,
@@ -213,13 +235,18 @@ class ApiClient {
         },
         REQUEST_TIMEOUT_MS,
       )
+      this.assertCurrentSession(epoch)
       if (!res.ok) return false
       const envelope = await readEnvelope(res)
+      this.assertCurrentSession(epoch)
       const pair = envelope?.data as { access_token?: string; refresh_token?: string } | undefined
       if (!pair?.access_token || !pair.refresh_token) return false
+      if (useAuthStore.getState().refreshToken !== refreshToken) return false
       await useAuthStore.getState().setTokens(pair.access_token, pair.refresh_token)
+      this.assertCurrentSession(epoch)
       return true
-    } catch {
+    } catch (error) {
+      if (error instanceof ApiError && error.code === ApiErrorCode.SessionChanged) throw error
       return false
     }
   }
@@ -229,6 +256,7 @@ class ApiClient {
    * Content-Type; the runtime sets the multipart boundary automatically.
    */
   async upload<T>(path: string, form: FormData, retriesLeft = 1): Promise<ApiResponse<T>> {
+    const epoch = this.sessionEpoch
     const tokenAtSend = useAuthStore.getState().accessToken
     const headers: Record<string, string> = {}
     if (tokenAtSend) headers['Authorization'] = `Bearer ${tokenAtSend}`
@@ -238,19 +266,26 @@ class ApiClient {
       { method: 'POST', headers, body: form },
       UPLOAD_TIMEOUT_MS,
     )
+    this.assertCurrentSession(epoch)
     const envelope = await readEnvelope(res)
+    this.assertCurrentSession(epoch)
 
     if (res.status === 401 && retriesLeft > 0) {
       if (useAuthStore.getState().accessToken !== tokenAtSend) {
+        this.assertCurrentSession(epoch)
         return this.upload<T>(path, form, retriesLeft - 1)
       }
-      if (useAuthStore.getState().refreshToken && (await this.tryRefresh())) {
+      if (useAuthStore.getState().refreshToken && (await this.tryRefresh(epoch))) {
+        this.assertCurrentSession(epoch)
         return this.upload<T>(path, form, retriesLeft - 1)
       }
+      this.assertCurrentSession(epoch)
       await useAuthStore.getState().logout()
+      this.assertCurrentSession(epoch)
       throw new ApiError(401, ApiErrorCode.SessionExpired, 'Your session expired. Please sign in again.')
     }
 
+    this.assertCurrentSession(epoch)
     return settle<T>(res, envelope)
   }
 
