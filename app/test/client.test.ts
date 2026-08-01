@@ -299,6 +299,35 @@ describe('refresh coalescing', () => {
 })
 
 describe('session-safe logout after refresh failure', () => {
+  it('ordinary logout still clears a same-account session whose tokens rotate during push cleanup', async () => {
+    let releasePush!: () => void
+    let enteredPush!: () => void
+    const pushEntered = new Promise<void>((resolve) => { enteredPush = resolve })
+    const pushGate = new Promise<void>((resolve) => { releasePush = resolve })
+    pushMocks.deregisterPushToken.mockImplementation(async () => {
+      enteredPush()
+      await pushGate
+    })
+    net = mockFetch((req) => {
+      if (req.path === '/auth/logout') return ok({ message: 'ok' })
+      throw new Error(`unexpected request ${req.path}`)
+    })
+    signIn('access-a', 'refresh-a', 'user-a')
+    const logout = useAuthStore.getState().logout()
+    await pushEntered
+
+    await useAuthStore.getState().setTokens('fresh-a', 'rotated-a')
+    releasePush()
+    await logout
+
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: null,
+      refreshToken: null,
+      user: null,
+      isAuthenticated: false,
+    })
+  })
+
   it('does not let a stale request logout clear a newer account', async () => {
     let releasePush!: () => void
     let enteredPush!: () => void

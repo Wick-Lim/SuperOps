@@ -14,6 +14,8 @@ const USER_KEY = 'superops-user'
 const LEGACY_AUTH_KEY = 'superops-auth'
 
 interface AuthState {
+  /** Changes only when an account session ends, never for same-session token rotation. */
+  sessionGeneration: number
   accessToken: string | null
   refreshToken: string | null
   user: User | null
@@ -25,17 +27,25 @@ interface AuthState {
   setTokens: (access: string, refresh: string) => Promise<void>
   setUser: (user: User) => Promise<void>
   /** Clears the local session and best-effort revokes the server refresh token. */
-  logout: (expectedSession?: { accessToken: string | null; refreshToken: string | null }) => Promise<void>
+  advanceSessionGeneration: () => void
+  logout: (expectedSession?: {
+    generation: number
+    accessToken: string | null
+    refreshToken: string | null
+  }) => Promise<void>
   hydrate: () => Promise<void>
 }
 
 export const useAuthStore = create<AuthState>()((set, get) => ({
+  sessionGeneration: 0,
   accessToken: null,
   refreshToken: null,
   user: null,
   isAuthenticated: false,
   hydrated: false,
   persistError: null,
+
+  advanceSessionGeneration: () => set((state) => ({ sessionGeneration: state.sessionGeneration + 1 })),
 
   // Awaited, not fire-and-forget: a failed write used to be invisible and
   // silently signed the user out on the next cold start.
@@ -63,14 +73,14 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
     // Captured before clearing: the revoke call needs the token, and the route
     // (POST /api/v1/auth/logout) is unauthenticated by design.
     const targetSession = expectedSession ?? {
+      generation: get().sessionGeneration,
       accessToken: get().accessToken,
       refreshToken: get().refreshToken,
     }
     const refresh = targetSession.refreshToken
     const access = targetSession.accessToken
     const isTargetSessionCurrent = () => {
-      const current = get()
-      return current.accessToken === access && current.refreshToken === refresh
+      return get().sessionGeneration === targetSession.generation
     }
 
     const revoke = async () => {
@@ -113,7 +123,14 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
       return
     }
 
-    set({ accessToken: null, refreshToken: null, user: null, isAuthenticated: false, persistError: null })
+    set((state) => ({
+      sessionGeneration: state.sessionGeneration + 1,
+      accessToken: null,
+      refreshToken: null,
+      user: null,
+      isAuthenticated: false,
+      persistError: null,
+    }))
 
     await Promise.all([
       deleteSecureItem(ACCESS_KEY),

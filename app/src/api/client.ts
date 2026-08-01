@@ -139,6 +139,7 @@ class ApiClient {
 
   resetSession(): void {
     this.sessionEpoch += 1
+    useAuthStore.getState().advanceSessionGeneration()
     this.refreshInFlight = null
   }
 
@@ -165,6 +166,7 @@ class ApiClient {
     // "another request already refreshed while this one was in flight".
     const tokenAtSend = useAuthStore.getState().accessToken
     const refreshTokenAtSend = useAuthStore.getState().refreshToken
+    const sessionGenerationAtSend = useAuthStore.getState().sessionGeneration
 
     const res = await fetchWithTimeout(
       `${API_BASE_URL}${path}`,
@@ -195,6 +197,7 @@ class ApiClient {
           }
           this.assertCurrentSession(epoch)
           await useAuthStore.getState().logout({
+            generation: sessionGenerationAtSend,
             accessToken: tokenAtSend,
             refreshToken: refreshTokenAtSend,
           })
@@ -263,6 +266,7 @@ class ApiClient {
     const epoch = this.sessionEpoch
     const tokenAtSend = useAuthStore.getState().accessToken
     const refreshTokenAtSend = useAuthStore.getState().refreshToken
+    const sessionGenerationAtSend = useAuthStore.getState().sessionGeneration
     const headers: Record<string, string> = {}
     if (tokenAtSend) headers['Authorization'] = `Bearer ${tokenAtSend}`
 
@@ -286,6 +290,7 @@ class ApiClient {
       }
       this.assertCurrentSession(epoch)
       await useAuthStore.getState().logout({
+        generation: sessionGenerationAtSend,
         accessToken: tokenAtSend,
         refreshToken: refreshTokenAtSend,
       })
