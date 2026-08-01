@@ -201,7 +201,13 @@ class ApiClient {
             accessToken: tokenAtSend,
             refreshToken: refreshTokenAtSend,
           })
-          this.assertCurrentSession(epoch)
+          const sessionAfterLogout = useAuthStore.getState()
+          if (
+            sessionAfterLogout.sessionGeneration !== sessionGenerationAtSend + 1 ||
+            sessionAfterLogout.isAuthenticated
+          ) {
+            this.assertCurrentSession(epoch)
+          }
           throw new ApiError(401, ApiErrorCode.SessionExpired, 'Your session expired. Please sign in again.')
         }
       }
@@ -294,7 +300,13 @@ class ApiClient {
         accessToken: tokenAtSend,
         refreshToken: refreshTokenAtSend,
       })
-      this.assertCurrentSession(epoch)
+      const sessionAfterLogout = useAuthStore.getState()
+      if (
+        sessionAfterLogout.sessionGeneration !== sessionGenerationAtSend + 1 ||
+        sessionAfterLogout.isAuthenticated
+      ) {
+        this.assertCurrentSession(epoch)
+      }
       throw new ApiError(401, ApiErrorCode.SessionExpired, 'Your session expired. Please sign in again.')
     }
 

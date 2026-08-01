@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import AsyncStorage from '@react-native-async-storage/async-storage'
+import * as SecureStore from 'expo-secure-store'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AccountCache } from '../src/lib/accountCache'
 import {
   clearDMRosterCache,
@@ -15,12 +17,64 @@ import {
   getCachedWorkspaceRole,
   loadWorkspaceRole,
 } from '../src/screens/internal/useWorkspaceRole'
-import { flush, mockFetch, ok, resetStores } from './helpers'
+import { resetAccountSession, isTerminalBootstrapAuthError } from '../src/lib/accountSession'
+import { ApiError } from '../src/lib/errors'
+import { useAuthStore } from '../src/stores/authStore'
+import { useChannelStore } from '../src/stores/channelStore'
+import { useDriveStore } from '../src/stores/driveStore'
+import { useMessageStore } from '../src/stores/messageStore'
+import { useUiStore } from '../src/stores/uiStore'
+import { useUserStore } from '../src/stores/userStore'
+import { useWorkspaceStore } from '../src/stores/workspaceStore'
+import { flush, makeChannel, makeMessage, mockFetch, ok, resetStores, signIn } from './helpers'
 
 const realFetch = globalThis.fetch
+const testSecureStore = SecureStore as typeof SecureStore & { __reset: () => void }
 
-beforeEach(() => resetStores())
-afterEach(() => { globalThis.fetch = realFetch })
+beforeEach(async () => {
+  resetStores()
+  await AsyncStorage.clear()
+  testSecureStore.__reset()
+})
+
+afterEach(() => {
+  globalThis.fetch = realFetch
+  vi.restoreAllMocks()
+})
+
+function populateAccountA(): void {
+  signIn('access-a', 'refresh-a', 'user-a')
+  useAuthStore.setState({ hydrated: true })
+  useWorkspaceStore.setState({
+    workspaces: [{ id: 'workspace-a' } as never],
+    activeWorkspace: { id: 'workspace-a' } as never,
+  })
+  useChannelStore.setState({
+    channels: [makeChannel('channel-a')],
+    activeChannel: makeChannel('channel-a'),
+  })
+  useMessageStore.setState({
+    messages: { 'channel-a': [makeMessage('message-a', 'channel-a')] },
+    cursors: { 'channel-a': 'cursor-a' },
+    hasMore: { 'channel-a': true },
+  })
+  useDriveStore.setState({
+    registry: [{ type: 'document', creatable: true } as never],
+    registryLoaded: true,
+    rootId: 'root-a',
+    entries: [{ kind: 'file', file: { id: 'file-a' } } as never],
+  })
+  useUserStore.setState({
+    users: { 'user-a': { id: 'user-a', username: 'account-a' } as never },
+  })
+  useUiStore.setState({
+    presence: { 'user-a': 'online' },
+    typing: { 'channel-a': ['user-a'] },
+    unreadNotifications: 4,
+    connection: 'connected',
+    activeThread: { channelId: 'channel-a', parent: makeMessage('parent-a', 'channel-a') },
+  })
+}
 
 describe('generational account caches', () => {
   it('rejects a write holding a generation from before clear', () => {
@@ -68,5 +122,153 @@ describe('generational account caches', () => {
 
     expect(getCachedDMRoster('channel-a')).toBeUndefined()
     expect(getCachedWorkspaceRole('workspace-a:user-a')).toBeUndefined()
+  })
+})
+
+describe('account session reset', () => {
+  it('empties all account state before remote cleanup settles', async () => {
+    populateAccountA()
+    await AsyncStorage.setItem('superops-push-token', 'push-a')
+    let releaseRemote!: () => void
+    const gate = new Promise<void>((resolve) => { releaseRemote = resolve })
+    mockFetch(async (req) => {
+      if (req.path === '/users/me/devices/push-a' || req.path === '/auth/logout') {
+        await gate
+        return ok({ message: 'ok' })
+      }
+      throw new Error(`unexpected request ${req.path}`)
+    })
+
+    const resetting = resetAccountSession()
+    await flush(20)
+
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: null,
+      refreshToken: null,
+      user: null,
+      isAuthenticated: false,
+      hydrated: true,
+    })
+    expect(useWorkspaceStore.getState()).toMatchObject({ workspaces: [], activeWorkspace: null })
+    expect(useChannelStore.getState()).toMatchObject({ channels: [], activeChannel: null })
+    expect(useMessageStore.getState().messages).toEqual({})
+    expect(useDriveStore.getState()).toMatchObject({ rootId: null, entries: [] })
+    expect(useDriveStore.getState().registry).toHaveLength(1)
+    expect(useUserStore.getState().users).toEqual({})
+    expect(useUiStore.getState()).toMatchObject({
+      presence: {},
+      typing: {},
+      unreadNotifications: 0,
+      connection: 'idle',
+      activeThread: null,
+    })
+
+    releaseRemote()
+    await expect(resetting).resolves.toBeUndefined()
+  })
+
+  it('starts B with no selectable state from A and is safe twice', async () => {
+    populateAccountA()
+    mockFetch(() => ok({ message: 'ok' }))
+    await resetAccountSession()
+    await resetAccountSession()
+    signIn('access-b', 'refresh-b', 'user-b')
+
+    expect(useAuthStore.getState().user?.id).toBe('user-b')
+    expect(useWorkspaceStore.getState().activeWorkspace).toBeNull()
+    expect(useChannelStore.getState().activeChannel).toBeNull()
+    expect(useMessageStore.getState().messages['channel-a']).toBeUndefined()
+    expect(useUiStore.getState().activeThread).toBeNull()
+    expect(useDriveStore.getState().rootId).toBeNull()
+    expect(useUserStore.getState().users['user-a']).toBeUndefined()
+  })
+
+  it('clears every loaded module cache through the coordinator', async () => {
+    signIn('access-a', 'refresh-a', 'user-a')
+    mockFetch((req) => {
+      if (req.path.includes('/emojis')) {
+        return ok([{ id: 'emoji-a', name: 'old', image_url: '/old.png' }])
+      }
+      if (req.path.includes('/channels/channel-a/members')) {
+        return ok([{ user_id: 'user-a' }])
+      }
+      if (req.path.includes('/workspaces/workspace-a/members')) {
+        return ok([{ user_id: 'user-a', role: 'admin' }])
+      }
+      if (req.path === '/auth/logout') return ok({ message: 'ok' })
+      throw new Error(`unexpected request ${req.path}`)
+    })
+
+    loadCustomEmoji('workspace-a')
+    await Promise.all([
+      loadDMRoster('workspace-a', 'channel-a'),
+      loadWorkspaceRole('workspace-a', 'user-a'),
+    ])
+    await flush(20)
+    expect(getCustomEmojiSnapshot('workspace-a')).toHaveLength(1)
+    expect(getCachedDMRoster('channel-a')).toEqual(['user-a'])
+    expect(getCachedWorkspaceRole('workspace-a:user-a')).toBe('admin')
+
+    await resetAccountSession()
+
+    expect(getCustomEmojiSnapshot('workspace-a')).toEqual([])
+    expect(getCachedDMRoster('channel-a')).toBeUndefined()
+    expect(getCachedWorkspaceRole('workspace-a:user-a')).toBeUndefined()
+  })
+
+  it('classifies only terminal bootstrap authorization failures', () => {
+    expect(isTerminalBootstrapAuthError(new ApiError(401, 'UNAUTHORIZED', 'expired'))).toBe(true)
+    expect(isTerminalBootstrapAuthError(new ApiError(403, 'FORBIDDEN', 'disabled'))).toBe(true)
+    expect(isTerminalBootstrapAuthError(new ApiError(0, 'NETWORK_ERROR', 'offline'))).toBe(false)
+    expect(isTerminalBootstrapAuthError(new ApiError(503, 'SERVICE_UNAVAILABLE', 'down'))).toBe(false)
+  })
+
+  it('keeps the local boundary when storage and remote cleanup fail', async () => {
+    populateAccountA()
+    await AsyncStorage.setItem('superops-push-token', 'push-a')
+    const remove = vi.spyOn(AsyncStorage, 'removeItem').mockRejectedValue(new Error('storage failed'))
+    mockFetch(async () => { throw new Error('network failed') })
+
+    await expect(resetAccountSession()).resolves.toBeUndefined()
+
+    expect(useAuthStore.getState().isAuthenticated).toBe(false)
+    expect(useWorkspaceStore.getState().activeWorkspace).toBeNull()
+    expect(useChannelStore.getState().activeChannel).toBeNull()
+    expect(useMessageStore.getState().messages).toEqual({})
+    expect(useDriveStore.getState().rootId).toBeNull()
+    expect(useUiStore.getState().activeThread).toBeNull()
+    expect(useUserStore.getState().users).toEqual({})
+    remove.mockRestore()
+  })
+
+  it('orders an old token write before reset deletion and a new session write', async () => {
+    let releaseOldWrite!: () => void
+    let enterOldWrite!: () => void
+    const oldWriteEntered = new Promise<void>((resolve) => { enterOldWrite = resolve })
+    const oldWriteGate = new Promise<void>((resolve) => { releaseOldWrite = resolve })
+    const realSetItem = SecureStore.setItemAsync
+    vi.spyOn(SecureStore, 'setItemAsync').mockImplementation(async (key, value) => {
+      if (key === 'superops.access_token' && value === 'access-a') {
+        enterOldWrite()
+        await oldWriteGate
+      }
+      await realSetItem(key, value)
+    })
+    mockFetch(() => ok({ message: 'ok' }))
+
+    const oldWrite = useAuthStore.getState().setTokens('access-a', 'refresh-a')
+    await oldWriteEntered
+    const resetting = resetAccountSession()
+    const newWrite = useAuthStore.getState().setTokens('access-b', 'refresh-b')
+    releaseOldWrite()
+    await Promise.all([oldWrite, resetting, newWrite])
+
+    expect(await SecureStore.getItemAsync('superops.access_token')).toBe('access-b')
+    expect(await SecureStore.getItemAsync('superops.refresh_token')).toBe('refresh-b')
+    expect(useAuthStore.getState()).toMatchObject({
+      accessToken: 'access-b',
+      refreshToken: 'refresh-b',
+      isAuthenticated: true,
+    })
   })
 })

@@ -2,7 +2,6 @@ import { create } from 'zustand'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import type { User } from '../lib/types'
 import { getSecureItem, setSecureItem, deleteSecureItem } from '../lib/secureStorage'
-import { authApi } from '../api/auth'
 
 // expo-secure-store keys must match [A-Za-z0-9._-]+.
 const ACCESS_KEY = 'superops.access_token'
@@ -12,6 +11,73 @@ const REFRESH_KEY = 'superops.refresh_token'
 const USER_KEY = 'superops-user'
 // Pre-keystore location of the token pair; read once, then migrated and erased.
 const LEGACY_AUTH_KEY = 'superops-auth'
+
+let authSessionGeneration = 0
+let persistenceTail: Promise<void> = Promise.resolve()
+
+function enqueuePersistence<T>(work: () => Promise<T>): Promise<T> {
+  const run = persistenceTail.then(work, work)
+  persistenceTail = run.then(() => undefined, () => undefined)
+  return run
+}
+
+export function clearLocalAuthSession(): Promise<void> {
+  authSessionGeneration += 1
+  useAuthStore.setState({
+    accessToken: null,
+    refreshToken: null,
+    user: null,
+    isAuthenticated: false,
+    persistError: null,
+  })
+  return enqueuePersistence(async () => {
+    await Promise.all([
+      deleteSecureItem(ACCESS_KEY),
+      deleteSecureItem(REFRESH_KEY),
+      AsyncStorage.removeItem(USER_KEY).catch(() => undefined),
+      AsyncStorage.removeItem(LEGACY_AUTH_KEY).catch(() => undefined),
+    ])
+  })
+}
+
+interface StoredAuthSession {
+  access: string | null
+  refresh: string | null
+  user: User | null
+}
+
+async function readStoredAuthSession(): Promise<StoredAuthSession> {
+  let access = await getSecureItem(ACCESS_KEY)
+  let refresh = await getSecureItem(REFRESH_KEY)
+  if (!access) {
+    const legacy = await AsyncStorage.getItem(LEGACY_AUTH_KEY)
+    if (legacy) {
+      try {
+        const parsed = JSON.parse(legacy) as { accessToken?: string; refreshToken?: string }
+        if (parsed.accessToken) {
+          access = parsed.accessToken
+          refresh = parsed.refreshToken ?? null
+          await setSecureItem(ACCESS_KEY, access)
+          if (refresh) await setSecureItem(REFRESH_KEY, refresh)
+        }
+      } catch {
+        access = null
+        refresh = null
+      }
+      await AsyncStorage.removeItem(LEGACY_AUTH_KEY).catch(() => undefined)
+    }
+  }
+  let user: User | null = null
+  const serialized = await AsyncStorage.getItem(USER_KEY)
+  if (serialized) {
+    try {
+      user = JSON.parse(serialized) as User
+    } catch {
+      user = null
+    }
+  }
+  return { access, refresh, user }
+}
 
 interface AuthState {
   /** Changes only when an account session ends, never for same-session token rotation. */
@@ -50,141 +116,62 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
   // Awaited, not fire-and-forget: a failed write used to be invisible and
   // silently signed the user out on the next cold start.
   setTokens: async (access, refresh) => {
+    const generation = authSessionGeneration
     set({ accessToken: access, refreshToken: refresh, isAuthenticated: true })
     try {
-      await setSecureItem(ACCESS_KEY, access)
-      await setSecureItem(REFRESH_KEY, refresh)
-      if (get().persistError) set({ persistError: null })
-    } catch (err) {
-      set({ persistError: err instanceof Error ? err.message : 'Could not save your session securely.' })
+      await enqueuePersistence(async () => {
+        if (generation !== authSessionGeneration) return
+        await setSecureItem(ACCESS_KEY, access)
+        await setSecureItem(REFRESH_KEY, refresh)
+      })
+      if (generation === authSessionGeneration && get().persistError) {
+        set({ persistError: null })
+      }
+    } catch (error) {
+      if (generation === authSessionGeneration) {
+        set({ persistError: error instanceof Error ? error.message : 'Could not save your session securely.' })
+      }
     }
   },
 
   setUser: async (user) => {
+    const generation = authSessionGeneration
     set({ user })
     try {
-      await AsyncStorage.setItem(USER_KEY, JSON.stringify(user))
+      await enqueuePersistence(async () => {
+        if (generation !== authSessionGeneration) return
+        await AsyncStorage.setItem(USER_KEY, JSON.stringify(user))
+      })
     } catch {
-      // The profile is a cache; losing it only costs one extra /users/me call.
+      // The profile is a cache; the authenticated profile endpoint refills it.
     }
   },
 
   logout: async (expectedSession) => {
-    // Captured before clearing: the revoke call needs the token, and the route
-    // (POST /api/v1/auth/logout) is unauthenticated by design.
-    const targetSession = expectedSession ?? {
-      generation: get().sessionGeneration,
-      accessToken: get().accessToken,
-      refreshToken: get().refreshToken,
-    }
-    const refresh = targetSession.refreshToken
-    const access = targetSession.accessToken
-    const isTargetSessionCurrent = () => {
-      return get().sessionGeneration === targetSession.generation
-    }
-
-    const revoke = async () => {
-      if (!refresh) return
-      try {
-        await authApi.logout(refresh)
-      } catch {
-        // An offline logout is still a logout locally.
-      }
-    }
-
-    // A caller may have crossed a reset before reaching the store. Never let
-    // its cleanup clear the account that replaced it.
-    if (!isTargetSessionCurrent()) {
-      await revoke()
-      return
-    }
-
-    // Deregister this device's push token BEFORE the session is cleared — the
-    // DELETE needs the access token. Without it, the next person to sign in on
-    // a shared handset keeps receiving this user's notifications until they
-    // happen to register the same token themselves.
-    //
-    // Imported dynamically, and failure ignored, for two reasons: `lib/push`
-    // pulls in expo-notifications, which must not become a static dependency of
-    // this store (the unit suite runs it in plain node), and a device that
-    // cannot be deregistered must not be able to block a sign-out.
-    try {
-      const { deregisterPushToken } = await import('../lib/push')
-      await deregisterPushToken(access)
-    } catch {
-      // No push module, no permission, or offline. Signing out still proceeds.
-    }
-
-    // Push cleanup is asynchronous. The user may have signed into a different
-    // account while it was running, in which case this logout now belongs to
-    // the old session and must not touch the replacement's local state.
-    if (!isTargetSessionCurrent()) {
-      await revoke()
-      return
-    }
-
-    set((state) => ({
-      sessionGeneration: state.sessionGeneration + 1,
-      accessToken: null,
-      refreshToken: null,
-      user: null,
-      isAuthenticated: false,
-      persistError: null,
-    }))
-
-    await Promise.all([
-      deleteSecureItem(ACCESS_KEY),
-      deleteSecureItem(REFRESH_KEY),
-      AsyncStorage.removeItem(USER_KEY).catch(() => {}),
-      AsyncStorage.removeItem(LEGACY_AUTH_KEY).catch(() => {}),
-    ])
-
-    // Best effort: without this the refresh-token row survives every
-    // user-initiated logout until it expires naturally.
-    await revoke()
+    if (expectedSession && get().sessionGeneration !== expectedSession.generation) return
+    const { resetAccountSession } = await import('../lib/accountSession')
+    if (expectedSession && get().sessionGeneration !== expectedSession.generation) return
+    await resetAccountSession()
   },
 
   hydrate: async () => {
+    const generation = authSessionGeneration
     try {
-      let access = await getSecureItem(ACCESS_KEY)
-      let refresh = await getSecureItem(REFRESH_KEY)
-
-      // Migrate a pre-keystore session instead of forcing a re-login.
-      if (!access) {
-        const legacy = await AsyncStorage.getItem(LEGACY_AUTH_KEY)
-        if (legacy) {
-          try {
-            const parsed = JSON.parse(legacy) as { accessToken?: string; refreshToken?: string }
-            if (parsed?.accessToken) {
-              access = parsed.accessToken
-              refresh = parsed.refreshToken ?? null
-              await setSecureItem(ACCESS_KEY, access)
-              if (refresh) await setSecureItem(REFRESH_KEY, refresh)
-            }
-          } catch {
-            // Unparsable legacy blob — treat as signed out.
-          }
-          await AsyncStorage.removeItem(LEGACY_AUTH_KEY).catch(() => {})
-        }
-      }
-
-      let user: User | null = null
-      const userStr = await AsyncStorage.getItem(USER_KEY)
-      if (userStr) {
-        try {
-          user = JSON.parse(userStr) as User
-        } catch {
-          user = null
-        }
-      }
-
-      if (access) {
-        set({ accessToken: access, refreshToken: refresh, user, isAuthenticated: true, hydrated: true })
+      const stored = await enqueuePersistence(readStoredAuthSession)
+      if (generation !== authSessionGeneration) return
+      if (stored.access) {
+        set({
+          accessToken: stored.access,
+          refreshToken: stored.refresh,
+          user: stored.user,
+          isAuthenticated: true,
+          hydrated: true,
+        })
       } else {
         set({ hydrated: true })
       }
     } catch {
-      set({ hydrated: true })
+      if (generation === authSessionGeneration) set({ hydrated: true })
     }
   },
 }))

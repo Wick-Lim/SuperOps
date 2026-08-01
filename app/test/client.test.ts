@@ -3,12 +3,20 @@ import { api, fileURL, withPaging } from '../src/api/client'
 import { authApi } from '../src/api/auth'
 import { ApiError, ApiErrorCode, ServerErrorCode, hasErrorCode, isApiError } from '../src/lib/errors'
 import { useAuthStore } from '../src/stores/authStore'
+import { useChannelStore } from '../src/stores/channelStore'
+import { useDriveStore } from '../src/stores/driveStore'
+import { useMessageStore } from '../src/stores/messageStore'
+import { useUiStore } from '../src/stores/uiStore'
+import { useUserStore } from '../src/stores/userStore'
+import { useWorkspaceStore } from '../src/stores/workspaceStore'
 import {
   API,
   apiFailure,
   envelope,
   flush,
   htmlError,
+  makeChannel,
+  makeMessage,
   mockFetch,
   ok,
   resetStores,
@@ -299,7 +307,7 @@ describe('refresh coalescing', () => {
 })
 
 describe('session-safe logout after refresh failure', () => {
-  it('ordinary logout still clears a same-account session whose tokens rotate during push cleanup', async () => {
+  it('does not erase a sign-in that starts after the synchronous logout boundary', async () => {
     let releasePush!: () => void
     let enteredPush!: () => void
     const pushEntered = new Promise<void>((resolve) => { enteredPush = resolve })
@@ -321,10 +329,10 @@ describe('session-safe logout after refresh failure', () => {
     await logout
 
     expect(useAuthStore.getState()).toMatchObject({
-      accessToken: null,
-      refreshToken: null,
+      accessToken: 'fresh-a',
+      refreshToken: 'rotated-a',
       user: null,
-      isAuthenticated: false,
+      isAuthenticated: true,
     })
   })
 
@@ -423,6 +431,25 @@ describe('retry depth cap', () => {
 
   it('logs out with SESSION_EXPIRED when the refresh itself fails', async () => {
     signIn('stale', 'refresh-1')
+    useWorkspaceStore.setState({
+      workspaces: [{ id: 'workspace-a' } as never],
+      activeWorkspace: { id: 'workspace-a' } as never,
+    })
+    useChannelStore.setState({
+      channels: [makeChannel('channel-a')],
+      activeChannel: makeChannel('channel-a'),
+    })
+    useMessageStore.setState({
+      messages: { 'channel-a': [makeMessage('message-a', 'channel-a')] },
+      cursors: { 'channel-a': 'cursor-a' },
+      hasMore: { 'channel-a': true },
+    })
+    useDriveStore.setState({ rootId: 'root-a', entries: [{ kind: 'file' } as never] })
+    useUserStore.setState({ users: { 'user-a': { id: 'user-a' } as never } })
+    useUiStore.setState({
+      presence: { 'user-a': 'online' },
+      activeThread: { channelId: 'channel-a', parent: makeMessage('parent-a', 'channel-a') },
+    })
     net = mockFetch((req) => {
       if (req.path === '/auth/refresh') return apiFailure(401, 'INVALID_REFRESH_TOKEN')
       if (req.path === '/auth/logout') return ok({ message: 'ok' })
@@ -439,6 +466,12 @@ describe('retry depth cap', () => {
     expect((err as ApiError).isAuthExpired).toBe(true)
     expect(useAuthStore.getState().accessToken).toBeNull()
     expect(useAuthStore.getState().isAuthenticated).toBe(false)
+    expect(useWorkspaceStore.getState().activeWorkspace).toBeNull()
+    expect(useChannelStore.getState().activeChannel).toBeNull()
+    expect(useMessageStore.getState().messages).toEqual({})
+    expect(useDriveStore.getState().rootId).toBeNull()
+    expect(useUserStore.getState().users).toEqual({})
+    expect(useUiStore.getState()).toMatchObject({ presence: {}, activeThread: null })
     // Best-effort server-side revoke still went out.
     expect(net.to('/auth/logout')).toHaveLength(1)
   })

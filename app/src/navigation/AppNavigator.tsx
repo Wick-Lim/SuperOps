@@ -8,7 +8,8 @@ import {
 import { useAuthStore } from '../stores/authStore'
 import { workspaceApi } from '../api/workspaces'
 import { useWorkspaceStore } from '../stores/workspaceStore'
-import { errorMessage, isApiError } from '../api/client'
+import { errorMessage } from '../api/client'
+import { isTerminalBootstrapAuthError } from '../lib/accountSession'
 import { usePushNotifications } from '../lib/push'
 import { navigationRef } from './navigationRef'
 import { API_BASE_URL } from '../config'
@@ -273,15 +274,14 @@ export default function AppNavigator() {
         store.setActiveWorkspace(list.find((w) => w.id === active?.id) ?? list[0])
         setBoot({ status: 'ready', route: 'Workspace' })
       })
-      .catch((err: unknown) => {
+      .catch(async (error: unknown) => {
         if (cancelled) return
-        // An expired session has already cleared the auth store; that state
-        // change routes to Login on its own, and an error screen would flash
-        // over the top of it.
-        if (isApiError(err) && err.isAuthExpired) return
-        // Sending every failure — including a dropped connection — to the
-        // onboarding wizard offered an existing user a second workspace.
-        setBoot({ status: 'error', message: errorMessage(err, 'Could not reach the server.') })
+        if (isTerminalBootstrapAuthError(error)) {
+          await useAuthStore.getState().logout()
+          return
+        }
+        if (cancelled) return
+        setBoot({ status: 'error', message: errorMessage(error, 'Could not reach the server.') })
       })
 
     // Without this, a logout during the in-flight request still wrote state
