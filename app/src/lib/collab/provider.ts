@@ -282,23 +282,39 @@ export class CollabProvider {
         // discards the rest.
         if (this.canWrite) this.onProjectRequest?.()
         break
-      case 'rejected':
-        if (e.op === 'join') {
-          const terminal = e.code === 'FORBIDDEN' || e.code === 'NOT_FOUND'
-          this.canWrite = false
-          this.recoveryEpoch += 1
-          this.recoveryInFlight = null
-          this.recoveryRequested = false
-          this.recoveryCatchUpRequested = false
-          this.clearSocketSends()
-          if (this.pendingUpdate) this.needsHttpRecovery = true
-          this.pendingCompactionHead = 0
-          wsManager.leaveRoom(this.documentId)
-          this.setStatus(terminal ? 'revoked' : 'error', e.message)
-        } else if (this.pendingUpdate && (e.op === 'update' || e.op === 'unknown')) {
-          this.beginHttpRecovery(true)
-        }
+      case 'rejected': {
+          // Older/unsupported collaboration servers emit an unscoped
+          // UNSUPPORTED error for the initial join. There is no operation or
+          // document id to route, so use the provider's initial connecting
+          // state to distinguish it from an unscoped update failure: the
+          // latter remains an HTTP-recovery path while a deployment that has
+          // no collaboration support must stop retrying forever.
+          const initialJoin =
+            e.op === 'join' ||
+            (
+              e.op === 'unknown' &&
+              e.code === 'UNSUPPORTED' &&
+              this.status === 'connecting' &&
+              wsManager.roomAccess(this.documentId) === undefined &&
+              !this.pendingUpdate
+            )
+          if (initialJoin) {
+            const terminal = e.code === 'FORBIDDEN' || e.code === 'NOT_FOUND' || e.code === 'UNSUPPORTED'
+            this.canWrite = false
+            this.recoveryEpoch += 1
+            this.recoveryInFlight = null
+            this.recoveryRequested = false
+            this.recoveryCatchUpRequested = false
+            this.clearSocketSends()
+            if (this.pendingUpdate) this.needsHttpRecovery = true
+            this.pendingCompactionHead = 0
+            wsManager.leaveRoom(this.documentId)
+            this.setStatus(terminal ? 'revoked' : 'error', e.message)
+          } else if (this.pendingUpdate && (e.op === 'update' || e.op === 'unknown')) {
+            this.beginHttpRecovery(true)
+          }
         break
+      }
       case 'resync':
         this.beginHttpRecovery(true)
         break

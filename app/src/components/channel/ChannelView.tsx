@@ -34,6 +34,7 @@ import { newTempId, optimisticMessage, type OutboxEntry } from '../message/outbo
 import { useCustomEmoji } from '../message/customEmoji'
 import { announce, useModalFocus } from '../a11y'
 import { getCachedDMRoster, loadDMRoster } from './dmRosterCache'
+import { visibleDMRoster } from './dmRosterVisibility'
 
 interface Props {
   channel: Channel
@@ -80,6 +81,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers, showBack }
   const [forwardTarget, setForwardTarget] = useState<Message | null>(null)
   const [viewerFile, setViewerFile] = useState<FileRef | null>(null)
   const [dmIds, setDmIds] = useState<string[]>(() => [...(getCachedDMRoster(channel.id) ?? [])])
+  const [dmRosterChannelId, setDmRosterChannelId] = useState(channel.id)
 
   const loadingMoreRef = useRef(false)
   const lastAnnouncedRef = useRef<string | null>(null)
@@ -124,11 +126,13 @@ export default function ChannelView({ channel, onBack, onOpenMembers, showBack }
     // Props can switch this mounted view directly from one channel to another.
     // Replace the old roster synchronously so A's names never label B's header
     // while B's member request is still in flight.
+    setDmRosterChannelId(channel.id)
     setDmIds([...(getCachedDMRoster(channel.id) ?? [])])
     if (!isDM || channel.name) return
     const cached = getCachedDMRoster(channel.id)
     if (cached) {
       const ids = [...cached]
+      setDmRosterChannelId(channel.id)
       setDmIds(ids)
       ensureUsers(ids)
       return
@@ -138,6 +142,7 @@ export default function ChannelView({ channel, onBack, onOpenMembers, showBack }
       .then((loaded) => {
         if (cancelled || !loaded) return
         const ids = [...loaded]
+        setDmRosterChannelId(channel.id)
         setDmIds(ids)
         ensureUsers(ids)
       })
@@ -150,10 +155,11 @@ export default function ChannelView({ channel, onBack, onOpenMembers, showBack }
   const title = useMemo(() => {
     if (channel.name) return channel.name
     if (!isDM) return 'Channel'
-    const others = dmIds.filter((id) => id !== currentUserId)
+    const visibleIds = visibleDMRoster(channel.id, dmRosterChannelId, dmIds)
+    const others = visibleIds.filter((id) => id !== currentUserId)
     if (others.length === 0) return 'Direct message'
     return others.map((id) => displayName(users, id)).join(', ')
-  }, [channel.name, currentUserId, dmIds, isDM, users])
+  }, [channel.id, channel.name, currentUserId, dmIds, dmRosterChannelId, isDM, users])
 
   // --- pagination ----------------------------------------------------------
 

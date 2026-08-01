@@ -920,6 +920,41 @@ describe('the collaboration provider', () => {
     provider.destroy()
   })
 
+  it('keeps an unscoped transient update rejection on the recovery path', async () => {
+    net = mockFetch((req) => {
+      if (req.path.includes('/state')) return emptyState()
+      if (req.path.includes('/updates')) return apiFailure(503, 'SERVICE_UNAVAILABLE')
+      return ok({})
+    })
+    const socket = connectOpen()
+    socket.emit({ type: 'hello', seq: 1, data: { connection_id: 'connection-a' } })
+    const { doc, provider } = makeProvider()
+    await flush()
+    socket.emit({
+      type: 'collab.joined',
+      data: { document_id: DOC, head_seq: 0, can_write: true },
+    })
+    await settle()
+
+    doc.getText('body').insert(0, 'unscoped transient failure')
+    await flush()
+    socket.emit({
+      type: 'error',
+      seq: 2,
+      data: {
+        code: 'INTERNAL_ERROR',
+        message: 'could not process collaboration frame',
+      },
+    })
+    await settle()
+
+    expect(updateCalls()).toHaveLength(1)
+    expect(provider.currentStatus).toBe('error')
+    expect(provider.currentStatus).not.toBe('revoked')
+    expect(provider.hasPendingChanges).toBe(true)
+    provider.destroy()
+  })
+
   it('treats a scoped join rejection as terminal and stops rejoining the room', async () => {
     const socket = connectOpen()
     const { provider } = makeProvider()
@@ -943,6 +978,29 @@ describe('the collaboration provider', () => {
     const resumed = connectOpen()
     await flush()
     expect(resumed.sentOfType('collab.join')).toEqual([])
+    provider.destroy()
+  })
+
+  it('treats an unscoped unsupported join as terminal and stops retrying', async () => {
+    const socket = connectOpen()
+    const { provider } = makeProvider()
+    await flush()
+
+    socket.emit({
+      type: 'error',
+      data: {
+        code: 'UNSUPPORTED',
+        message: 'collaboration is not enabled on this server',
+      },
+    })
+    await flush()
+
+    expect(provider.currentStatus).toBe('revoked')
+    expect(provider.writable).toBe(false)
+    expect(socket.sentOfType('collab.leave').map((frame) => frame.data.document_id)).toEqual([DOC])
+
+    provider.retry()
+    expect(provider.currentStatus).toBe('revoked')
     provider.destroy()
   })
 

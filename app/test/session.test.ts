@@ -150,16 +150,11 @@ describe('generational account caches', () => {
     expect(getCachedWorkspaceRole('workspace-a:user-a')).toBeUndefined()
   })
 
-  it('resets ChannelView DM state from the newly selected channel before loading', async () => {
-    const fs = await import('node:fs/promises')
-    const source = await fs.readFile('src/components/channel/ChannelView.tsx', 'utf8')
-    const effectStart = source.indexOf('// A DM has `name === null`')
-    const effect = source.slice(effectStart, source.indexOf('const title = useMemo', effectStart))
-    const reset = effect.indexOf('setDmIds([...(getCachedDMRoster(channel.id) ?? [])])')
-    const guard = effect.indexOf('if (!isDM || channel.name) return')
+  it('hides a prior DM roster until the newly selected channel owns it', async () => {
+    const { visibleDMRoster } = await import('../src/components/channel/dmRosterVisibility')
 
-    expect(reset, 'the prior channel roster remains visible after a channel switch').toBeGreaterThan(-1)
-    expect(reset, 'the reset must happen even when the new channel is not an unnamed DM').toBeLessThan(guard)
+    expect(visibleDMRoster('channel-b', 'channel-a', ['user-a'])).toEqual([])
+    expect(visibleDMRoster('channel-b', 'channel-b', ['user-b'])).toEqual(['user-b'])
   })
 })
 
