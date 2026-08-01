@@ -19,6 +19,7 @@ import {
 } from '../src/screens/internal/useWorkspaceRole'
 import { resetAccountSession, isTerminalBootstrapAuthError } from '../src/lib/accountSession'
 import { ApiError } from '../src/lib/errors'
+import { registerPushToken, setBadge } from '../src/lib/push'
 import { useAuthStore } from '../src/stores/authStore'
 import { useChannelStore } from '../src/stores/channelStore'
 import { useDriveStore } from '../src/stores/driveStore'
@@ -28,10 +29,35 @@ import { useUserStore } from '../src/stores/userStore'
 import { useWorkspaceStore } from '../src/stores/workspaceStore'
 import { flush, makeChannel, makeMessage, mockFetch, ok, resetStores, signIn } from './helpers'
 
+const notificationMocks = vi.hoisted(() => ({
+  getPermissionsAsync: vi.fn(),
+  requestPermissionsAsync: vi.fn(),
+  getExpoPushTokenAsync: vi.fn(),
+  setBadgeCountAsync: vi.fn(),
+}))
+
+vi.mock('expo-notifications', () => ({
+  ...notificationMocks,
+  setNotificationHandler: vi.fn(),
+  setNotificationChannelAsync: vi.fn(),
+  addNotificationReceivedListener: vi.fn(),
+  useLastNotificationResponse: vi.fn(() => null),
+  DEFAULT_ACTION_IDENTIFIER: 'default',
+  AndroidImportance: { HIGH: 4 },
+  IosAuthorizationStatus: { PROVISIONAL: 4 },
+}))
+
 const realFetch = globalThis.fetch
 const testSecureStore = SecureStore as typeof SecureStore & { __reset: () => void }
 
 beforeEach(async () => {
+  notificationMocks.getPermissionsAsync.mockReset().mockResolvedValue({
+    granted: true,
+    canAskAgain: true,
+  })
+  notificationMocks.requestPermissionsAsync.mockReset()
+  notificationMocks.getExpoPushTokenAsync.mockReset().mockResolvedValue({ data: 'push-shared' })
+  notificationMocks.setBadgeCountAsync.mockReset().mockResolvedValue(undefined)
   resetStores()
   await AsyncStorage.clear()
   testSecureStore.__reset()
@@ -270,5 +296,49 @@ describe('account session reset', () => {
       refreshToken: 'refresh-b',
       isAuthenticated: true,
     })
+  })
+
+  it('does not let A push cleanup erase B registration for the same device token', async () => {
+    populateAccountA()
+    await AsyncStorage.setItem('superops-push-token', 'push-shared')
+    let releaseAccountA!: () => void
+    let enterAccountA!: () => void
+    const accountAEntered = new Promise<void>((resolve) => { enterAccountA = resolve })
+    const accountAGate = new Promise<void>((resolve) => { releaseAccountA = resolve })
+    const deleteBearers: string[] = []
+    mockFetch(async (req) => {
+      if (req.path === '/users/me/devices/push-shared') {
+        deleteBearers.push(req.headers.Authorization)
+        if (req.headers.Authorization === 'Bearer access-a') {
+          enterAccountA()
+          await accountAGate
+        }
+        return ok({ message: 'ok' })
+      }
+      if (req.path === '/users/me/devices') {
+        expect(req.headers.Authorization).toBe('Bearer access-b')
+        return ok({ token: 'push-shared', platform: 'ios' })
+      }
+      if (req.path === '/auth/logout') return ok({ message: 'ok' })
+      throw new Error(`unexpected request ${req.path}`)
+    })
+
+    const resettingAccountA = resetAccountSession()
+    await accountAEntered
+    signIn('access-b', 'refresh-b', 'user-b')
+    await expect(registerPushToken()).resolves.toBe('registered')
+    await setBadge(7)
+    releaseAccountA()
+    await resettingAccountA
+
+    expect(await AsyncStorage.getItem('superops-push-token')).toBe('push-shared')
+    expect(notificationMocks.setBadgeCountAsync).toHaveBeenLastCalledWith(7)
+    expect(useAuthStore.getState().user?.id).toBe('user-b')
+
+    await resetAccountSession()
+
+    expect(await AsyncStorage.getItem('superops-push-token')).toBeNull()
+    expect(notificationMocks.setBadgeCountAsync).toHaveBeenLastCalledWith(0)
+    expect(deleteBearers).toEqual(['Bearer access-a', 'Bearer access-b'])
   })
 })

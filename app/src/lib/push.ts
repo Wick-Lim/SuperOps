@@ -7,6 +7,7 @@ import { deviceApi, type DevicePlatform } from '../api/devices'
 import { channelApi } from '../api/channels'
 import { notificationApi } from '../api/notifications'
 import { isApiError } from './errors'
+import { useAuthStore } from '../stores/authStore'
 import { useChannelStore } from '../stores/channelStore'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { useUiStore } from '../stores/uiStore'
@@ -37,6 +38,14 @@ import { navigationRef } from '../navigation/navigationRef'
  * at that moment (it is a network call and can fail offline).
  */
 const PUSH_TOKEN_KEY = 'superops-push-token'
+
+let pushPersistenceTail: Promise<void> = Promise.resolve()
+
+function enqueuePushPersistence<T>(work: () => Promise<T>): Promise<T> {
+  const run = pushPersistenceTail.then(work, work)
+  pushPersistenceTail = run.then(() => undefined, () => undefined)
+  return run
+}
 
 /**
  * Optional override for the Expo project id. `getExpoPushTokenAsync` normally
@@ -207,7 +216,7 @@ export async function registerPushToken(): Promise<PushOutcome> {
   }
 
   try {
-    await AsyncStorage.setItem(PUSH_TOKEN_KEY, token)
+    await enqueuePushPersistence(() => AsyncStorage.setItem(PUSH_TOKEN_KEY, token))
   } catch {
     // Only costs us the ability to deregister on logout without a fresh token.
   }
@@ -217,27 +226,47 @@ export async function registerPushToken(): Promise<PushOutcome> {
 /**
  * Deregisters this device and forgets the token.
  *
- * Called from `authStore.logout` *before* the session is cleared, because the
- * request needs the access token. Skipping it is what makes the next person to
- * sign in on a shared handset receive the previous user's notifications until
- * they happen to re-register.
+ * The reset coordinator passes the old access token explicitly after the
+ * in-memory session is cleared. Shared device storage is changed only while
+ * that same signed-out generation still owns the cleanup; a newer sign-in may
+ * reuse the same physical Expo token and must keep its key and badge state.
  */
-export async function deregisterPushToken(accessToken: string | null): Promise<void> {
+export async function deregisterPushToken(
+  accessToken: string | null,
+  resetGeneration: number,
+): Promise<void> {
   let token: string | null = null
   try {
-    token = await AsyncStorage.getItem(PUSH_TOKEN_KEY)
+    token = await enqueuePushPersistence(() => AsyncStorage.getItem(PUSH_TOKEN_KEY))
   } catch {
     return
   }
   if (!token) return
 
   await deviceApi.deregister(token, accessToken)
-  try {
-    await AsyncStorage.removeItem(PUSH_TOKEN_KEY)
-  } catch {
-    // A stale key is harmless: the next deregister call 404s and moves on.
-  }
-  await setBadge(0)
+  await enqueuePushPersistence(async () => {
+    const cleanupIsCurrent = () => {
+      const auth = useAuthStore.getState()
+      return auth.sessionGeneration === resetGeneration && !auth.isAuthenticated
+    }
+    if (!cleanupIsCurrent()) return
+
+    let storedToken: string | null
+    try {
+      storedToken = await AsyncStorage.getItem(PUSH_TOKEN_KEY)
+    } catch {
+      return
+    }
+    if (!cleanupIsCurrent() || storedToken !== token) return
+
+    try {
+      await AsyncStorage.removeItem(PUSH_TOKEN_KEY)
+    } catch {
+      // A stale key is harmless: the next deregister call 404s and moves on.
+    }
+    if (!cleanupIsCurrent()) return
+    await setBadge(0)
+  })
 }
 
 /** Sets the app icon badge, ignoring launchers that do not support one. */

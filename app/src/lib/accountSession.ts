@@ -21,6 +21,7 @@ export async function resetAccountSession(): Promise<void> {
   const { accessToken, refreshToken } = useAuthStore.getState()
 
   api.resetSession()
+  const localResetGeneration = useAuthStore.getState().sessionGeneration
   wsManager.reset()
   useWorkspaceStore.getState().clear()
   useChannelStore.getState().clear()
@@ -37,7 +38,7 @@ export async function resetAccountSession(): Promise<void> {
   const localStorageCleanup = clearLocalAuthSession()
 
   const pushCleanup = import('./push').then(({ deregisterPushToken }) =>
-    deregisterPushToken(accessToken),
+    deregisterPushToken(accessToken, localResetGeneration),
   )
   const serverCleanup = refreshToken
     ? authApi.logout(refreshToken).then(() => undefined)
