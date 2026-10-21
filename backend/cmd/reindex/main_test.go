@@ -25,12 +25,13 @@ func TestSelectSources(t *testing.T) {
 		want  []search.ObjectType
 		valid bool
 	}{
-		{"default", "", []search.ObjectType{search.TypeMessage, search.TypeFile}, true},
-		{"all", "all", []search.ObjectType{search.TypeMessage, search.TypeFile}, true},
+		{"default", "", []search.ObjectType{search.TypeMessage, search.TypeFile, search.TypeIssue}, true},
+		{"all", "all", []search.ObjectType{search.TypeMessage, search.TypeFile, search.TypeIssue}, true},
 		{"one type", "file", []search.ObjectType{search.TypeFile}, true},
 		{"the other type", "message", []search.ObjectType{search.TypeMessage}, true},
-		// A type search knows about but nothing produces yet must not silently
-		// rebuild to zero rows and report success.
+		{"issue type", "issue", []search.ObjectType{search.TypeIssue}, true},
+		// A type search knows about but nothing produces as a standalone source
+		// (document is produced by the file source).
 		{"a type with no source", "document", nil, false},
 		{"nonsense", "everything", nil, false},
 	}
@@ -174,6 +175,18 @@ func TestScanRows(t *testing.T) {
 			want: search.Doc{
 				Type: search.TypeFile, ID: objID, WorkspaceID: wsID,
 				UserID: userID, Title: "draft.pdf", CreatedAt: createdAt.Unix(),
+			},
+		},
+		{
+			name: "issue carries its materialized keys and key+title",
+			typ:  search.TypeIssue,
+			row: fakeRow{objID, wsID, userID, "OPS-14", "Fix token refresh", "Body of issue",
+				[]string{"w-" + wsID, "u-" + otherID}, createdAt},
+			wantACL: []string{"w-" + wsID, "u-" + otherID},
+			want: search.Doc{
+				Type: search.TypeIssue, ID: objID, WorkspaceID: wsID,
+				UserID: userID, Title: "OPS-14 Fix token refresh",
+				Content: "Body of issue", CreatedAt: createdAt.Unix(),
 			},
 		},
 	}

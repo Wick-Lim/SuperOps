@@ -385,6 +385,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	drivePublisher := drive.NewPublisher(natsClient, logger)
 	driveHandler := drive.NewHandler(pool, az, driveKinds, fileStorage, collabRepo, auditService,
 		drivePublisher)
+	driveHandler.SetLinkSecret(cfg.JWT.Secret)
 
 	// The comment surface. ONE per product: plan 02 §13 cut per-file comments
 	// so that Phase 2 could build this once and Drive adopt it, and a second
@@ -401,6 +402,7 @@ func New(ctx context.Context, cfg *Config, logger *slog.Logger) (*App, error) {
 	// describe — internal/authz's derivedTypes is unchanged and migration 031
 	// adds no arm to either expected-state view.
 	issueHandler := issue.NewHandler(pool, az, comment.NewNATSNotifier(natsClient), auditService)
+	issueHandler.SetPublisher(issue.NewPublisher(natsClient, logger))
 	// Closes the cycle: the checker revokes document sessions through the
 	// service, and the service authorizes through the checker.
 	revoker.collab.Store(collabSvc)

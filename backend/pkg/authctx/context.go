@@ -8,6 +8,7 @@ const (
 	keyUserID      ctxKey = "user_id"
 	keyWorkspaceID ctxKey = "workspace_id"
 	keyRole        ctxKey = "role"
+	keyLinkID      ctxKey = "link_id"
 )
 
 func WithUserID(ctx context.Context, userID string) context.Context {
@@ -20,6 +21,10 @@ func WithWorkspaceID(ctx context.Context, workspaceID string) context.Context {
 
 func WithRole(ctx context.Context, role string) context.Context {
 	return context.WithValue(ctx, keyRole, role)
+}
+
+func WithLinkID(ctx context.Context, linkID string) context.Context {
+	return context.WithValue(ctx, keyLinkID, linkID)
 }
 
 func UserID(ctx context.Context) string {
@@ -38,6 +43,13 @@ func WorkspaceID(ctx context.Context) string {
 
 func Role(ctx context.Context) string {
 	if v, ok := ctx.Value(keyRole).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func LinkID(ctx context.Context) string {
+	if v, ok := ctx.Value(keyLinkID).(string); ok {
 		return v
 	}
 	return ""

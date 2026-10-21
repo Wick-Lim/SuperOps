@@ -89,6 +89,7 @@ const (
 	jobMailSweep        = "mail_unsent_sweep"
 	jobProjectionRepair = "projection_repair"
 	jobQuotaDrift       = "quota_drift"
+	jobEventOutbox      = "event_outbox"
 )
 
 // Job cadences. startDelay staggers the first run so a rolling restart does not
@@ -166,6 +167,9 @@ const (
 	// Per sweep. A bounded, visible amount of work rather than a thundering
 	// request to every room in a backlog.
 	projectionRepairBatch = 100
+
+	eventOutboxInterval   = 5 * time.Second
+	eventOutboxStartDelay = 3 * time.Second
 )
 
 // Advisory-lock keys. Distinct 64-bit constants; any other application taking
@@ -205,7 +209,8 @@ const (
 	lockProjectionRepair int64 = 0x50_000D
 	// The storage-quota reconciler. Locked because it WRITES workspace_storage;
 	// two replicas recomputing the same workspace would race on the same row.
-	lockQuotaDrift int64 = 0x50_000E
+	lockQuotaDrift  int64 = 0x50_000E
+	lockEventOutbox int64 = 0x50_000F
 )
 
 // aclDriftSamples bounds how many concrete disagreements one drift report
@@ -347,6 +352,7 @@ func run() int {
 		// message filter: a poisonous file event must not stall message
 		// indexing, and the two have independent redelivery budgets.
 		bind(durableSpec{durable: "file-indexer", filter: "superops.*.file.*", handle: indexer.HandleFile})
+		bind(durableSpec{durable: "issue-indexer", filter: "superops.*.issue.*", handle: indexer.HandleIssue})
 	}
 
 	// Push rides the notification fan-out: the same events, the same audience
@@ -461,6 +467,24 @@ func run() int {
 	messageRepo := message.NewRepository(pool)
 	start(jobScheduledSend, scheduledInterval, scheduledInterval, func(c context.Context) error {
 		return promoteScheduled(c, pool, messageRepo, natsClient, l)
+	})
+	start(jobEventOutbox, eventOutboxStartDelay, eventOutboxInterval, func(c context.Context) error {
+		ran, err := withSingletonLock(c, pool, lockEventOutbox, func(c context.Context) error {
+			_, err := messageRepo.SweepOutbox(c, 100, func(pubCtx context.Context, ev message.OutboxEvent) error {
+				return natsClient.PublishDurable(pubCtx, ev.Subject, ev.DedupeID, natspkg.Event{
+					Type: ev.EventType,
+					Data: ev.Payload,
+				})
+			})
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		if !ran {
+			l.Debug("event outbox skipped: another replica holds the lock")
+		}
+		return nil
 	})
 
 	start(jobRetention, retentionStartDelay, retentionInterval, func(c context.Context) error {

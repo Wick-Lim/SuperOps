@@ -265,6 +265,21 @@ const fileSQL = `
 	 ORDER BY f.created_at, f.id
 	 LIMIT $4`
 
+const issueSQL = `
+	SELECT i.id, i.workspace_id, COALESCE(i.created_by::text, ''),
+	       p.key || '-' || i.number::text,
+	       i.title, i.description,
+	       COALESCE(ARRAY(SELECT k.key FROM acl_key k
+	                       WHERE k.object_type = 'issue' AND k.object_id = i.id), '{}'),
+	       i.created_at
+	  FROM issues i
+	  JOIN projects p ON p.id = i.project_id
+	 WHERE i.archived_at IS NULL
+	   AND ($1::uuid IS NULL OR i.workspace_id = $1::uuid)
+	   AND (i.created_at, i.id) > ($2::timestamptz, $3::uuid)
+	 ORDER BY i.created_at, i.id
+	 LIMIT $4`
+
 func sources() []source {
 	return []source{
 		{
@@ -301,6 +316,22 @@ func sources() []source {
 				// indexer's transitional sweep exists to remove — and ?type=document
 				// returns nothing the day after a recovery.
 				doc.Type = search.FileObjectType(fileType)
+				doc.CreatedAt = createdAt.Unix()
+				return doc.Doc(), cursor{at: createdAt, id: doc.ID}, nil
+			},
+		},
+		{
+			typ: search.TypeIssue,
+			sql: issueSQL,
+			scan: func(row pgxRow) (search.Doc, cursor, error) {
+				var (
+					doc       search.IssueDoc
+					createdAt time.Time
+				)
+				if err := row.Scan(&doc.ID, &doc.WorkspaceID, &doc.UserID,
+					&doc.Key, &doc.Title, &doc.Description, &doc.ACL, &createdAt); err != nil {
+					return search.Doc{}, cursor{}, fmt.Errorf("scan issue: %w", err)
+				}
 				doc.CreatedAt = createdAt.Unix()
 				return doc.Doc(), cursor{at: createdAt, id: doc.ID}, nil
 			},

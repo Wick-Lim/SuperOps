@@ -272,6 +272,7 @@ func (r *Repository) Ingest(ctx context.Context, in Inbound) (*Conversation, *Me
 	in.References = nonNil(in.References)
 	in.To = nonNil(in.To)
 	in.Cc = nonNil(in.Cc)
+	in.BodyHTML = SanitizeHTML(in.BodyHTML)
 
 	var (
 		conv Conversation
@@ -407,6 +408,8 @@ func (r *Repository) Ingest(ctx context.Context, in Inbound) (*Conversation, *Me
 	msg.MessageID = in.MessageID
 	msg.FromAddress = in.FromAddress
 	msg.Subject = in.Subject
+	msg.BodyText = in.BodyText
+	msg.BodyHTML = in.BodyHTML
 	return &conv, &msg, nil
 }
 

@@ -2,12 +2,15 @@ package drive
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -621,15 +624,151 @@ func (h *Handler) ResolveLink(w http.ResponseWriter, r *http.Request) {
 	h.record(ctx, workspaceID, "drive.link_resolved", objectType, objectID,
 		map[string]interface{}{"link_id": linkID})
 
+	sessionToken, err := h.mintLinkSession(linkSessionClaims{
+		LinkID:      linkID,
+		ObjectType:  objectType,
+		ObjectID:    objectID,
+		WorkspaceID: workspaceID,
+		Capability:  capability,
+		Exp:         time.Now().Add(linkSessionTTL).Unix(),
+	})
+	if err != nil {
+		httputil.HandleError(w, httputil.NewInternal(err))
+		return
+	}
+
 	httputil.JSON(w, http.StatusOK, map[string]interface{}{
-		"link_id":     linkID,
-		"object_type": objectType,
-		"object_id":   objectID,
-		"capability":  capability,
+		"link_id":       linkID,
+		"object_type":   objectType,
+		"object_id":     objectID,
+		"capability":    capability,
+		"session_token": sessionToken,
 		// The key set this session holds, and it is EXACTLY one key. Never the
 		// workspace member key: acl_object.workspace_id stays authoritative for
 		// tenancy, and a link that carried 'w-' would read the whole workspace.
 		"access_keys": []string{authz.LinkSubject(linkID).Key()},
 		"expires_in":  int(linkSessionTTL.Seconds()),
 	})
+}
+
+const linkSessionPrefix = "sl1."
+
+type linkSessionClaims struct {
+	LinkID      string `json:"link_id"`
+	ObjectType  string `json:"object_type"`
+	ObjectID    string `json:"object_id"`
+	WorkspaceID string `json:"workspace_id"`
+	Capability  string `json:"capability"`
+	Exp         int64  `json:"exp"`
+}
+
+func (h *Handler) mintLinkSession(claims linkSessionClaims) (string, error) {
+	raw, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	payload := base64.RawURLEncoding.EncodeToString(raw)
+	signingInput := linkSessionPrefix + payload
+	mac := hmac.New(sha256.New, h.linkSecret)
+	_, _ = mac.Write([]byte(signingInput))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return signingInput + "." + sig, nil
+}
+
+func (h *Handler) verifyLinkSession(ctx context.Context, token string) (*linkSessionClaims, error) {
+	if !strings.HasPrefix(token, linkSessionPrefix) {
+		return nil, ErrLinkInvalid
+	}
+	rest := strings.TrimPrefix(token, linkSessionPrefix)
+	dot := strings.IndexByte(rest, '.')
+	if dot <= 0 || dot == len(rest)-1 {
+		return nil, ErrLinkInvalid
+	}
+	payloadB64 := rest[:dot]
+	sigB64 := rest[dot+1:]
+
+	gotSig, err := base64.RawURLEncoding.DecodeString(sigB64)
+	if err != nil {
+		return nil, ErrLinkInvalid
+	}
+	mac := hmac.New(sha256.New, h.linkSecret)
+	_, _ = mac.Write([]byte(linkSessionPrefix + payloadB64))
+	if !hmac.Equal(gotSig, mac.Sum(nil)) {
+		return nil, ErrLinkInvalid
+	}
+
+	payloadJSON, err := base64.RawURLEncoding.DecodeString(payloadB64)
+	if err != nil {
+		return nil, ErrLinkInvalid
+	}
+	var claims linkSessionClaims
+	if err := json.Unmarshal(payloadJSON, &claims); err != nil {
+		return nil, ErrLinkInvalid
+	}
+	if claims.LinkID == "" || claims.Exp <= time.Now().Unix() {
+		return nil, ErrLinkInvalid
+	}
+
+	var (
+		revokedAt *time.Time
+		expiresAt *time.Time
+	)
+	if err := h.repo.pool.QueryRow(ctx,
+		`SELECT revoked_at, expires_at FROM drive_share_links WHERE id = $1`,
+		claims.LinkID).Scan(&revokedAt, &expiresAt); err != nil {
+		return nil, ErrLinkInvalid
+	}
+	if revokedAt != nil || (expiresAt != nil && expiresAt.Before(time.Now())) {
+		return nil, ErrLinkInvalid
+	}
+	return &claims, nil
+}
+
+func extractShareLinkToken(r *http.Request) (token string, fromBearer bool) {
+	if hdr := strings.TrimSpace(r.Header.Get("X-Share-Link-Token")); hdr != "" {
+		return hdr, false
+	}
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
+		cand := strings.TrimSpace(auth[len(prefix):])
+		if strings.HasPrefix(cand, linkSessionPrefix) {
+			return cand, true
+		}
+	}
+	return "", false
+}
+
+// linkOrAuthMw allows a route to be accessed via a resolved share-link session
+// token (X-Share-Link-Token or Authorization: Bearer sl1.<payload>.<sig>),
+// while still honouring user JWT authentication when present.
+func (h *Handler) linkOrAuthMw(authMw func(http.Handler) http.Handler) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		authed := authMw(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rawLinkToken, fromBearer := extractShareLinkToken(r)
+			if rawLinkToken == "" {
+				authed.ServeHTTP(w, r)
+				return
+			}
+			claims, err := h.verifyLinkSession(r.Context(), rawLinkToken)
+			if err != nil {
+				// If the caller supplied a link token as the sole Bearer token
+				// and it is invalid/revoked/expired, reject with 401.
+				if fromBearer || r.Header.Get("Authorization") == "" {
+					httputil.JSONError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid or expired share link session")
+					return
+				}
+				// Otherwise fall back to the user's JWT session.
+				authed.ServeHTTP(w, r)
+				return
+			}
+			r = r.WithContext(authctx.WithLinkID(r.Context(), claims.LinkID))
+			if !fromBearer && r.Header.Get("Authorization") != "" {
+				authed.ServeHTTP(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }

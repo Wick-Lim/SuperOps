@@ -110,7 +110,7 @@ const publishTimeout = 3 * time.Second
 // committed by the time we get here, so a client that hung up must not also
 // cost the workspace its event.
 func (h *Handler) publish(ctx context.Context, workspaceID, eventType, dedupeID string, data any) {
-	if h.nats == nil || workspaceID == "" {
+	if workspaceID == "" {
 		return
 	}
 	subject := "superops." + workspaceID + "." + subjectSuffix(eventType)
@@ -118,8 +118,25 @@ func (h *Handler) publish(ctx context.Context, workspaceID, eventType, dedupeID 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), publishTimeout)
 	defer cancel()
 
+	outboxID, outboxErr := h.repo.RecordOutboxEvent(ctx, subject, dedupeID, eventType, data)
+	if outboxErr != nil && h.log != nil {
+		h.log.Error("record message outbox event", "subject", subject, "event", eventType, "error", outboxErr)
+	}
+	if h.nats == nil {
+		return
+	}
+
 	if err := h.nats.PublishDurable(ctx, subject, dedupeID, natspkg.Event{Type: eventType, Data: data}); err != nil {
-		h.log.Error("publish message event", "subject", subject, "event", eventType, "error", err)
+		if h.log != nil {
+			h.log.Error("publish message event", "subject", subject, "event", eventType, "error", err)
+		}
+		if outboxID > 0 {
+			_ = h.repo.RecordOutboxFailure(ctx, outboxID, err)
+		}
+		return
+	}
+	if outboxID > 0 {
+		_ = h.repo.MarkOutboxPublished(ctx, outboxID)
 	}
 }
 

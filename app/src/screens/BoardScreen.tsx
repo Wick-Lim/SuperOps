@@ -7,6 +7,7 @@ import type { Issue, IssueState, Project } from '../api/issues'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { useResponsive, space, MIN_TOUCH, PANE } from '../lib/responsive'
 import { ContentColumn, EmptyState, ErrorState, LoadingState, ScreenHeader } from './internal/ui'
+import PromptModal from '../components/PromptModal'
 
 /**
  * The board.
@@ -34,8 +35,20 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
   const [truncated, setTruncated] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [promptState, setPromptState] = useState<{
+    title: string
+    suggestion: string
+    onSubmit: (value: string) => void
+  } | null>(null)
   const { tier } = useResponsive()
   const stacked = tier === 'compact'
+
+  const openPrompt = useCallback(
+    (title: string, suggestion: string, onSubmit: (value: string) => void) => {
+      setPromptState({ title, suggestion, onSubmit })
+    },
+    [],
+  )
 
   const loadProject = useCallback(async (id: string) => {
     setError(null)
@@ -82,7 +95,7 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
 
   const newProject = useCallback(() => {
     if (!workspaceId) return
-    promptFor('New project', 'Untitled', async (name) => {
+    openPrompt('New project', 'Untitled', async (name) => {
       // The key is derived from the name and uppercased, because it is what
       // people type and paste — asking for it separately is a second field
       // whose answer is almost always the first one abbreviated.
@@ -95,12 +108,12 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
         Alert.alert('Could not create the project', errorMessage(e))
       }
     })
-  }, [workspaceId, loadProject])
+  }, [workspaceId, loadProject, openPrompt])
 
   const newIssue = useCallback(
     (stateId: string) => {
       if (!project) return
-      promptFor('New issue', 'Untitled issue', async (title) => {
+      openPrompt('New issue', 'Untitled issue', async (title) => {
         try {
           await issueApi.createIssue(project.id, { title, state_id: stateId })
           await loadProject(project.id)
@@ -109,7 +122,7 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
         }
       })
     },
-    [project, loadProject],
+    [project, loadProject, openPrompt],
   )
 
   // Moving between columns without reordering: NEITHER anchor is sent, which
@@ -211,6 +224,18 @@ export default function BoardScreen({ navigation, route }: { navigation: any; ro
           )}
         </>
       )}
+
+      <PromptModal
+        visible={promptState !== null}
+        title={promptState?.title ?? ''}
+        defaultValue={promptState?.suggestion ?? ''}
+        onCancel={() => setPromptState(null)}
+        onSubmit={(val) => {
+          const cb = promptState?.onSubmit
+          setPromptState(null)
+          cb?.(val)
+        }}
+      />
     </SafeAreaView>
   )
 }
@@ -284,19 +309,6 @@ function Column({
       </Pressable>
     </View>
   )
-}
-
-function promptFor(title: string, suggestion: string, onSubmit: (value: string) => void) {
-  const alert = Alert as unknown as {
-    prompt?: (t: string, m?: string, cb?: (s: string) => void, type?: string, def?: string) => void
-  }
-  if (typeof alert.prompt === 'function') {
-    alert.prompt(title, undefined, (text) => onSubmit(text?.trim() || suggestion), 'plain-text', suggestion)
-    return
-  }
-  // Android and web have no Alert.prompt. Creating with the suggested name beats
-  // a button that does nothing on two of three platforms.
-  onSubmit(suggestion)
 }
 
 const styles = StyleSheet.create({

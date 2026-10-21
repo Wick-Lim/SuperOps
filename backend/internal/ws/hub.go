@@ -264,6 +264,37 @@ func (h *Hub) RevokeChannelForAll(channelID string) {
 	h.publishRevoke("", channelID)
 }
 
+// RevokeWorkspaceMembership evicts userID from workspaceID across every
+// connection they hold, cluster-wide: dropping the workspace from the
+// in-memory workspace set, unsubscribing any channels they were removed from,
+// and re-validating any open collaboration rooms on their connections.
+func (h *Hub) RevokeWorkspaceMembership(userID, workspaceID string, channelIDs []string) {
+	h.revokeWorkspaceLocal(userID, workspaceID, channelIDs)
+	h.publishWorkspaceRevoke(userID, workspaceID, channelIDs)
+}
+
+func (h *Hub) revokeWorkspaceLocal(userID, workspaceID string, channelIDs []string) {
+	if userID == "" || workspaceID == "" {
+		return
+	}
+
+	targets := h.userTargets(userID)
+	for _, c := range targets {
+		c.LeaveWorkspace(workspaceID)
+		for _, channelID := range channelIDs {
+			if channelID == "" || !c.IsSubscribed(channelID) {
+				continue
+			}
+			c.Unsubscribe(channelID)
+			c.SendMessage(TypeUnsubscribed, map[string]string{
+				"channel_id": channelID,
+				"reason":     ReasonRevoked,
+			})
+		}
+		c.recheckRooms()
+	}
+}
+
 func (h *Hub) revokeLocal(userID, channelID string) {
 	if channelID == "" {
 		return

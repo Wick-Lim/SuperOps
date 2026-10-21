@@ -19,6 +19,7 @@ import (
 // time it is called, so a hub that cannot be reached must not fail the request.
 type SubscriptionRevoker interface {
 	RevokeChannelSubscription(userID, channelID string)
+	RevokeWorkspaceMembership(userID, workspaceID string, channelIDs []string)
 }
 
 type Handler struct {
@@ -295,13 +296,12 @@ func (h *Handler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hub subscriptions live in memory and survive the DELETE, so without this
-	// the evicted user keeps receiving message.new for every channel they were
-	// in until they happen to disconnect.
+	// Hub subscriptions and workspace memberships live in memory and survive the
+	// DELETE, so without this the evicted user keeps receiving workspace-scoped
+	// events and message.new for every channel they were in until they happen to
+	// disconnect.
 	if h.hub != nil {
-		for _, channelID := range removedFrom {
-			h.hub.RevokeChannelSubscription(targetUID, channelID)
-		}
+		h.hub.RevokeWorkspaceMembership(targetUID, wsID, removedFrom)
 	}
 
 	httputil.JSON(w, http.StatusOK, map[string]any{

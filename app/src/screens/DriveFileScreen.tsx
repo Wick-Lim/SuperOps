@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { SafeAreaView, View, Text, Image, Pressable, ScrollView, Alert, Linking, StyleSheet } from 'react-native'
+import * as DocumentPicker from 'expo-document-picker'
 import { theme } from '../lib/theme'
 import { errorMessage } from '../api/client'
 import { driveApi, formatBytes } from '../api/drive'
@@ -27,6 +28,7 @@ export default function DriveFileScreen({ navigation, route }: { navigation: any
   const [descriptor, setDescriptor] = useState<DriveDescriptor | null>(null)
   const [versions, setVersions] = useState<DriveVersion[]>([])
   const [loading, setLoading] = useState(true)
+  const [uploadingVersion, setUploadingVersion] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
@@ -62,6 +64,26 @@ export default function DriveFileScreen({ navigation, route }: { navigation: any
     // the bytes on the bucket's origin.
     void Linking.openURL(descriptor.content_url)
   }, [descriptor])
+
+  const uploadNewVersion = useCallback(async () => {
+    if (uploadingVersion) return
+    try {
+      const result = await DocumentPicker.getDocumentAsync({})
+      if (result.canceled || !result.assets || result.assets.length === 0) return
+      const asset = result.assets[0]
+      setUploadingVersion(true)
+      await driveApi.replaceContent(fileId, {
+        uri: asset.uri,
+        name: asset.name,
+        mimeType: asset.mimeType,
+      })
+      await load()
+    } catch (e) {
+      Alert.alert('Could not upload a new version', errorMessage(e))
+    } finally {
+      setUploadingVersion(false)
+    }
+  }, [fileId, load, uploadingVersion])
 
   const restore = useCallback(
     (version: number) => {
@@ -169,7 +191,17 @@ export default function DriveFileScreen({ navigation, route }: { navigation: any
                 disabled={!descriptor.collab_document_id}
               />
             ) : (
-              <Action label="Download" onPress={download} disabled={!descriptor.content_url} />
+              <>
+                <Action label="Download" onPress={download} disabled={!descriptor.content_url} />
+                {canWrite && (
+                  <Action
+                    label={uploadingVersion ? 'Uploading…' : 'Upload new version'}
+                    tone="muted"
+                    onPress={() => void uploadNewVersion()}
+                    disabled={uploadingVersion}
+                  />
+                )}
+              </>
             )}
             <Action
               label="Share"

@@ -288,7 +288,9 @@ type MinIOConfig struct {
 }
 
 // IsEnabled reports whether the file feature should be constructed.
-func (c MinIOConfig) IsEnabled() bool { return c.Enabled && c.Endpoint != "" }
+func (c MinIOConfig) IsEnabled() bool {
+	return c.Enabled && (c.Endpoint != "" || (c.Backend == "s3" && c.Region != ""))
+}
 
 // PushConfig configures mobile push notifications via Expo's push service.
 //
@@ -431,6 +433,12 @@ func (c SSOConfig) IsEnabled() bool { return strings.TrimSpace(c.SecretKey) != "
 func LoadConfig() (*Config, error) {
 	e := &env{}
 
+	storageBackend := e.str("STORAGE_BACKEND", "minio")
+	defaultStorageEndpoint := "localhost:9000"
+	if strings.EqualFold(strings.TrimSpace(storageBackend), "s3") {
+		defaultStorageEndpoint = ""
+	}
+
 	cfg := &Config{
 		Server: ServerConfig{
 			Host:         e.str("SERVER_HOST", "0.0.0.0"),
@@ -474,8 +482,8 @@ func LoadConfig() (*Config, error) {
 		},
 		MinIO: MinIOConfig{
 			Enabled:      e.bool("FILES_ENABLED", true),
-			Backend:      e.str("STORAGE_BACKEND", "minio"),
-			Endpoint:     e.str("STORAGE_ENDPOINT", e.str("MINIO_ENDPOINT", "localhost:9000")),
+			Backend:      storageBackend,
+			Endpoint:     e.str("STORAGE_ENDPOINT", e.str("MINIO_ENDPOINT", defaultStorageEndpoint)),
 			AccessKey:    e.str("STORAGE_ACCESS_KEY", e.str("MINIO_ACCESS_KEY", "minioadmin")),
 			SecretKey:    e.str("STORAGE_SECRET_KEY", e.str("MINIO_SECRET_KEY", "minioadmin")),
 			Bucket:       e.str("STORAGE_BUCKET", e.str("MINIO_BUCKET", "superops")),

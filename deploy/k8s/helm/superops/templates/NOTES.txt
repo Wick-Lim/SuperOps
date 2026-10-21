@@ -8,7 +8,7 @@ Dependencies this release points at
   Postgres : {{ include "superops.postgresqlHost" . }}:{{ include "superops.postgresqlPort" . }}
   Redis    : {{ include "superops.redisHost" . }}:6379
   NATS     : {{ include "superops.natsHost" . }}:4222
-  MinIO    : {{ include "superops.minioHost" . }}:9000
+  Storage  : {{ if eq (.Values.storage.backend | default "minio") "s3" }}s3 ({{ .Values.storage.endpoint | default (printf "s3.%s.amazonaws.com" .Values.storage.region) }}/{{ .Values.storage.bucket }}){{ else if or .Values.minio.enabled .Values.externalMinio.host }}{{ include "superops.minioHost" . }}:9000{{ else }}disabled{{ end }}
   Search   : {{ if and .Values.search.enabled .Values.externalMeilisearch.host }}{{ .Values.externalMeilisearch.host }}{{ else }}disabled (no meilisearch dependency in this chart){{ end }}
 
 First login

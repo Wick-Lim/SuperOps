@@ -466,3 +466,55 @@ describe('the share screen', () => {
     ).toBe(true)
   })
 })
+
+describe('unified inbox and cross-platform prompts', () => {
+  it('calls the unified /inbox and /notification-prefs routes', async () => {
+    const { notificationApi } = await import('../src/api/notifications')
+    net = mockFetch(() => ok({ unread: 2, by_workspace: [] }))
+    await notificationApi.inboxCount()
+    expect(net.calls.some((c) => c.path === '/inbox/count')).toBe(true)
+
+    net = mockFetch(() => ok([]))
+    await notificationApi.inbox({ state: 'unread', workspace_id: 'w-1' })
+    expect(net.calls.some((c) => c.path.startsWith('/inbox?state=unread&workspace_id=w-1'))).toBe(
+      true,
+    )
+
+    await notificationApi.markDone('it-1')
+    expect(net.calls.some((c) => c.path === '/inbox/it-1/done' && c.method === 'PUT')).toBe(true)
+
+    await notificationApi.listPrefs('w-1')
+    expect(net.calls.some((c) => c.path === '/notification-prefs?workspace_id=w-1')).toBe(true)
+  })
+
+  it('resolves share links through POST /drive/links/{token}/resolve', async () => {
+    const { driveApi } = await import('../src/api/drive')
+    net = mockFetch(() =>
+      ok({
+        object_type: 'file',
+        object_id: 'f-1',
+        capability: 'read',
+        session_token: 'sl1.test.sig',
+        note: 'ok',
+      }),
+    )
+    const res = await driveApi.resolveLink('tok-abc')
+    expect(res.data?.session_token).toBe('sl1.test.sig')
+    expect(net.calls.some((c) => c.path === '/drive/links/tok-abc/resolve' && c.method === 'POST')).toBe(
+      true,
+    )
+  })
+
+  it('uses cross-platform PromptModal instead of iOS-only Alert.prompt', async () => {
+    const fs = await import('node:fs/promises')
+    const driveSrc = await fs.readFile('src/screens/DriveScreen.tsx', 'utf8')
+    const boardSrc = await fs.readFile('src/screens/BoardScreen.tsx', 'utf8')
+    const searchSrc = await fs.readFile('src/screens/SearchScreen.tsx', 'utf8')
+
+    expect(driveSrc).toContain('PromptModal')
+    expect(driveSrc).not.toContain('alert.prompt(')
+    expect(boardSrc).toContain('PromptModal')
+    expect(boardSrc).not.toContain('alert.prompt(')
+    expect(searchSrc).toContain("navigation.navigate('IssueDetail', { issueId: hit.id })")
+  })
+})

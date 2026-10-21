@@ -226,45 +226,75 @@ func (r *Repository) MoveFolder(ctx context.Context, actorID, id, newParentID st
 		return nil, ErrCycle
 	}
 
-	folder, err := r.Folder(ctx, id)
+	var (
+		out         *Folder
+		afterCommit func()
+	)
+	err := database.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		// Lock both drive_folders rows in a stable order so concurrent moves
+		// cannot deadlock, and so validation and parent_id update share one
+		// transaction with authz.MoveInTx.
+		first, second := id, newParentID
+		if first > second {
+			first, second = second, first
+		}
+		folders := make(map[string]*Folder, 2)
+		for _, fid := range []string{first, second} {
+			f, err := scanFolder(tx.QueryRow(ctx,
+				`SELECT `+folderColumns+` FROM drive_folders WHERE id = $1 FOR UPDATE`, fid))
+			if err != nil {
+				return err
+			}
+			folders[fid] = f
+		}
+
+		folder := folders[id]
+		if folder == nil {
+			return ErrNotFound
+		}
+		if folder.IsRoot {
+			return fmt.Errorf("%w: the Drive root cannot be moved", errBadInput)
+		}
+		if folder.TrashedAt != nil {
+			return ErrTrashed
+		}
+
+		parent := folders[newParentID]
+		if parent == nil {
+			return ErrNotFound
+		}
+		if parent.WorkspaceID != folder.WorkspaceID {
+			return ErrCrossWorkspace
+		}
+		if parent.TrashedAt != nil {
+			return ErrTrashed
+		}
+
+		var err error
+		afterCommit, err = r.authz.MoveInTx(ctx, tx, authz.UserSubject(actorID),
+			authz.FolderObject(id), authz.FolderObject(newParentID))
+		if err != nil {
+			return translateMoveError(err)
+		}
+
+		out, err = scanFolder(tx.QueryRow(ctx,
+			`UPDATE drive_folders SET parent_id = $2 WHERE id = $1 AND trashed_at IS NULL
+			 RETURNING `+folderColumns, id, newParentID))
+		if err != nil {
+			return fmt.Errorf("move folder: %w", err)
+		}
+		if out == nil {
+			return ErrTrashed
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if folder == nil {
-		return nil, ErrNotFound
+	if afterCommit != nil {
+		afterCommit()
 	}
-	if folder.IsRoot {
-		return nil, fmt.Errorf("%w: the Drive root cannot be moved", errBadInput)
-	}
-	parent, err := r.Folder(ctx, newParentID)
-	if err != nil {
-		return nil, err
-	}
-	if parent == nil {
-		return nil, ErrNotFound
-	}
-	if parent.WorkspaceID != folder.WorkspaceID {
-		return nil, ErrCrossWorkspace
-	}
-	if parent.TrashedAt != nil {
-		return nil, ErrTrashed
-	}
-
-	// authz.Move refuses a move into the object's own subtree and one that would
-	// push a descendant past the depth cap, both inside its own transaction and
-	// under the same locks it takes for the rewrite. Doing the same checks here
-	// would be a second opinion that can disagree; translating its errors is
-	// what keeps one answer.
-	if err := r.authz.Move(ctx, authz.UserSubject(actorID),
-		authz.FolderObject(id), authz.FolderObject(newParentID)); err != nil {
-		return nil, translateMoveError(err)
-	}
-
-	if _, err := r.pool.Exec(ctx,
-		`UPDATE drive_folders SET parent_id = $2 WHERE id = $1`, id, newParentID); err != nil {
-		return nil, fmt.Errorf("move folder: %w", err)
-	}
-	return r.Folder(ctx, id)
+	return out, nil
 }
 
 // translateMoveError maps authz's refusals onto this package's sentinels so the

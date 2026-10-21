@@ -277,65 +277,77 @@ func loginFailureReason(u *user.User, passwordOK bool) string {
 }
 
 func (s *Service) RefreshTokens(ctx context.Context, refreshToken, userAgent, ipAddress string) (*TokenPair, error) {
-	session, err := s.repo.GetSessionByToken(ctx, refreshToken)
+	var (
+		tokens  *TokenPair
+		authErr error
+	)
+	err := database.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		session, err := s.repo.ConsumeSessionByTokenTx(ctx, tx, refreshToken)
+		if err != nil {
+			return err
+		}
+		if session == nil {
+			authErr = ErrInvalidRefreshToken
+			return nil
+		}
+		if time.Now().After(session.ExpiresAt) {
+			authErr = ErrInvalidRefreshToken
+			return nil
+		}
+
+		// Deactivation has to cut the refresh chain now, not whenever the session
+		// happens to expire — otherwise a disabled account keeps minting access
+		// tokens for the full refresh TTL.
+		var isActive bool
+		err = tx.QueryRow(ctx, `SELECT is_active FROM users WHERE id = $1`, session.UserID).Scan(&isActive)
+		if errors.Is(err, pgx.ErrNoRows) {
+			authErr = ErrInvalidRefreshToken
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("load user for refresh: %w", err)
+		}
+		if !isActive {
+			if err := s.repo.DeleteUserSessionsTx(ctx, tx, session.UserID); err != nil {
+				return err
+			}
+			authErr = ErrInvalidRefreshToken
+			return nil
+		}
+
+		// Enforcement turned on after this session was minted must bite now, not in
+		// thirty days when the refresh token would have expired on its own. Only a
+		// password session is re-evaluated: an SSO session is exactly what
+		// enforcement is asking for.
+		if session.AuthMethod != MethodSSO {
+			if err := s.requirePasswordLoginAllowed(ctx, session.UserID); err != nil {
+				if errors.Is(err, ErrSSORequired) {
+					authErr = err
+					return nil
+				}
+				return err
+			}
+		}
+
+		tokens, err = s.issueTokensTx(ctx, tx, session.UserID, userAgent, ipAddress, session.AuthMethod)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	if session == nil {
-		return nil, ErrInvalidRefreshToken
+	if authErr != nil {
+		return nil, authErr
 	}
-	if time.Now().After(session.ExpiresAt) {
-		if err := s.repo.DeleteSession(ctx, session.ID); err != nil {
-			return nil, err
-		}
-		return nil, ErrInvalidRefreshToken
-	}
-
-	// Deactivation has to cut the refresh chain now, not whenever the session
-	// happens to expire — otherwise a disabled account keeps minting access
-	// tokens for the full refresh TTL.
-	var isActive bool
-	err = s.pool.QueryRow(ctx, `SELECT is_active FROM users WHERE id = $1`, session.UserID).Scan(&isActive)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrInvalidRefreshToken
-	}
-	if err != nil {
-		return nil, fmt.Errorf("load user for refresh: %w", err)
-	}
-	if !isActive {
-		if err := s.repo.DeleteUserSessions(ctx, session.UserID); err != nil {
-			return nil, err
-		}
-		return nil, ErrInvalidRefreshToken
-	}
-
-	// Enforcement turned on after this session was minted must bite now, not in
-	// thirty days when the refresh token would have expired on its own. Only a
-	// password session is re-evaluated: an SSO session is exactly what
-	// enforcement is asking for.
-	if session.AuthMethod != MethodSSO {
-		if err := s.requirePasswordLoginAllowed(ctx, session.UserID); err != nil {
-			return nil, err
-		}
-	}
-
-	if err := s.repo.DeleteSession(ctx, session.ID); err != nil {
-		return nil, err
-	}
-
-	return s.issueTokens(ctx, session.UserID, userAgent, ipAddress, session.AuthMethod)
+	return tokens, nil
 }
 
 func (s *Service) Logout(ctx context.Context, refreshToken, ipAddress string) error {
-	session, err := s.repo.GetSessionByToken(ctx, refreshToken)
+	session, err := s.repo.ConsumeSessionByToken(ctx, refreshToken)
 	if err != nil {
 		return err
 	}
 	if session == nil {
 		return nil
-	}
-	if err := s.repo.DeleteSession(ctx, session.ID); err != nil {
-		return err
 	}
 	s.record(ctx, audit.Entry{
 		ActorID:      session.UserID,
@@ -598,6 +610,16 @@ func (s *Service) GetInviteInfo(ctx context.Context, token string) (*InviteInfo,
 }
 
 func (s *Service) issueTokens(ctx context.Context, userID, userAgent, ipAddress, method string) (*TokenPair, error) {
+	return s.issueTokensWith(ctx, s.repo.CreateSession, userID, userAgent, ipAddress, method)
+}
+
+func (s *Service) issueTokensTx(ctx context.Context, tx pgx.Tx, userID, userAgent, ipAddress, method string) (*TokenPair, error) {
+	return s.issueTokensWith(ctx, func(ctx context.Context, session *Session) error {
+		return s.repo.CreateSessionTx(ctx, tx, session)
+	}, userID, userAgent, ipAddress, method)
+}
+
+func (s *Service) issueTokensWith(ctx context.Context, persist func(context.Context, *Session) error, userID, userAgent, ipAddress, method string) (*TokenPair, error) {
 	accessToken, err := s.jwtMgr.Generate(userID)
 	if err != nil {
 		return nil, err
@@ -619,7 +641,7 @@ func (s *Service) issueTokens(ctx context.Context, userID, userAgent, ipAddress,
 		ExpiresAt:        time.Now().Add(s.refreshTTL),
 	}
 
-	if err := s.repo.CreateSession(ctx, session); err != nil {
+	if err := persist(ctx, session); err != nil {
 		return nil, err
 	}
 

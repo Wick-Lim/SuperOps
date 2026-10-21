@@ -187,6 +187,33 @@ func TestFileDocACLFollowsAttachment(t *testing.T) {
 	}
 }
 
+func TestIssueDocConstructsSearchableDocument(t *testing.T) {
+	doc, err := IssueDoc{
+		ID:          fil,
+		WorkspaceID: wsA,
+		UserID:      usr,
+		Key:         "OPS-14",
+		Title:       "Fix concurrent token refresh",
+		Description: "Two concurrent refreshes both issued tokens.",
+		CreatedAt:   1700000000,
+	}.Doc().validate()
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if doc.Type != TypeIssue || doc.DocID != "issue_"+fil || doc.ID != fil {
+		t.Fatalf("doc identity = %+v", doc)
+	}
+	if doc.Title != "OPS-14 Fix concurrent token refresh" {
+		t.Fatalf("title = %q, want key + title", doc.Title)
+	}
+	if doc.Content != "Two concurrent refreshes both issued tokens." {
+		t.Fatalf("content = %q", doc.Content)
+	}
+	if len(doc.ACL) != 1 || doc.ACL[0] != "w-"+wsA {
+		t.Fatalf("acl = %v, want default workspace key", doc.ACL)
+	}
+}
+
 // Every rejection here is a document that would have been written, acked and
 // then been invisible — or, for the ACL cases, visible to the wrong people.
 func TestDocValidateRejects(t *testing.T) {

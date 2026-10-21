@@ -97,9 +97,9 @@ migrate-down: require-env
 	@set -e; cd $(BACKEND_DIR); $(DEV_ENV) go run ./cmd/migrate -direction down -steps 1
 
 migrate-create:
-	@read -p "Migration name: " name; \
-	num=$$(ls -1 $(BACKEND_DIR)/migrations/*.up.sql 2>/dev/null | wc -l | tr -d ' '); \
-	num=$$(printf "%03d" $$((num + 1))); \
+	@printf "Migration name: "; read -r name; \
+	max=$$(ls -1 $(BACKEND_DIR)/migrations/*.up.sql 2>/dev/null | sed -E 's|.*/0*([0-9]+)_.*|\1|' | sort -n | tail -1); \
+	num=$$(printf "%03d" $$(( $${max:-0} + 1 ))); \
 	touch $(BACKEND_DIR)/migrations/$${num}_$${name}.up.sql; \
 	touch $(BACKEND_DIR)/migrations/$${num}_$${name}.down.sql; \
 	echo "Created migrations/$${num}_$${name}.{up,down}.sql"

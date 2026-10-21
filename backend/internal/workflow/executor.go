@@ -111,6 +111,7 @@ func (e *Executor) Run(ctx context.Context, run *Run, steps []Step) error {
 
 		result, err := action.Perform(ctx, run, mergeConfig(step.Config, payload))
 		if err != nil {
+			e.repo.FailEffect(ctx, run.ID, i)
 			_ = e.repo.FinishStep(ctx, run.ID, i, step.Kind, "failed", err.Error(), nil)
 			_ = e.repo.FinishRun(ctx, run.ID, "failed",
 				fmt.Sprintf("step %d (%s): %v", i, step.Kind, err))

@@ -81,9 +81,8 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	userID     string
-	connID     string
-	workspaces map[string]bool // immutable after construction
+	userID string
+	connID string
 
 	// send is never closed: closing it would race every concurrent broadcast
 	// (the race detector flags send-vs-close, and the runtime panics on it).
@@ -96,6 +95,7 @@ type Client struct {
 	closing atomic.Bool
 
 	mu            sync.RWMutex
+	workspaces    map[string]bool
 	subscriptions map[string]bool
 	// rooms maps a collaboration document id to the write permission granted
 	// at join time. Separate from subscriptions on purpose — see room.go.
@@ -402,12 +402,23 @@ func (c *Client) Subscriptions() []string {
 }
 
 // InWorkspace reports whether this connection's user belongs to a workspace.
-// The set is resolved once at upgrade time and never mutated.
 func (c *Client) InWorkspace(workspaceID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.workspaces[workspaceID]
 }
 
+// LeaveWorkspace removes a workspace from this connection's membership set so
+// workspace-scoped broadcasts stop reaching an evicted member.
+func (c *Client) LeaveWorkspace(workspaceID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.workspaces, workspaceID)
+}
+
 func (c *Client) WorkspaceIDs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	out := make([]string, 0, len(c.workspaces))
 	for id := range c.workspaces {
 		out = append(out, id)

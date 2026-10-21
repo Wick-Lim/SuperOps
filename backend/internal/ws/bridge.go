@@ -24,12 +24,15 @@ type BroadcastEnvelope struct {
 	Data          json.RawMessage `json:"data"`
 }
 
-// RevokeEnvelope withdraws a channel subscription across replicas. A member can
-// be removed by a request served by a replica the member's socket is not on.
+// RevokeEnvelope withdraws a channel subscription or workspace membership
+// across replicas. A member can be removed by a request served by a replica the
+// member's socket is not on.
 type RevokeEnvelope struct {
-	OriginID  string `json:"origin_id"`
-	UserID    string `json:"user_id"` // "" = every connection
-	ChannelID string `json:"channel_id"`
+	OriginID    string   `json:"origin_id"`
+	UserID      string   `json:"user_id"` // "" = every connection
+	ChannelID   string   `json:"channel_id,omitempty"`
+	WorkspaceID string   `json:"workspace_id,omitempty"`
+	ChannelIDs  []string `json:"channel_ids,omitempty"`
 }
 
 // StartNATSBridge subscribes the hub to NATS broadcast subjects
@@ -67,6 +70,10 @@ func (h *Hub) StartNATSBridge(nc *nats.Conn, logger *slog.Logger) {
 			return
 		}
 		if env.OriginID == h.id {
+			return
+		}
+		if env.WorkspaceID != "" {
+			h.revokeWorkspaceLocal(env.UserID, env.WorkspaceID, env.ChannelIDs)
 			return
 		}
 		h.revokeLocal(env.UserID, env.ChannelID)
@@ -110,5 +117,23 @@ func (h *Hub) publishRevoke(userID, channelID string) {
 	}
 	if err := h.natsConn.Publish(natsRevokeSubject, data); err != nil {
 		h.logger.Warn("nats bridge: publish revoke failed", "channel_id", channelID, "error", err)
+	}
+}
+
+func (h *Hub) publishWorkspaceRevoke(userID, workspaceID string, channelIDs []string) {
+	if h.natsConn == nil {
+		return
+	}
+	data, err := json.Marshal(RevokeEnvelope{
+		OriginID:    h.id,
+		UserID:      userID,
+		WorkspaceID: workspaceID,
+		ChannelIDs:  channelIDs,
+	})
+	if err != nil {
+		return
+	}
+	if err := h.natsConn.Publish(natsRevokeSubject, data); err != nil {
+		h.logger.Warn("nats bridge: publish workspace revoke failed", "workspace_id", workspaceID, "error", err)
 	}
 }

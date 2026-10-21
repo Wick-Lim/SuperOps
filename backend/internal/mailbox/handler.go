@@ -407,6 +407,7 @@ func (h *Handler) Reply(w http.ResponseWriter, r *http.Request) {
 		httputil.HandleError(w, err)
 		return
 	}
+	req.BodyHTML = SanitizeHTML(req.BodyHTML)
 	if strings.TrimSpace(req.BodyText) == "" && strings.TrimSpace(req.BodyHTML) == "" {
 		httputil.JSONError(w, http.StatusBadRequest, "EMPTY_REPLY", "a reply needs a body")
 		return

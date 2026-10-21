@@ -157,6 +157,10 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
       navigation.navigate('DriveFile', { fileId: hit.id })
       return
     }
+    if (hit.type === 'issue') {
+      navigation.navigate('IssueDetail', { issueId: hit.id })
+      return
+    }
     const known = channels.find((c) => c.id === hit.channel_id)
     if (known) {
       useChannelStore.getState().setActiveChannel(known)
@@ -196,17 +200,25 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
   const nextLimit = LIMIT_STEPS.find((l) => l > limit)
   const canShowMore = !!nextLimit && hits.length >= limit && total > hits.length
 
-  const renderHit = ({ item }: { item: SearchHit }) => (
+  const renderHit = ({ item }: { item: SearchHit }) => {
+    const isTitledHit = isDriveHit(item) || item.type === 'issue'
+    return (
     <Pressable
       onPress={() => openHit(item)}
       disabled={opening === item.id}
       accessibilityRole="button"
       accessibilityLabel={
-        isDriveHit(item)
+        isTitledHit
           ? `${hitKindLabel(item)} ${item.title || 'Untitled'}: ${item.content}`
           : `Message from ${displayName(users, item.user_id)} in ${channelName(item.channel_id)}: ${item.content}`
       }
-      accessibilityHint={isDriveHit(item) ? 'Opens the file' : 'Opens the channel'}
+      accessibilityHint={
+        item.type === 'issue'
+          ? 'Opens the issue'
+          : isDriveHit(item)
+            ? 'Opens the file'
+            : 'Opens the channel'
+      }
       style={{
         flexDirection: 'row',
         gap: 10,
@@ -229,7 +241,7 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
         }}
       >
         <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>
-          {isDriveHit(item)
+          {isTitledHit
             ? hitKindLabel(item).slice(0, 2).toUpperCase()
             : displayName(users, item.user_id).slice(0, 2).toUpperCase()}
         </Text>
@@ -237,12 +249,12 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
       <View style={{ flex: 1 }}>
         <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, marginBottom: 2 }}>
           <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }} numberOfLines={1}>
-            {isDriveHit(item)
+            {isTitledHit
               ? item.title || 'Untitled'
               : displayName(users, item.user_id)}
           </Text>
           <Text style={{ color: theme.textMuted, fontSize: 12, flex: 1 }} numberOfLines={1}>
-            {isDriveHit(item) ? hitKindLabel(item) : `#${channelName(item.channel_id)}`}
+            {isTitledHit ? hitKindLabel(item) : `#${channelName(item.channel_id)}`}
           </Text>
           <Text style={{ color: theme.textMuted, fontSize: 11 }}>{hitTime(item.created_at)}</Text>
         </View>
@@ -251,7 +263,8 @@ export default function SearchScreen({ navigation }: { navigation: any; route: a
         </Text>
       </View>
     </Pressable>
-  )
+    )
+  }
 
   const channelChips = [
     <Chip key="all" label="All" selected={!channelFilter} onPress={() => setChannelFilter(null)} />,

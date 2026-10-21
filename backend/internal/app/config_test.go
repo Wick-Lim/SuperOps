@@ -213,12 +213,80 @@ func TestOptionalFeatureGuards(t *testing.T) {
 		{MinIOConfig{Enabled: true, Endpoint: "minio:9000"}, true},
 		{MinIOConfig{Enabled: false, Endpoint: "minio:9000"}, false},
 		{MinIOConfig{Enabled: true, Endpoint: ""}, false},
+		{MinIOConfig{Enabled: true, Backend: "s3", Endpoint: "", Region: "ap-northeast-2"}, true},
+		{MinIOConfig{Enabled: false, Backend: "s3", Endpoint: "", Region: "ap-northeast-2"}, false},
+		{MinIOConfig{Enabled: true, Backend: "s3", Endpoint: "", Region: ""}, false},
 	}
 	for _, tt := range minio {
 		if got := tt.cfg.IsEnabled(); got != tt.want {
 			t.Errorf("MinIOConfig%+v.IsEnabled() = %v, want %v", tt.cfg, got, tt.want)
 		}
 	}
+}
+
+func TestLoadConfigStorageBackendDefaults(t *testing.T) {
+	t.Run("default minio backend defaults endpoint to localhost:9000", func(t *testing.T) {
+		validEnv(t)
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.MinIO.Backend != "minio" {
+			t.Errorf("Backend = %q, want %q", cfg.MinIO.Backend, "minio")
+		}
+		if cfg.MinIO.Endpoint != "localhost:9000" {
+			t.Errorf("Endpoint = %q, want %q", cfg.MinIO.Endpoint, "localhost:9000")
+		}
+		if !cfg.MinIO.IsEnabled() {
+			t.Error("expected default minio config to be enabled")
+		}
+	})
+
+	t.Run("s3 backend without STORAGE_ENDPOINT leaves Endpoint empty for region derivation", func(t *testing.T) {
+		validEnv(t)
+		t.Setenv("STORAGE_BACKEND", "s3")
+		t.Setenv("STORAGE_REGION", "ap-northeast-2")
+		t.Setenv("STORAGE_USE_SSL", "true")
+		t.Setenv("STORAGE_ACCESS_KEY", "AKIATEST")
+		t.Setenv("STORAGE_SECRET_KEY", "secrettest")
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.MinIO.Backend != "s3" {
+			t.Errorf("Backend = %q, want %q", cfg.MinIO.Backend, "s3")
+		}
+		if cfg.MinIO.Endpoint != "" {
+			t.Errorf("Endpoint = %q, want empty string so storage.Config.Normalize derives regional S3 endpoint", cfg.MinIO.Endpoint)
+		}
+		if cfg.MinIO.Region != "ap-northeast-2" {
+			t.Errorf("Region = %q, want %q", cfg.MinIO.Region, "ap-northeast-2")
+		}
+		if !cfg.MinIO.IsEnabled() {
+			t.Error("expected s3 config with region and no explicit endpoint to be enabled")
+		}
+	})
+
+	t.Run("s3 backend with explicit STORAGE_ENDPOINT preserves it", func(t *testing.T) {
+		validEnv(t)
+		t.Setenv("STORAGE_BACKEND", "s3")
+		t.Setenv("STORAGE_ENDPOINT", "s3.ap-northeast-2.amazonaws.com")
+		t.Setenv("STORAGE_REGION", "ap-northeast-2")
+		t.Setenv("STORAGE_USE_SSL", "true")
+
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.MinIO.Endpoint != "s3.ap-northeast-2.amazonaws.com" {
+			t.Errorf("Endpoint = %q, want %q", cfg.MinIO.Endpoint, "s3.ap-northeast-2.amazonaws.com")
+		}
+		if !cfg.MinIO.IsEnabled() {
+			t.Error("expected s3 config with explicit endpoint to be enabled")
+		}
+	})
 }
 
 func TestDBConfigDSN(t *testing.T) {

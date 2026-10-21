@@ -9,6 +9,7 @@ import {
   RefreshControl,
   StyleSheet,
 } from 'react-native'
+import * as DocumentPicker from 'expo-document-picker'
 import { theme } from '../lib/theme'
 import { errorMessage, hasErrorCode } from '../api/client'
 import { driveApi, formatBytes } from '../api/drive'
@@ -16,6 +17,7 @@ import type { DriveEntry, DriveFolder, DriveUsage, RegistryKind } from '../api/d
 import { useDriveStore, creatableKinds } from '../stores/driveStore'
 import { useWorkspaceStore } from '../stores/workspaceStore'
 import { useResponsive, MIN_TOUCH, space } from '../lib/responsive'
+import PromptModal from '../components/PromptModal'
 import {
   ContentColumn,
   EmptyState,
@@ -61,9 +63,22 @@ export default function DriveScreen({ navigation }: { navigation: any; route: an
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [uploading, setUploading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [usage, setUsage] = useState<DriveUsage | null>(null)
+  const [promptState, setPromptState] = useState<{
+    title: string
+    suggestion: string
+    onSubmit: (value: string) => void
+  } | null>(null)
   const { tier } = useResponsive()
+
+  const openPrompt = useCallback(
+    (title: string, suggestion: string, onSubmit: (value: string) => void) => {
+      setPromptState({ title, suggestion, onSubmit })
+    },
+    [],
+  )
 
   const workspaceId = activeWorkspace?.id
 
@@ -164,9 +179,7 @@ export default function DriveScreen({ navigation }: { navigation: any; route: an
 
   const newFolder = useCallback(async () => {
     if (!workspaceId || !folder) return
-    // A prompt rather than a modal: creating a folder is one field, and a screen
-    // for it is a screen the user has to dismiss.
-    promptForName('New folder', 'Untitled folder', async (name) => {
+    openPrompt('New folder', 'Untitled folder', async (name) => {
       try {
         await driveApi.createFolder(workspaceId, folder.id, name)
         await loadFolder(folder.id)
@@ -174,12 +187,12 @@ export default function DriveScreen({ navigation }: { navigation: any; route: an
         Alert.alert('Could not create the folder', errorMessage(e))
       }
     })
-  }, [workspaceId, folder, loadFolder])
+  }, [workspaceId, folder, loadFolder, openPrompt])
 
   const newOfKind = useCallback(
     (kind: RegistryKind) => {
       if (!workspaceId || !folder) return
-      promptForName(`New ${kind.display_name.toLowerCase()}`, `Untitled ${kind.display_name}`, async (name) => {
+      openPrompt(`New ${kind.display_name.toLowerCase()}`, `Untitled ${kind.display_name}`, async (name) => {
         try {
           const created = await driveApi.createFile(workspaceId, folder.id, name, kind.type)
           await loadFolder(folder.id)
@@ -189,8 +202,30 @@ export default function DriveScreen({ navigation }: { navigation: any; route: an
         }
       })
     },
-    [workspaceId, folder, loadFolder, navigation],
+    [workspaceId, folder, loadFolder, navigation, openPrompt],
   )
+
+  const uploadFile = useCallback(async () => {
+    if (!workspaceId || !folder || uploading) return
+    try {
+      const result = await DocumentPicker.getDocumentAsync({})
+      if (result.canceled || !result.assets || result.assets.length === 0) return
+      const asset = result.assets[0]
+      setUploading(true)
+      const uploaded = await driveApi.upload(workspaceId, folder.id, {
+        uri: asset.uri,
+        name: asset.name,
+        mimeType: asset.mimeType,
+      })
+      await loadFolder(folder.id)
+      void loadUsage()
+      navigation.navigate('DriveFile', { fileId: uploaded.data.id })
+    } catch (e) {
+      Alert.alert('Could not upload the file', errorMessage(e))
+    } finally {
+      setUploading(false)
+    }
+  }, [workspaceId, folder, uploading, loadFolder, loadUsage, navigation])
 
   const trashEntry = useCallback(
     (entry: DriveEntry) => {
@@ -256,6 +291,10 @@ export default function DriveScreen({ navigation }: { navigation: any; route: an
 
         <View style={styles.actions}>
           <ActionButton label="New folder" onPress={newFolder} />
+          <ActionButton
+            label={uploading ? 'Uploading…' : 'Upload file'}
+            onPress={() => void uploadFile()}
+          />
           {creatable.map((kind) => (
             <ActionButton
               key={kind.type}
@@ -298,6 +337,18 @@ export default function DriveScreen({ navigation }: { navigation: any; route: an
           ListFooterComponent={<ListFooter loading={loadingMore} hasMore={hasMore} onLoadMore={loadMore} />}
         />
       )}
+
+      <PromptModal
+        visible={promptState !== null}
+        title={promptState?.title ?? ''}
+        defaultValue={promptState?.suggestion ?? ''}
+        onCancel={() => setPromptState(null)}
+        onSubmit={(val) => {
+          const cb = promptState?.onSubmit
+          setPromptState(null)
+          cb?.(val)
+        }}
+      />
     </SafeAreaView>
   )
 }
@@ -448,26 +499,6 @@ function ActionButton({
       <Text style={tone === 'muted' ? styles.actionMutedText : styles.actionText}>{label}</Text>
     </Pressable>
   )
-}
-
-/** promptForName wraps Alert.prompt, which does not exist on Android or web.
- * The fallback creates with the suggested name rather than refusing: a "New
- * folder" that does nothing on Android is worse than one called "Untitled". */
-function promptForName(title: string, suggestion: string, onSubmit: (name: string) => void) {
-  const alert = Alert as unknown as {
-    prompt?: (
-      title: string,
-      message?: string,
-      callback?: (text: string) => void,
-      type?: string,
-      defaultValue?: string,
-    ) => void
-  }
-  if (typeof alert.prompt === 'function') {
-    alert.prompt(title, undefined, (text) => onSubmit(text?.trim() || suggestion), 'plain-text', suggestion)
-    return
-  }
-  onSubmit(suggestion)
 }
 
 const styles = StyleSheet.create({

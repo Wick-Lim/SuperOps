@@ -7,6 +7,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/Wick-Lim/SuperOps/backend/pkg/database"
 )
 
 // Drive's permission model, asserted at the layer that decides it.
@@ -323,5 +327,77 @@ func TestFolderIsNativeAndTheDerivedTypesAreNot(t *testing.T) {
 		if !errors.Is(err, ErrDerivedType) {
 			t.Errorf("Register(%s) failed with %v, want ErrDerivedType", obj, err)
 		}
+	}
+}
+
+func TestMoveInTxAtomicWithFolderParent(t *testing.T) {
+	c, w := rebuilt(t)
+	d := seedDrive(t, c, w)
+	ctx := context.Background()
+
+	src := insertFolder(t, c, w.wsA, &d.root, "AtomicFolder", false, w.owner)
+
+	var beforeParent, beforePath string
+	if err := c.pool.QueryRow(ctx, `SELECT parent_id::text FROM drive_folders WHERE id = $1`, src).Scan(&beforeParent); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.pool.QueryRow(ctx, `SELECT path FROM acl_object WHERE object_type = 'folder' AND object_id = $1`, src).Scan(&beforePath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a transaction failure AFTER MoveInTx succeeds: neither
+	// drive_folders.parent_id nor acl_object.path may move.
+	boom := errors.New("simulated failure after MoveInTx")
+	err := database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+		if _, err := c.MoveInTx(ctx, tx, UserSubject(w.owner), FolderObject(src), FolderObject(d.team)); err != nil {
+			return err
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("got err = %v, want %v", err, boom)
+	}
+
+	var rolledBackParent, rolledBackPath string
+	if err := c.pool.QueryRow(ctx, `SELECT parent_id::text FROM drive_folders WHERE id = $1`, src).Scan(&rolledBackParent); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.pool.QueryRow(ctx, `SELECT path FROM acl_object WHERE object_type = 'folder' AND object_id = $1`, src).Scan(&rolledBackPath); err != nil {
+		t.Fatal(err)
+	}
+	if rolledBackParent != beforeParent || rolledBackPath != beforePath {
+		t.Fatalf("rollback left inconsistent state: parent=%s (want %s), path=%s (want %s)",
+			rolledBackParent, beforeParent, rolledBackPath, beforePath)
+	}
+
+	// Now commit both in one transaction.
+	var afterCommit func()
+	if err := database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
+		var moveErr error
+		afterCommit, moveErr = c.MoveInTx(ctx, tx, UserSubject(w.owner), FolderObject(src), FolderObject(d.team))
+		if moveErr != nil {
+			return moveErr
+		}
+		_, moveErr = tx.Exec(ctx, `UPDATE drive_folders SET parent_id = $2 WHERE id = $1 AND trashed_at IS NULL`, src, d.team)
+		return moveErr
+	}); err != nil {
+		t.Fatalf("transactional move: %v", err)
+	}
+	if afterCommit != nil {
+		afterCommit()
+	}
+
+	var afterParent, afterPath string
+	if err := c.pool.QueryRow(ctx, `SELECT parent_id::text FROM drive_folders WHERE id = $1`, src).Scan(&afterParent); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.pool.QueryRow(ctx, `SELECT path FROM acl_object WHERE object_type = 'folder' AND object_id = $1`, src).Scan(&afterPath); err != nil {
+		t.Fatal(err)
+	}
+	if afterParent != d.team {
+		t.Fatalf("parent_id = %s, want %s", afterParent, d.team)
+	}
+	if !strings.Contains(afterPath, pathSegment(FolderObject(d.team))) {
+		t.Fatalf("acl_object.path = %s, want segment for %s", afterPath, d.team)
 	}
 }

@@ -151,6 +151,51 @@ func TestHandleFileIgnoresOtherEventTypes(t *testing.T) {
 	}
 }
 
+func TestHandleIssuePermanentFailures(t *testing.T) {
+	const subject = "superops." + wsA + ".issue.created"
+
+	tests := []struct {
+		name    string
+		subject string
+		data    string
+	}{
+		{"envelope is not json", subject, `{`},
+		{"payload is not json", subject, `{"type":"issue.created","data":42}`},
+		{"no issue id", subject, `{"type":"issue.created","data":{"title":"Bug"}}`},
+		{
+			"subject has no workspace id",
+			"superops",
+			`{"type":"issue.created","data":{"id":"` + fil + `","created_at":"2026-07-25T10:00:00Z"}}`,
+		},
+		{
+			"created_at is unusable",
+			subject,
+			`{"type":"issue.created","data":{"id":"` + fil + `","created_at":"yesterday"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := testIndexer().HandleIssue(context.Background(), msg(tt.subject, tt.data))
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !isPermanent(err) {
+				t.Fatalf("error %v is retryable; a permanently bad event must be terminated", err)
+			}
+		})
+	}
+}
+
+func TestHandleIssueIgnoresOtherEventTypes(t *testing.T) {
+	for _, typ := range []string{"issue.commented", "message.new", ""} {
+		body := `{"type":"` + typ + `","data":{}}`
+		if err := testIndexer().HandleIssue(context.Background(), msg("superops."+wsA+".issue.created", body)); err != nil {
+			t.Fatalf("type %q: %v", typ, err)
+		}
+	}
+}
+
 func TestPermanentErrorUnwraps(t *testing.T) {
 	inner := errors.New("boom")
 	err := error(&PermanentError{Reason: "bad payload", Err: inner})

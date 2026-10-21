@@ -18,30 +18,45 @@ data:
   # Object storage. The backend is a deployment decision (ROADMAP §3c): "minio"
   # for the in-cluster server this chart can install, "s3" for a managed bucket.
   # An unknown value fails at boot with the list of valid ones.
-  STORAGE_BACKEND: {{ .Values.storage.backend | quote }}
-  {{- if eq .Values.storage.backend "s3" }}
-  {{- with .Values.storage.endpoint }}
+  {{- $storage := .Values.storage | default dict }}
+  {{- $storageEnabled := true }}
+  {{- if hasKey $storage "enabled" }}
+  {{- $storageEnabled = $storage.enabled }}
+  {{- end }}
+  {{- $storageBackend := $storage.backend | default "minio" }}
+  {{- $filesEnabled := and $storageEnabled (or .Values.minio.enabled (eq $storageBackend "s3") (ne (.Values.externalMinio.host | default "") "")) }}
+  {{- range $secretKey := list "STORAGE_ACCESS_KEY" "STORAGE_SECRET_KEY" "MINIO_SECRET_KEY" }}
+  {{- if or (hasKey ($.Values.backend.env | default dict) $secretKey) (hasKey ($.Values.backend.extraEnv | default dict) $secretKey) }}
+  {{- fail (printf "%s must be given as storage.accessKey / storage.secretKey (or minio.auth.*), which render into the release Secret. backend.env / backend.extraEnv render into this ConfigMap" $secretKey) }}
+  {{- end }}
+  {{- end }}
+  STORAGE_BACKEND: {{ $storageBackend | quote }}
+  {{- if eq $storageBackend "s3" }}
+  {{- if and $filesEnabled (not (or $storage.region $storage.endpoint)) }}
+  {{- fail "storage.region (or storage.endpoint) is required when storage.backend is \"s3\"" }}
+  {{- end }}
+  {{- with $storage.endpoint }}
   STORAGE_ENDPOINT: {{ . | quote }}
   {{- end }}
-  {{- with .Values.storage.region }}
+  {{- with $storage.region }}
   STORAGE_REGION: {{ . | quote }}
   {{- end }}
-  {{- else }}
+  {{- else if $filesEnabled }}
   STORAGE_ENDPOINT: "{{ include "superops.minioHost" . }}:9000"
   {{- end }}
-  STORAGE_BUCKET: {{ .Values.storage.bucket | quote }}
-  STORAGE_USE_SSL: {{ .Values.storage.useSSL | toString | quote }}
+  STORAGE_BUCKET: {{ $storage.bucket | quote }}
+  STORAGE_USE_SSL: {{ $storage.useSSL | toString | quote }}
   {{- /* `with` would drop an explicit `false`, which is the one value these two
   settings exist to express. Unset means "whatever this backend should do";
   false means the operator said no. A template that cannot tell them apart
   silently creates buckets in an account that forbids it. */}}
-  {{- if ne (toString .Values.storage.pathStyle) "" }}
-  STORAGE_PATH_STYLE: {{ .Values.storage.pathStyle | toString | quote }}
+  {{- if ne (toString $storage.pathStyle) "" }}
+  STORAGE_PATH_STYLE: {{ $storage.pathStyle | toString | quote }}
   {{- end }}
-  {{- if ne (toString .Values.storage.createBucket) "" }}
-  STORAGE_CREATE_BUCKET: {{ .Values.storage.createBucket | toString | quote }}
+  {{- if ne (toString $storage.createBucket) "" }}
+  STORAGE_CREATE_BUCKET: {{ $storage.createBucket | toString | quote }}
   {{- end }}
-  FILES_ENABLED: {{ .Values.minio.enabled | toString | quote }}
+  FILES_ENABLED: {{ $filesEnabled | toString | quote }}
   # Search only works against an externally provisioned Meilisearch — the chart
   # has no meilisearch dependency.
   SEARCH_ENABLED: {{ and .Values.search.enabled (ne (.Values.externalMeilisearch.host | default "") "") | toString | quote }}
@@ -196,7 +211,7 @@ data:
   {{- /* Keys this template emits itself; a passthrough copy would be a
   duplicate map key in the rendered ConfigMap. Use `push.*` / `mail.*` for
   these. */}}
-  {{- if not (has $k (list "DB_SSLMODE" "STORAGE_BACKEND" "STORAGE_ENDPOINT" "STORAGE_REGION" "STORAGE_BUCKET"
+  {{- if not (has $k (list "DB_SSLMODE" "FILES_ENABLED" "STORAGE_BACKEND" "STORAGE_ENDPOINT" "STORAGE_REGION" "STORAGE_BUCKET"
       "STORAGE_USE_SSL" "STORAGE_PATH_STYLE" "STORAGE_CREATE_BUCKET" "PUSH_ENABLED" "PUSH_TIMEOUT" "EXPO_PUSH_ENDPOINT"
       "MAIL_TRANSPORT" "MAIL_TIMEOUT" "MAIL_TEST_PER_MIN" "PRODUCT_NAME" "PUBLIC_BASE_URL" "MAIL_FROM" "MAIL_FROM_NAME"
       "MAIL_SMTP_HOST" "MAIL_SMTP_PORT" "MAIL_SMTP_TLS" "MAIL_SMTP_ALLOW_INSECURE_AUTH" "MAIL_SMTP_INSECURE_SKIP_VERIFY"

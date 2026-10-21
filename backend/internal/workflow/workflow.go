@@ -617,34 +617,47 @@ func (r *Repository) ClaimRun(ctx context.Context) (*Run, []Step, error) {
 // ClaimEffect reserves a step's side effect.
 //
 // THE SAFETY PROPERTY OF THE WHOLE PACKAGE. It returns false when the effect
-// was already recorded — which means a previous delivery performed it — and the
-// caller must then SKIP the action rather than repeat it.
+// already reached 'succeeded' — which means a previous delivery completed it —
+// and the caller must then SKIP the action rather than repeat it.
 //
-// The insert commits BEFORE the effect is performed, which is the deliberate
-// direction: a crash between them loses the effect, and a workflow that
-// occasionally fails to post a message is recoverable, while one that
-// occasionally posts twice is what makes people disable automation.
+// If a previous worker claimed the row and crashed before RecordEffectResult
+// (or the step failed and the run was re-queued), the row's status is 'claimed'
+// or 'failed', so ON CONFLICT DO UPDATE re-claims it and returns true.
 func (r *Repository) ClaimEffect(ctx context.Context, runID string, stepIndex int, kind string) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
-		INSERT INTO workflow_effects (run_id, step_index, kind)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (run_id, step_index) DO NOTHING`, runID, stepIndex, kind)
+		INSERT INTO workflow_effects (run_id, step_index, kind, status, updated_at)
+		VALUES ($1, $2, $3, 'claimed', NOW())
+		ON CONFLICT (run_id, step_index) DO UPDATE
+		   SET status = 'claimed', updated_at = NOW()
+		 WHERE workflow_effects.status <> 'succeeded'`, runID, stepIndex, kind)
 	if err != nil {
 		return false, fmt.Errorf("claim effect: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
 
-// RecordEffectResult stores what an effect produced, so a retry can report the
-// original result rather than an empty success.
+// RecordEffectResult marks an effect 'succeeded' and stores what it produced,
+// so a retry can report the original result and skip re-running the step.
 func (r *Repository) RecordEffectResult(ctx context.Context, runID string, stepIndex int, result any) {
-	encoded, err := json.Marshal(result)
+	encoded, err := json.Marshal(nonNilAny(result))
 	if err != nil {
-		return
+		encoded = []byte("{}")
 	}
 	_, _ = r.pool.Exec(ctx,
-		`UPDATE workflow_effects SET result = $3 WHERE run_id = $1 AND step_index = $2`,
+		`UPDATE workflow_effects
+		    SET status = 'succeeded', result = $3, updated_at = NOW()
+		  WHERE run_id = $1 AND step_index = $2`,
 		runID, stepIndex, encoded)
+}
+
+// FailEffect marks an effect 'failed' so a subsequent retry is not mistaken for
+// an already-completed step.
+func (r *Repository) FailEffect(ctx context.Context, runID string, stepIndex int) {
+	_, _ = r.pool.Exec(ctx,
+		`UPDATE workflow_effects
+		    SET status = 'failed', updated_at = NOW()
+		  WHERE run_id = $1 AND step_index = $2 AND status <> 'succeeded'`,
+		runID, stepIndex)
 }
 
 func (r *Repository) FinishStep(ctx context.Context, runID string, index int, kind, status, errText string, output any) error {

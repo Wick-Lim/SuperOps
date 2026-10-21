@@ -45,6 +45,17 @@ type FileEvent struct {
 	IsDeleted bool   `json:"is_deleted"`
 }
 
+// IssueEvent is the payload of superops.{workspace_id}.issue.{action}.
+type IssueEvent struct {
+	ID          string `json:"id"`
+	Key         string `json:"key"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	UserID      string `json:"user_id"`
+	CreatedAt   string `json:"created_at"`
+	IsDeleted   bool   `json:"is_deleted"`
+}
+
 // ACLSource reads an object's materialized access keys.
 //
 // The indexer asks for them rather than deriving them, because the derivation
@@ -302,6 +313,68 @@ func (idx *Indexer) HandleFile(ctx context.Context, msg *nats.Msg) error {
 		}
 	}
 	idx.logger.Debug("indexed file", "id", event.ID, "type", typ)
+	return nil
+}
+
+// HandleIssue indexes or unindexes an issue event on superops.{workspace_id}.issue.{action}.
+func (idx *Indexer) HandleIssue(ctx context.Context, msg *nats.Msg) error {
+	envelope, ok, err := decodeEnvelope(msg, "issue.created", "issue.updated", "issue.deleted")
+	if err != nil || !ok {
+		return err
+	}
+
+	var event IssueEvent
+	if err := json.Unmarshal(envelope.Data, &event); err != nil {
+		return &PermanentError{Reason: "malformed " + envelope.Type + " payload", Err: err}
+	}
+	if event.ID == "" {
+		return &PermanentError{Reason: envelope.Type + " event carries no issue id"}
+	}
+
+	if envelope.Type == "issue.deleted" || event.IsDeleted {
+		if err := idx.service.DeleteAwait(ctx, TypeIssue, event.ID); err != nil {
+			return fmt.Errorf("unindex issue %s: %w", event.ID, err)
+		}
+		idx.logger.Debug("unindexed issue", "id", event.ID)
+		return nil
+	}
+
+	workspaceID, err := workspaceFromSubject(msg.Subject)
+	if err != nil {
+		return err
+	}
+	createdAt, err := eventTime(event.CreatedAt, "issue "+event.ID)
+	if err != nil {
+		return err
+	}
+
+	var acl []string
+	if idx.acl != nil {
+		acl, err = idx.acl.KeysForObject(ctx, "issue", event.ID)
+		if err != nil {
+			return fmt.Errorf("read access keys for issue %s: %w", event.ID, err)
+		}
+	}
+
+	doc := IssueDoc{
+		ID:          event.ID,
+		WorkspaceID: workspaceID,
+		UserID:      event.UserID,
+		Key:         event.Key,
+		Title:       event.Title,
+		Description: event.Description,
+		ACL:         acl,
+		CreatedAt:   createdAt.Unix(),
+	}.Doc()
+
+	if _, err := doc.validate(); err != nil {
+		return err
+	}
+
+	if err := idx.service.IndexAwait(ctx, doc); err != nil {
+		return fmt.Errorf("index issue %s: %w", event.ID, err)
+	}
+	idx.logger.Debug("indexed issue", "id", event.ID)
 	return nil
 }
 

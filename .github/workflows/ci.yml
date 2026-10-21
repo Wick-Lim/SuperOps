@@ -103,6 +103,10 @@ jobs:
           grep -q -- '--- PASS: TestChainDetectsTamper' /tmp/dbtests.txt \
             || { echo "::error::the audit chain test did not run (Postgres unreachable?)"; exit 1; }
 
+      - name: Migration prefix and Makefile integrity
+        working-directory: backend
+        run: go test ./cmd/migrate/... -count=1 -v
+
       # REPORTING, and it now fails when it cannot report.
       #
       # This was `go tool cover … | tail -1 | tee …` with no pipefail, so a
@@ -652,3 +656,31 @@ jobs:
             || { echo "DB_HOST does not match the postgresql subchart Service name"; exit 1; }
           grep -q 'ADMIN_PASSWORD' /tmp/prod.yaml \
             || { echo "ADMIN_PASSWORD missing — LoadConfig fatals without it"; exit 1; }
+          grep -q 'image: "ghcr.io/wick-lim/superops-backend:v0.1.0"' /tmp/prod.yaml \
+            || { echo "default backend image tag does not match v0.1.0 format from release.yml"; exit 1; }
+          grep -q 'image: "ghcr.io/wick-lim/superops-frontend:v0.1.0"' /tmp/prod.yaml \
+            || { echo "default frontend image tag does not match v0.1.0 format from release.yml"; exit 1; }
+          grep -q 'FILES_ENABLED: "true"' /tmp/prod.yaml \
+            || { echo "FILES_ENABLED is not true in default bundled MinIO render"; exit 1; }
+          grep -q 'STORAGE_BACKEND: "minio"' /tmp/prod.yaml \
+            || { echo "STORAGE_BACKEND is not minio in default bundled MinIO render"; exit 1; }
+
+          # External S3 topology (bundled MinIO disabled, regional S3 bucket enabled).
+          S3_SETS="$HELM_SETS --set minio.enabled=false --set storage.backend=s3 --set storage.useSSL=true --set storage.region=ap-northeast-2 --set storage.accessKey=AKIATEST --set storage.secretKey=secrettest"
+          helm lint deploy/k8s/helm/superops $S3_SETS
+          helm template prod-s3 deploy/k8s/helm/superops $S3_SETS > /tmp/prod-s3.yaml
+          grep -q 'FILES_ENABLED: "true"' /tmp/prod-s3.yaml \
+            || { echo "FILES_ENABLED is not true when minio.enabled=false and storage.backend=s3"; exit 1; }
+          grep -q 'STORAGE_BACKEND: "s3"' /tmp/prod-s3.yaml \
+            || { echo "STORAGE_BACKEND is not s3 in external S3 render"; exit 1; }
+          grep -q 'STORAGE_REGION: "ap-northeast-2"' /tmp/prod-s3.yaml \
+            || { echo "STORAGE_REGION missing in external S3 render"; exit 1; }
+          grep -q 'STORAGE_ACCESS_KEY: "AKIATEST"' /tmp/prod-s3.yaml \
+            || { echo "STORAGE_ACCESS_KEY missing in external S3 Secret"; exit 1; }
+          grep -q 'STORAGE_SECRET_KEY: "secrettest"' /tmp/prod-s3.yaml \
+            || { echo "STORAGE_SECRET_KEY missing in external S3 Secret"; exit 1; }
+          helm template prod-s3 deploy/k8s/helm/superops -s templates/configmap.yaml $S3_SETS > /tmp/prod-s3-cm.yaml
+          if grep -q 'AKIATEST\|secrettest\|STORAGE_ACCESS_KEY\|STORAGE_SECRET_KEY' /tmp/prod-s3-cm.yaml; then
+            echo "::error::storage credentials leaked into ConfigMap"
+            exit 1
+          fi

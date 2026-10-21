@@ -25,10 +25,15 @@ type Handler struct {
 	authz    *authz.Checker
 	notifier Notifier
 	audit    *audit.Service
+	events   *Publisher
 }
 
 func NewHandler(pool *pgxpool.Pool, az *authz.Checker, notifier Notifier, auditor *audit.Service) *Handler {
 	return &Handler{repo: NewRepository(pool, az), authz: az, notifier: notifier, audit: auditor}
+}
+
+func (h *Handler) SetPublisher(p *Publisher) {
+	h.events = p
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
@@ -225,6 +230,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	h.record(ctx, i.WorkspaceID, "issue.created", "issue", i.ID,
 		map[string]interface{}{"key": i.Key, "title": i.Title})
+	h.events.PublishIssue(ctx, ActionCreated, i)
 	h.notifyAssigned(ctx, i, nil)
 	httputil.JSON(w, http.StatusCreated, i)
 }
@@ -279,6 +285,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.record(ctx, after.WorkspaceID, "issue.updated", "issue", after.ID, nil)
+	h.events.PublishIssue(ctx, ActionUpdated, after)
 	h.notifyAssigned(ctx, after, before.AssigneeID)
 	httputil.JSON(w, http.StatusOK, after)
 }

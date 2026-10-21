@@ -397,6 +397,16 @@ export const driveApi = {
   revokeLink(linkId: string) {
     return api.del<void>(`/drive/links/${linkId}`)
   },
+
+  resolveLink(token: string, password?: string) {
+    return api.post<{
+      object_type: LinkObjectType
+      object_id: string
+      capability: string
+      session_token?: string
+      note: string
+    }>(`/drive/links/${encodeURIComponent(token)}/resolve`, password ? { password } : {})
+  },
 }
 
 /** formatBytes renders a size the way a person reads one. Binary units, because

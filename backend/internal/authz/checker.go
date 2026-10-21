@@ -1264,93 +1264,109 @@ func (c *Checker) Revoke(ctx context.Context, actor, subject SubjectRef, obj Obj
 // re-authorizes against the new position. That is the plan's revocation-latency
 // risk, closed.
 func (c *Checker) Move(ctx context.Context, actor SubjectRef, obj, newParent ObjectRef) error {
-	ref, ok, err := obj.normalize()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("move: invalid object id")
-	}
-	parentRef, ok, err := newParent.normalize()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("move %s: invalid parent id", ref)
-	}
-	if derivedTypes[ref.Type] {
-		return fmt.Errorf("move %s: %w", ref, ErrDerivedType)
-	}
-	if ref == parentRef {
-		return fmt.Errorf("move %s: %w", ref, ErrMoveCycle)
-	}
-
-	var live []ObjectRef
-	var truncated bool
+	var afterCommit func()
 	if err := database.WithTx(ctx, c.pool, func(tx pgx.Tx) error {
-		// Lock in a stable order so two concurrent moves cannot deadlock on
-		// each other's rows.
-		first, second := ref, parentRef
-		if first.String() > second.String() {
-			first, second = second, first
-		}
-		states := map[ObjectRef]*objectState{}
-		for _, r := range []ObjectRef{first, second} {
-			st, err := lockObject(ctx, tx, r)
-			if err != nil {
-				return err
-			}
-			if st == nil {
-				return fmt.Errorf("move %s under %s: %s: %w", ref, parentRef, r, ErrNotRegistered)
-			}
-			states[r] = st
-		}
-		src, dst := states[ref], states[parentRef]
-
-		if src.workspaceID != dst.workspaceID {
-			return fmt.Errorf("move %s under %s: %w: %s and %s",
-				ref, parentRef, ErrCrossWorkspaceMove, src.workspaceID, dst.workspaceID)
-		}
-		if hasPrefixPath(dst.path, src.path) {
-			return fmt.Errorf("move %s under %s: %w", ref, parentRef, ErrMoveCycle)
-		}
-
-		newPath := buildPath(dst.path, ref)
-
-		// The deepest descendant decides whether the move fits. Checking only
-		// the object itself would let a move push its children past the cap and
-		// leave the UPDATE to fail on a CHECK constraint with no explanation.
-		var deepest int
-		if err := tx.QueryRow(ctx, `
-			SELECT COALESCE(MAX(length(path) - length(replace(path, '/', ''))), 0) - 1
-			  FROM acl_object WHERE path LIKE $1 || '%'`, src.path).Scan(&deepest); err != nil {
-			return fmt.Errorf("measure subtree depth: %w", err)
-		}
-		if grown := deepest - pathDepth(src.path) + pathDepth(newPath); grown > MaxPathDepth {
-			return fmt.Errorf("move %s under %s: %w: %d segments, the limit is %d",
-				ref, parentRef, ErrMoveTooDeep, grown, MaxPathDepth)
-		}
-
-		if _, err := tx.Exec(ctx, `
-			UPDATE acl_object
-			   SET path = $2 || substring(path FROM $3::int), updated_at = NOW()
-			 WHERE path LIKE $1 || '%'`,
-			src.path, newPath, len(src.path)+1); err != nil {
-			return fmt.Errorf("move subtree: %w", err)
-		}
-		if err := rewriteSubtreeKeys(ctx, tx, newPath); err != nil {
-			return err
-		}
-		live, truncated, err = liveDescendants(ctx, tx, newPath)
+		var err error
+		afterCommit, err = c.MoveInTx(ctx, tx, actor, obj, newParent)
 		return err
 	}); err != nil {
 		return err
 	}
-
-	c.revokeLive(nil, live, truncated, "move "+ref.String()+" under "+parentRef.String())
-	c.audit(ctx, actor, "acl.moved", ref, nil,
-		map[string]interface{}{"new_parent_type": string(parentRef.Type), "new_parent_id": parentRef.ID})
+	if afterCommit != nil {
+		afterCommit()
+	}
 	return nil
+}
+
+// MoveInTx performs the locked path/cycle/depth checks and acl_object/acl_key
+// subtree rewrite of Move inside the caller's transaction, returning a
+// post-commit hook that drives the Revoker and writes the audit entry once the
+// transaction has committed.
+func (c *Checker) MoveInTx(ctx context.Context, tx pgx.Tx, actor SubjectRef, obj, newParent ObjectRef) (func(), error) {
+	ref, ok, err := obj.normalize()
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("move: invalid object id")
+	}
+	parentRef, ok, err := newParent.normalize()
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("move %s: invalid parent id", ref)
+	}
+	if derivedTypes[ref.Type] {
+		return nil, fmt.Errorf("move %s: %w", ref, ErrDerivedType)
+	}
+	if ref == parentRef {
+		return nil, fmt.Errorf("move %s: %w", ref, ErrMoveCycle)
+	}
+
+	// Lock in a stable order so two concurrent moves cannot deadlock on
+	// each other's rows.
+	first, second := ref, parentRef
+	if first.String() > second.String() {
+		first, second = second, first
+	}
+	states := map[ObjectRef]*objectState{}
+	for _, r := range []ObjectRef{first, second} {
+		st, err := lockObject(ctx, tx, r)
+		if err != nil {
+			return nil, err
+		}
+		if st == nil {
+			return nil, fmt.Errorf("move %s under %s: %s: %w", ref, parentRef, r, ErrNotRegistered)
+		}
+		states[r] = st
+	}
+	src, dst := states[ref], states[parentRef]
+
+	if src.workspaceID != dst.workspaceID {
+		return nil, fmt.Errorf("move %s under %s: %w: %s and %s",
+			ref, parentRef, ErrCrossWorkspaceMove, src.workspaceID, dst.workspaceID)
+	}
+	if hasPrefixPath(dst.path, src.path) {
+		return nil, fmt.Errorf("move %s under %s: %w", ref, parentRef, ErrMoveCycle)
+	}
+
+	newPath := buildPath(dst.path, ref)
+
+	// The deepest descendant decides whether the move fits. Checking only
+	// the object itself would let a move push its children past the cap and
+	// leave the UPDATE to fail on a CHECK constraint with no explanation.
+	var deepest int
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(length(path) - length(replace(path, '/', ''))), 0) - 1
+		  FROM acl_object WHERE path LIKE $1 || '%'`, src.path).Scan(&deepest); err != nil {
+		return nil, fmt.Errorf("measure subtree depth: %w", err)
+	}
+	if grown := deepest - pathDepth(src.path) + pathDepth(newPath); grown > MaxPathDepth {
+		return nil, fmt.Errorf("move %s under %s: %w: %d segments, the limit is %d",
+			ref, parentRef, ErrMoveTooDeep, grown, MaxPathDepth)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE acl_object
+		   SET path = $2 || substring(path FROM $3::int), updated_at = NOW()
+		 WHERE path LIKE $1 || '%'`,
+		src.path, newPath, len(src.path)+1); err != nil {
+		return nil, fmt.Errorf("move subtree: %w", err)
+	}
+	if err := rewriteSubtreeKeys(ctx, tx, newPath); err != nil {
+		return nil, err
+	}
+	live, truncated, err := liveDescendants(ctx, tx, newPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return func() {
+		c.revokeLive(nil, live, truncated, "move "+ref.String()+" under "+parentRef.String())
+		c.audit(ctx, actor, "acl.moved", ref, nil,
+			map[string]interface{}{"new_parent_type": string(parentRef.Type), "new_parent_id": parentRef.ID})
+	}, nil
 }
 
 // lockObject reads an acl_object row FOR UPDATE, returning (nil, nil) when it

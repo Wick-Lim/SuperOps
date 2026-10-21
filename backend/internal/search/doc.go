@@ -429,6 +429,46 @@ func (f FileDoc) Doc() Doc {
 	}
 }
 
+// IssueDoc is the issue projection of Doc.
+type IssueDoc struct {
+	ID          string   `json:"id"`
+	WorkspaceID string   `json:"workspace_id"`
+	UserID      string   `json:"user_id"`
+	Key         string   `json:"key"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	ACL         []string `json:"acl"`
+	CreatedAt   int64    `json:"created_at"`
+	IsDeleted   bool     `json:"is_deleted"`
+}
+
+// Doc renders an issue as an indexable object.
+func (i IssueDoc) Doc() Doc {
+	acl := keySet(i.ACL...)
+	if len(acl) == 0 {
+		acl = keySet(WorkspaceKey(i.WorkspaceID))
+	}
+	title := strings.TrimSpace(i.Title)
+	if k := strings.TrimSpace(i.Key); k != "" {
+		if title != "" {
+			title = k + " " + title
+		} else {
+			title = k
+		}
+	}
+	return Doc{
+		Type:        TypeIssue,
+		ID:          i.ID,
+		WorkspaceID: i.WorkspaceID,
+		UserID:      i.UserID,
+		Title:       title,
+		Content:     i.Description,
+		ACL:         acl,
+		CreatedAt:   i.CreatedAt,
+		IsDeleted:   i.IsDeleted,
+	}
+}
+
 // keySet drops the empty results of a failed key construction, so a malformed
 // id becomes "no key" (and then, in validate, a rejected document) rather than
 // an empty string in a filter expression.

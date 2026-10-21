@@ -2,6 +2,7 @@ package drive
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"net/http"
 	"path"
@@ -48,26 +49,38 @@ type CollabRevoker interface {
 }
 
 type Handler struct {
-	repo    *Repository
-	authz   *authz.Checker
-	kinds   *registry.Registry
-	storage storage.Backend
-	collab  CollabLookup
-	revoker CollabRevoker
-	audit   *audit.Service
-	events  *Publisher
+	repo       *Repository
+	authz      *authz.Checker
+	kinds      *registry.Registry
+	storage    storage.Backend
+	collab     CollabLookup
+	revoker    CollabRevoker
+	audit      *audit.Service
+	events     *Publisher
+	linkSecret []byte
 }
 
 func NewHandler(pool *pgxpool.Pool, az *authz.Checker, kinds *registry.Registry,
 	store storage.Backend, collab CollabLookup, auditor *audit.Service, events *Publisher) *Handler {
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
 	return &Handler{
-		repo:    NewRepository(pool, az, kinds),
-		authz:   az,
-		kinds:   kinds,
-		storage: store,
-		collab:  collab,
-		audit:   auditor,
-		events:  events,
+		repo:       NewRepository(pool, az, kinds),
+		authz:      az,
+		kinds:      kinds,
+		storage:    store,
+		collab:     collab,
+		audit:      auditor,
+		events:     events,
+		linkSecret: secret,
+	}
+}
+
+// SetLinkSecret configures the HMAC secret used to sign resolved share-link
+// sessions across API replicas.
+func (h *Handler) SetLinkSecret(secret string) {
+	if secret != "" {
+		h.linkSecret = []byte(secret)
 	}
 }
 
@@ -78,9 +91,11 @@ func NewHandler(pool *pgxpool.Pool, az *authz.Checker, kinds *registry.Registry,
 func (h *Handler) SetCollabRevoker(r CollabRevoker) { h.revoker = r }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) http.Handler) {
+	linkAuthMw := h.linkOrAuthMw(authMw)
+
 	// The registry is served to every authenticated caller so the client
 	// hardcodes nothing: which editors exist is a deployment decision.
-	mux.Handle("GET /api/v1/drive/registry", authMw(http.HandlerFunc(h.Registry)))
+	mux.Handle("GET /api/v1/drive/registry", linkAuthMw(http.HandlerFunc(h.Registry)))
 
 	mux.Handle("GET /api/v1/workspaces/{workspace_id}/drive/root", authMw(http.HandlerFunc(h.Root)))
 	mux.Handle("POST /api/v1/workspaces/{workspace_id}/drive/folders", authMw(http.HandlerFunc(h.CreateFolder)))
@@ -92,13 +107,13 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("DELETE /api/v1/workspaces/{workspace_id}/drive/trash", authMw(http.HandlerFunc(h.EmptyTrash)))
 	mux.Handle("POST /api/v1/drive/{object_type}/{object_id}/restore", authMw(http.HandlerFunc(h.Restore)))
 
-	mux.Handle("GET /api/v1/drive/folders/{folder_id}", authMw(http.HandlerFunc(h.GetFolder)))
-	mux.Handle("GET /api/v1/drive/folders/{folder_id}/children", authMw(http.HandlerFunc(h.ListChildren)))
+	mux.Handle("GET /api/v1/drive/folders/{folder_id}", linkAuthMw(http.HandlerFunc(h.GetFolder)))
+	mux.Handle("GET /api/v1/drive/folders/{folder_id}/children", linkAuthMw(http.HandlerFunc(h.ListChildren)))
 	mux.Handle("PATCH /api/v1/drive/folders/{folder_id}", authMw(http.HandlerFunc(h.RenameFolder)))
 	mux.Handle("POST /api/v1/drive/folders/{folder_id}/move", authMw(http.HandlerFunc(h.MoveFolder)))
 	mux.Handle("DELETE /api/v1/drive/folders/{folder_id}", authMw(http.HandlerFunc(h.TrashFolder)))
 
-	mux.Handle("GET /api/v1/drive/files/{file_id}", authMw(http.HandlerFunc(h.GetFile)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}", linkAuthMw(http.HandlerFunc(h.GetFile)))
 	mux.Handle("PATCH /api/v1/drive/files/{file_id}", authMw(http.HandlerFunc(h.RenameFile)))
 	mux.Handle("POST /api/v1/drive/files/{file_id}/move", authMw(http.HandlerFunc(h.MoveFile)))
 	mux.Handle("DELETE /api/v1/drive/files/{file_id}", authMw(http.HandlerFunc(h.TrashFile)))
@@ -111,14 +126,14 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	// Embeds resolve PER CALLER. An embed node carries {ref_type, ref_id} and
 	// nothing else, so a document shared with somebody who cannot read its
 	// targets renders placeholders rather than leaking their names.
-	mux.Handle("POST /api/v1/drive/files/{file_id}/refs/resolve", authMw(http.HandlerFunc(h.ResolveRefs)))
-	mux.Handle("GET /api/v1/drive/files/{file_id}/backlinks", authMw(http.HandlerFunc(h.ListFileBacklinks)))
-	mux.Handle("GET /api/v1/drive/refs/{ref_type}/{ref_id}/files", authMw(http.HandlerFunc(h.ListBacklinks)))
+	mux.Handle("POST /api/v1/drive/files/{file_id}/refs/resolve", linkAuthMw(http.HandlerFunc(h.ResolveRefs)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}/backlinks", linkAuthMw(http.HandlerFunc(h.ListFileBacklinks)))
+	mux.Handle("GET /api/v1/drive/refs/{ref_type}/{ref_id}/files", linkAuthMw(http.HandlerFunc(h.ListBacklinks)))
 	// The anchor half of a comment on a range. The comment itself is
 	// internal/comment's, unchanged — see ruling 7.
 	mux.Handle("PUT /api/v1/drive/files/{file_id}/comments/{comment_id}/anchor",
-		authMw(http.HandlerFunc(h.PutAnchor)))
-	mux.Handle("GET /api/v1/drive/files/{file_id}/anchors", authMw(http.HandlerFunc(h.ListAnchors)))
+		linkAuthMw(http.HandlerFunc(h.PutAnchor)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}/anchors", linkAuthMw(http.HandlerFunc(h.ListAnchors)))
 
 	mux.Handle("GET /api/v1/drive/{object_type}/{object_id}/shares", authMw(http.HandlerFunc(h.ListShares)))
 	mux.Handle("PUT /api/v1/drive/{object_type}/{object_id}/shares", authMw(http.HandlerFunc(h.PutShare)))
@@ -127,8 +142,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, authMw func(http.Handler) h
 	mux.Handle("POST /api/v1/drive/{object_type}/{object_id}/links", authMw(http.HandlerFunc(h.CreateLink)))
 	mux.Handle("GET /api/v1/drive/{object_type}/{object_id}/links", authMw(http.HandlerFunc(h.ListLinks)))
 	mux.Handle("DELETE /api/v1/drive/links/{link_id}", authMw(http.HandlerFunc(h.RevokeLink)))
-	mux.Handle("GET /api/v1/drive/files/{file_id}/versions", authMw(http.HandlerFunc(h.ListVersions)))
-	mux.Handle("GET /api/v1/drive/files/{file_id}/versions/{version}/content", authMw(http.HandlerFunc(h.VersionContent)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}/versions", linkAuthMw(http.HandlerFunc(h.ListVersions)))
+	mux.Handle("GET /api/v1/drive/files/{file_id}/versions/{version}/content", linkAuthMw(http.HandlerFunc(h.VersionContent)))
 	mux.Handle("POST /api/v1/drive/files/{file_id}/versions/{version}/restore", authMw(http.HandlerFunc(h.RestoreVersion)))
 }
 
@@ -158,11 +173,24 @@ func (h *Handler) Registry(w http.ResponseWriter, _ *http.Request) {
 // want. It answers 404 rather than 403 for something the caller cannot read at
 // all, because a 403 on an object you cannot see confirms it exists.
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, obj authz.ObjectRef, want authz.Capability) (authz.Capability, bool) {
-	actor := authctx.UserID(r.Context())
-	got, err := h.authz.Capability(r.Context(), authz.UserSubject(actor), obj)
-	if err != nil {
-		httputil.HandleError(w, httputil.NewInternal(err))
-		return authz.CapNone, false
+	var got authz.Capability
+	if actor := authctx.UserID(r.Context()); actor != "" {
+		capUser, err := h.authz.Capability(r.Context(), authz.UserSubject(actor), obj)
+		if err != nil {
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return authz.CapNone, false
+		}
+		got = capUser
+	}
+	if linkID := authctx.LinkID(r.Context()); linkID != "" {
+		capLink, err := h.authz.Capability(r.Context(), authz.LinkSubject(linkID), obj)
+		if err != nil {
+			httputil.HandleError(w, httputil.NewInternal(err))
+			return authz.CapNone, false
+		}
+		if capLink > got {
+			got = capLink
+		}
 	}
 	switch {
 	case !got.Implies(authz.CapRead):
@@ -303,11 +331,20 @@ func (h *Handler) ListChildren(w http.ResponseWriter, r *http.Request) {
 
 	// ONE key set for the whole page, not one Can per row. This is the call
 	// docs/plans/00-permissions.md exists to make possible.
-	keys, err := h.authz.KeysFor(r.Context(),
-		authz.UserSubject(authctx.UserID(r.Context())), folder.WorkspaceID)
-	if err != nil {
-		fail(w, err)
-		return
+	var keys []string
+	if actor := authctx.UserID(r.Context()); actor != "" {
+		userKeys, err := h.authz.KeysFor(r.Context(),
+			authz.UserSubject(actor), folder.WorkspaceID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		keys = append(keys, userKeys...)
+	}
+	if linkID := authctx.LinkID(r.Context()); linkID != "" {
+		if k := authz.LinkSubject(linkID).Key(); k != "" {
+			keys = append(keys, k)
+		}
 	}
 
 	entries, cursor, hasMore, err := h.repo.Children(r.Context(), id, keys, page)

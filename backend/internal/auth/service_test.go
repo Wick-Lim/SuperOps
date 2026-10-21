@@ -1,12 +1,24 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Wick-Lim/SuperOps/backend/internal/user"
 	"github.com/Wick-Lim/SuperOps/backend/pkg/crypto"
@@ -173,5 +185,183 @@ func TestAuthErrorResponses(t *testing.T) {
 				t.Errorf("code = %q, want %q", code, tt.wantCode)
 			}
 		})
+	}
+}
+
+var testDBName = fmt.Sprintf("superops_auth_test_%d", os.Getpid())
+
+var (
+	dbOnce sync.Once
+	dbPool *pgxpool.Pool
+	dbErr  error
+)
+
+func env(k, def string) string {
+	if v, ok := os.LookupEnv(k); ok {
+		return v
+	}
+	return def
+}
+
+func requireInfra() bool {
+	b, err := strconv.ParseBool(os.Getenv("SUPEROPS_REQUIRE_INFRA"))
+	return err == nil && b
+}
+
+func dsn(database string) string {
+	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
+		url.QueryEscape(env("DB_USER", "superops")),
+		url.QueryEscape(env("DB_PASSWORD", "")),
+		env("DB_HOST", "127.0.0.1"),
+		env("DB_PORT", "5432"),
+		database,
+		env("DB_SSLMODE", "disable"),
+	)
+}
+
+func testDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dbOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		dbPool, dbErr = createTestDB(ctx)
+	})
+	if dbErr != nil {
+		if requireInfra() {
+			t.Fatalf("SUPEROPS_REQUIRE_INFRA=1 but Postgres is unusable: %v", dbErr)
+		}
+		t.Skipf("postgres unavailable, skipping auth database tests: %v", dbErr)
+	}
+	return dbPool
+}
+
+func createTestDB(ctx context.Context) (*pgxpool.Pool, error) {
+	maint, err := pgx.Connect(ctx, dsn(env("DB_MAINTENANCE_NAME", "postgres")))
+	if err != nil {
+		return nil, fmt.Errorf("connect to maintenance database: %w", err)
+	}
+	defer maint.Close(ctx)
+
+	if _, err := maint.Exec(ctx, `DROP DATABASE IF EXISTS "`+testDBName+`"`); err != nil {
+		return nil, fmt.Errorf("drop stale test database: %w", err)
+	}
+	if _, err := maint.Exec(ctx, `CREATE DATABASE "`+testDBName+`"`); err != nil {
+		return nil, fmt.Errorf("create test database: %w", err)
+	}
+
+	pool, err := pgxpool.New(ctx, dsn(testDBName))
+	if err != nil {
+		return nil, fmt.Errorf("open test database: %w", err)
+	}
+	dir := filepath.Join("..", "..", "migrations")
+	names, err := filepath.Glob(filepath.Join(dir, "*.up.sql"))
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("list migrations: %w", err)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		body, err := os.ReadFile(name)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		if _, err := pool.Exec(ctx, string(body)); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("apply %s: %w", filepath.Base(name), err)
+		}
+	}
+	return pool, nil
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if dbPool != nil {
+		dbPool.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if maint, err := pgx.Connect(ctx, dsn(env("DB_MAINTENANCE_NAME", "postgres"))); err == nil {
+			_, _ = maint.Exec(ctx, `DROP DATABASE IF EXISTS "`+testDBName+`" WITH (FORCE)`)
+			_ = maint.Close(ctx)
+		}
+	}
+	os.Exit(code)
+}
+
+func TestRefreshTokensConcurrentSingleWinner(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+
+	userID := uuid.NewString()
+	pwHash, err := crypto.HashPassword("correct-horse-battery")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	_, err = pool.Exec(ctx,
+		`INSERT INTO users (id, email, username, full_name, password_hash, is_active)
+		 VALUES ($1, $2, $3, 'Concurrent User', $4, true)`,
+		userID, "concurrent-"+userID+"@example.com", "conc_"+strings.ReplaceAll(userID[:8], "-", ""), pwHash,
+	)
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	repo := NewRepository(pool)
+	userRepo := user.NewRepository(pool)
+	jwtMgr := NewJWTManager("test-secret-key-at-least-32-bytes-long", 15*time.Minute)
+	svc := NewService(repo, userRepo, pool, jwtMgr, 24*time.Hour, nil)
+
+	initial, err := svc.issueTokens(ctx, userID, "test-agent", "127.0.0.1:1234", MethodPassword)
+	if err != nil {
+		t.Fatalf("issue initial tokens: %v", err)
+	}
+
+	const concurrency = 10
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, concurrency)
+	pairs := make([]*TokenPair, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			pairs[idx], errs[idx] = svc.RefreshTokens(ctx, initial.RefreshToken, "test-agent", "127.0.0.1:1234")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	var successes, invalidCount int
+	var winningPair *TokenPair
+	for i := 0; i < concurrency; i++ {
+		switch {
+		case errs[i] == nil:
+			successes++
+			winningPair = pairs[i]
+		case errors.Is(errs[i], ErrInvalidRefreshToken):
+			invalidCount++
+		default:
+			t.Errorf("goroutine %d returned unexpected error: %v", i, errs[i])
+		}
+	}
+
+	if successes != 1 {
+		t.Fatalf("RefreshTokens successes = %d, want 1 (invalid = %d)", successes, invalidCount)
+	}
+	if invalidCount != concurrency-1 {
+		t.Fatalf("RefreshTokens ErrInvalidRefreshToken count = %d, want %d", invalidCount, concurrency-1)
+	}
+	if winningPair == nil || winningPair.RefreshToken == "" || winningPair.RefreshToken == initial.RefreshToken {
+		t.Fatalf("winning token pair invalid: %+v", winningPair)
+	}
+
+	var sessionCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM sessions WHERE user_id = $1`, userID).Scan(&sessionCount); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessionCount != 1 {
+		t.Fatalf("session rows for user = %d, want 1", sessionCount)
 	}
 }

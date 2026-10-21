@@ -274,3 +274,79 @@ func TestDispatchChannelCreatedPrivate(t *testing.T) {
 		t.Fatalf("public channel not announced to workspace member (got %d frames)", len(bystander.send))
 	}
 }
+
+func TestRevokeWorkspaceMembershipLocalAndAcrossReplicas(t *testing.T) {
+	nc, cleanup := testNATS(t)
+	defer cleanup()
+
+	hubA := NewHub(testLogger())
+	go hubA.Run()
+	defer hubA.Shutdown()
+	hubA.StartNATSBridge(nc, testLogger())
+
+	hubB := NewHub(testLogger())
+	go hubB.Run()
+	defer hubB.Shutdown()
+	hubB.StartNATSBridge(nc, testLogger())
+
+	room := &stubRoom{recheckNo: ErrRoomForbidden}
+	localConn := NewClient(context.Background(), hubA, nil, "u1", []string{"ws-1", "ws-2"}, nil, nil, room, testLogger())
+	remoteConn := NewClient(context.Background(), hubB, nil, "u1", []string{"ws-1", "ws-2"}, nil, nil, room, testLogger())
+	bystander := newTestClient(hubB, "u2", "ws-1")
+
+	hubA.register <- localConn
+	hubB.register <- remoteConn
+	hubB.register <- bystander
+	waitFor(t, "all connections registered", func() bool {
+		return hubA.ConnectionCount() == 1 && hubB.ConnectionCount() == 2
+	})
+
+	localConn.Subscribe("chan-1")
+	localConn.Subscribe("chan-other-ws")
+	localConn.JoinRoom(testDocumentID, true)
+
+	remoteConn.Subscribe("chan-1")
+	remoteConn.Subscribe("chan-other-ws")
+	remoteConn.JoinRoom(testDocumentID, true)
+
+	bystander.Subscribe("chan-1")
+
+	// Evict u1 from ws-1 (which included chan-1) from hubA.
+	hubA.RevokeWorkspaceMembership("u1", "ws-1", []string{"chan-1"})
+
+	waitFor(t, "remote replica to apply workspace revocation", func() bool {
+		return !remoteConn.InWorkspace("ws-1") && !remoteConn.IsSubscribed("chan-1") && !remoteConn.InRoom(testDocumentID)
+	})
+
+	for name, c := range map[string]*Client{"local": localConn, "remote": remoteConn} {
+		if c.InWorkspace("ws-1") {
+			t.Fatalf("%s connection remained in ws-1 after revocation", name)
+		}
+		if !c.InWorkspace("ws-2") {
+			t.Fatalf("%s connection lost unrelated workspace ws-2", name)
+		}
+		if c.IsSubscribed("chan-1") {
+			t.Fatalf("%s connection remained subscribed to chan-1", name)
+		}
+		if !c.IsSubscribed("chan-other-ws") {
+			t.Fatalf("%s connection lost subscription to chan-other-ws", name)
+		}
+		if c.InRoom(testDocumentID) {
+			t.Fatalf("%s connection remained in collaboration room after workspace revocation", name)
+		}
+		frames := drain(t, c)
+		if len(frames) != 2 {
+			t.Fatalf("%s frames = %v, want 2 (unsubscribed + collab.left)", name, frames)
+		}
+	}
+
+	// Workspace-level broadcasts for ws-1 must no longer reach u1 on either replica.
+	hubA.BroadcastToWorkspaceLocal("ws-1", TypePresenceChanged, map[string]string{"workspace_id": "ws-1"}, "")
+	hubB.BroadcastToWorkspaceLocal("ws-1", TypePresenceChanged, map[string]string{"workspace_id": "ws-1"}, "")
+	if len(localConn.send) != 0 || len(remoteConn.send) != 0 {
+		t.Fatalf("evicted user still received ws-1 broadcasts (local=%d, remote=%d)", len(localConn.send), len(remoteConn.send))
+	}
+	if len(bystander.send) != 1 {
+		t.Fatalf("remaining workspace member received %d frames, want 1", len(bystander.send))
+	}
+}

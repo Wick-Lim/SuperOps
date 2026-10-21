@@ -1,12 +1,16 @@
 import React, { useCallback, useEffect, useState } from 'react'
-import { SafeAreaView, View, Text, Pressable, ScrollView, Alert, StyleSheet } from 'react-native'
+import { SafeAreaView, View, Text, TextInput, Pressable, ScrollView, Alert, StyleSheet } from 'react-native'
 import { theme } from '../lib/theme'
 import { errorMessage } from '../api/client'
 import { driveApi } from '../api/drive'
+import { userApi } from '../api/users'
 import type { Share, ShareLink, ShareObjectType, LinkObjectType } from '../api/drive'
+import type { PublicUser } from '../lib/types'
 import { useUserStore } from '../stores/userStore'
 import { space, MIN_TOUCH } from '../lib/responsive'
 import { ContentColumn, ErrorState, LoadingState, ScreenHeader, Section } from './internal/ui'
+
+const GRANT_CAPS = ['read', 'comment', 'write', 'share', 'admin'] as const
 
 /** Share links point at a folder or a file; the server answers 400 for the
  * rest. A type predicate rather than a plain boolean so a link call on a mailbox
@@ -48,6 +52,9 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
   const [error, setError] = useState<string | null>(null)
   const [freshToken, setFreshToken] = useState<string | null>(null)
   const [linksError, setLinksError] = useState<string | null>(null)
+  const [memberQuery, setMemberQuery] = useState('')
+  const [memberResults, setMemberResults] = useState<PublicUser[]>([])
+  const [grantCap, setGrantCap] = useState<(typeof GRANT_CAPS)[number]>('write')
 
   // Share links exist for a folder or a file only; the server answers 400 for
   // anything else, and tells you to grant a person or a group instead.
@@ -116,6 +123,43 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
   useEffect(() => {
     ensureUsers(shares.filter((s) => s.subject_type === 'user').map((s) => s.subject_id))
   }, [shares, ensureUsers])
+
+  useEffect(() => {
+    const q = memberQuery.trim()
+    if (!q) {
+      setMemberResults([])
+      return
+    }
+    let cancelled = false
+    const timer = setTimeout(() => {
+      userApi
+        .search(q)
+        .then((res) => {
+          if (!cancelled) setMemberResults(res.data ?? [])
+        })
+        .catch(() => {
+          if (!cancelled) setMemberResults([])
+        })
+    }, 250)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [memberQuery])
+
+  const grantToUser = useCallback(
+    async (userId: string) => {
+      try {
+        await driveApi.share(objectType, objectId, userId, grantCap)
+        setMemberQuery('')
+        setMemberResults([])
+        await load()
+      } catch (e) {
+        Alert.alert('Could not grant access', errorMessage(e))
+      }
+    },
+    [objectType, objectId, grantCap, load],
+  )
 
   const createLink = useCallback(async () => {
     // Unreachable through the UI — the button is behind `linkable` — but the
@@ -200,9 +244,8 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
               <Text style={styles.tokenNote}>
                 It is shown once and cannot be recovered.
                 {'\n\n'}
-                A holder cannot open {name} with it yet: the server validates the
-                token and describes what it points at, but nothing turns that
-                into access. Grant a person or a group instead.
+                Anyone who resolves this link receives a scoped session token for {name} until the
+                link expires or is revoked.
               </Text>
               {/* No clipboard dependency: the text above is selectable on every
                   platform, and a "Copy" button that silently did nothing on one
@@ -231,6 +274,47 @@ export default function DriveShareScreen({ navigation, route }: { navigation: an
           ) : (
             <>
               <Section title="People with access">
+                <View style={styles.grantBox}>
+                  <TextInput
+                    value={memberQuery}
+                    onChangeText={setMemberQuery}
+                    placeholder="Search workspace member to add…"
+                    placeholderTextColor={theme.textFaint}
+                    style={styles.grantInput}
+                    accessibilityLabel="Search workspace member to grant access"
+                  />
+                  <View style={styles.capRow}>
+                    {GRANT_CAPS.map((cap) => (
+                      <Pressable
+                        key={cap}
+                        onPress={() => setGrantCap(cap)}
+                        style={[styles.capChip, grantCap === cap && styles.capChipActive]}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected: grantCap === cap }}
+                      >
+                        <Text
+                          style={grantCap === cap ? styles.capChipTextActive : styles.capChipText}
+                        >
+                          {cap}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  {memberResults.map((u) => (
+                    <Pressable
+                      key={u.id}
+                      onPress={() => void grantToUser(u.id)}
+                      style={styles.row}
+                      accessibilityRole="button"
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.rowTitle}>{u.full_name || u.username}</Text>
+                        <Text style={styles.rowMeta}>@{u.username}</Text>
+                      </View>
+                      <Text style={styles.grantAction}>Grant {grantCap}</Text>
+                    </Pressable>
+                  ))}
+                </View>
                 {shares.length === 0 ? (
                   <Text style={styles.empty}>
                     Everyone in the workspace can already open this. Share to give someone more than
@@ -327,6 +411,29 @@ const styles = StyleSheet.create({
     marginTop: space.sm,
   },
   buttonText: { color: theme.body, fontWeight: '600', fontSize: 14 },
+
+  grantBox: { marginBottom: space.sm, gap: space.xs },
+  grantInput: {
+    minHeight: MIN_TOUCH,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: theme.border,
+    backgroundColor: theme.surface,
+    color: theme.text,
+    paddingHorizontal: space.sm,
+    fontSize: 13,
+  },
+  capRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.xs, paddingVertical: 4 },
+  capChip: {
+    paddingHorizontal: space.sm,
+    paddingVertical: 4,
+    borderRadius: 999,
+    backgroundColor: theme.surfaceAlt,
+  },
+  capChipActive: { backgroundColor: theme.primary },
+  capChipText: { color: theme.body, fontSize: 12, fontWeight: '600' },
+  capChipTextActive: { color: theme.primaryText, fontSize: 12, fontWeight: '700' },
+  grantAction: { color: theme.accent, fontSize: 13, fontWeight: '600' },
 
   tokenBox: {
     backgroundColor: theme.surface,
